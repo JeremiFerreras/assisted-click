@@ -180,19 +180,19 @@ namespace ac {
 
         explicit ActivationGuard(PlayLayer* layer) {
 
-cocos2d::CCObject* item = nullptr;
+ cocos2d::CCObject* item = nullptr;
 
-CCARRAY_FOREACH(layer->m_objects, item) {
-    auto* object = typeinfo_cast<GameObject*>(item);
+ CCARRAY_FOREACH(layer->m_objects, item) {
+     auto* object = typeinfo_cast<GameObject*>(item);
 
-    if (object) {
-        saved.emplace_back(
-            object,
-            captureActivation(object)
-        );
-    }
+     if (object) {
+         saved.emplace_back(
+             object,
+             captureActivation(object)
+         );
+     }
+   }
 }
-
 
         ~ActivationGuard() {
             for (auto& entry : saved) {
