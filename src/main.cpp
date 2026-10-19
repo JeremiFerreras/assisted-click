@@ -1,5 +1,17 @@
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+// Assisted Click - src/main.cpp
+// Revisado contra bindings Geode 2.2081 (GeometryDash.bro) y la lista de bugs
+// "Aplicar_CON_PRECISION". Ver comentarios [FIX x.y] para cada correccion.
+
+// [FIX P0/P1] NOMINMAX y windows.h SOLO en Windows y ANTES de los headers de Geode.
+#ifdef _WIN32
+    #ifndef WIN32_LEAN_AND_MEAN
+        #define WIN32_LEAN_AND_MEAN
+    #endif
+    #ifndef NOMINMAX
+        #define NOMINMAX
+    #endif
+    #include <windows.h>
+#endif
 
 #include <mutex>
 #include <string>
@@ -12,7 +24,9 @@
 #include <Geode/modify/EffectGameObject.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <deque>
 #include <unordered_map>
 #include <utility>
@@ -20,6 +34,9 @@
 
 using namespace geode::prelude;
 
+// ============================================================================
+// Consola
+// ============================================================================
 namespace ac_console {
 
 #ifdef _WIN32
@@ -39,7 +56,6 @@ static void writeRaw(const std::string& text) {
     }
 
     DWORD written = 0;
-
     WriteConsoleA(
         g_output,
         text.data(),
@@ -56,7 +72,6 @@ bool init() {
         return true;
     }
 
-    // Separarse de cualquier consola heredada o existente y forzar una nueva.
     FreeConsole();
 
     if (!AllocConsole()) {
@@ -102,15 +117,12 @@ void tickLine(std::string message) {
         return;
     }
 
-    if (message.size() > 110) {
-        message.resize(110);
+    if (message.size() > 150) {
+        message.resize(150);
     }
 
     if (message.size() < g_tickLineLength) {
-        message.append(
-            g_tickLineLength - message.size(),
-            ' '
-        );
+        message.append(g_tickLineLength - message.size(), ' ');
     }
 
     writeRaw("\r");
@@ -120,6 +132,8 @@ void tickLine(std::string message) {
     g_tickLineActive = true;
 }
 
+// [FIX 5] Idempotente: si init() fallo en Loaded, se puede reintentar
+// llamando de nuevo (se reintenta al crear cada PlayLayer).
 void showBannerOnce() {
     if (!init()) {
         return;
@@ -136,44 +150,47 @@ void showBannerOnce() {
     }
 
     line("===================================================");
-    line("[Assisted Click] v1.0.0 LOADED");
-    line("[Assisted Click] Live console: direct game events");
-    line("[Assisted Click] Tick status updates in place");
+    line("[Assisted Click] v1.0.0 LOADED (Community Edition)");
+    line("[Assisted Click] Events: DECISION / SCHEDULED / APPLIED");
+    line("[Assisted Click] Tick status updates in place (every 4 ticks)");
     line("[Assisted Click] Press F6 in-level to cycle prediction window");
     line("===================================================");
 }
 
 #else
 
-inline bool init() {
-    return false;
-}
-
+inline bool init() { return false; }
 inline void line(const std::string&) {}
-
 inline void tickLine(std::string) {}
-
 inline void showBannerOnce() {}
 
 #endif
 
 } // namespace ac_console
 
-// Apertura automática al cargar el mod mediante la API de Geode
 $on_mod(Loaded) {
     ac_console::showBannerOnce();
 }
 
+// ============================================================================
+// Logica del mod
+// ============================================================================
 namespace ac {
 
-    constexpr float kPhysicsDt = 1.0f / 240.0f;
+    float g_stepDt = 0.25f;
     constexpr int kLookAhead = 32;
+    constexpr int kMaxSimSteps = 256;
+
+    // [FIX 3.2] Si es true se reactiva la compensacion antigua de X (NO recomendado).
+    // Por defecto false: si el clon no avanza en X la simulacion es "Unknown".
+    constexpr bool kForceXCompensation = false;
 
     const int kWindows[] = {0, 2, 4, 8, 16};
     int g_windowIndex = 0;
 
     int g_tick = 0;
     float g_lastDx = 0.0f;
+    int g_dtStable = 0; // [FIX 4.3] ticks consecutivos con el mismo dt
 
     PlayLayer* g_layer = nullptr;
     PlayerObject* g_ghost = nullptr;
@@ -183,26 +200,84 @@ namespace ac {
     bool g_triggerEncountered = false;
     bool g_applyingQueuedInput = false;
 
+    // Diagnostico (por nivel)
+    bool g_seedVerified = false;
+    bool g_warnedX = false;
+    bool g_warnedDt = false;
+    bool g_warnedWorld = false;
+    int g_statKept = 0;        // original predicho seguro
+    int g_statChanged = 0;     // retraso aplicado
+    int g_statNoSolution = 0;  // moriria y no hay retraso seguro
+    int g_statUnknown = 0;     // simulacion no concluyente -> original
+    long long g_lastSimUs = 0;
+    long long g_maxSimUs = 0;
+
+    // [FIX 3.4] Resultado de simulacion con tres estados.
+    enum class SimResult {
+        Safe,
+        Died,
+        Unknown
+    };
+
     struct PendingInput {
-        int tick;
+        int tick;      // tick absoluto de aplicacion
         bool down;
         int button;
-        bool player2;
+        bool isPlayer1;
+    };
+
+    // [FIX 2.1] Estado por boton: ultimo tick programado y cuantas entradas siguen pendientes.
+    struct KeyState {
+        int lastDue = 0;
+        int pending = 0;
     };
 
     std::deque<PendingInput> g_queue;
-    std::unordered_map<int, int> g_pressDelay;
+    std::unordered_map<int, KeyState> g_keyState;
 
     int windowTicks() {
         return kWindows[g_windowIndex];
     }
 
-    int buttonKey(int button, bool player2) {
-        return button + (player2 ? 10000 : 0);
+    int buttonKey(int button, bool isPlayer1) {
+        return button + (isPlayer1 ? 0 : 10000);
     }
 
+    // [FIX 4.5] Guards con restauracion del valor previo (reentrada segura).
+    struct SimulationScope {
+        bool prev;
+
+        SimulationScope() : prev(g_simulating) {
+            g_simulating = true;
+            g_cloneDied = false;
+            g_triggerEncountered = false;
+        }
+
+        ~SimulationScope() {
+            g_simulating = prev;
+        }
+    };
+
+    struct QueuedInputScope {
+        bool prev;
+
+        QueuedInputScope() : prev(g_applyingQueuedInput) {
+            g_applyingQueuedInput = true;
+        }
+
+        ~QueuedInputScope() {
+            g_applyingQueuedInput = prev;
+        }
+    };
+
+    // [FIX 3.3] Inicializacion unica del clon. Cada AC_COPY solo compila si el
+    // miembro existe en los bindings (requires dentro de plantilla).
     template <class P>
     void seedGhost(P* dst, P* src) {
+        if (!dst || !src) return;
+
+        dst->resetStateVariables();
+        dst->resetTouchedRings(true);
         dst->resetCollisionLog(true);
         dst->resetCollisionValues();
 
@@ -215,15 +290,27 @@ namespace ac {
                 dst->F = src->F; \
             }
 
+        // Posicion / velocidad / fisica
         AC_COPY(m_position)
         AC_COPY(m_lastPosition)
         AC_COPY(m_yVelocity)
         AC_COPY(m_fallSpeed)
         AC_COPY(m_playerSpeed)
         AC_COPY(m_speedMultiplier)
+        AC_COPY(m_gravity)
+        AC_COPY(m_gravityMod)
+        AC_COPY(m_yStart)
         AC_COPY(m_platformerXVelocity)
         AC_COPY(m_physDeltaRelated)
+        AC_COPY(m_vehicleSize)
+        AC_COPY(m_xVelocityRelated)
+        AC_COPY(m_xVelocityRelated2)
+        AC_COPY(m_lastPortalPos)
+        AC_COPY(m_shipRotation)
+        AC_COPY(m_affectedByForces)
+        AC_COPY(m_isLocked)
 
+        // Modo de juego
         AC_COPY(m_isShip)
         AC_COPY(m_isBird)
         AC_COPY(m_isBall)
@@ -232,27 +319,75 @@ namespace ac {
         AC_COPY(m_isSpider)
         AC_COPY(m_isSwing)
         AC_COPY(m_isUpsideDown)
-        AC_COPY(m_isOnGround)
-        AC_COPY(m_isOnGround2)
-        AC_COPY(m_isOnGround4)
-        AC_COPY(m_isOnSlope)
-        AC_COPY(m_wasOnSlope)
         AC_COPY(m_isGoingLeft)
         AC_COPY(m_isSideways)
         AC_COPY(m_isPlatformer)
         AC_COPY(m_isSecondPlayer)
         AC_COPY(m_controlsDisabled)
+        AC_COPY(m_isDashing) // [FIX 3.3] faltaba
+        AC_COPY(m_dashFireFrame)
 
+        // Contacto / pendientes
+        AC_COPY(m_isOnGround)
+        AC_COPY(m_isOnGround2)
+        AC_COPY(m_isOnGround3)
+        AC_COPY(m_isOnGround4)
+        AC_COPY(m_isOnSlope)
+        AC_COPY(m_wasOnSlope)
+        AC_COPY(m_isOnIce)
+        AC_COPY(m_slopeVelocity)
+        AC_COPY(m_slopeRotation)
+        AC_COPY(m_currentSlopeYVelocity)
+        AC_COPY(m_isCurrentSlopeTop)
+        AC_COPY(m_maybeUpsideDownSlope)
+        AC_COPY(m_isAccelerating)
+        AC_COPY(m_collidedTopMinY)
+        AC_COPY(m_collidedBottomMaxY)
+        AC_COPY(m_collidedLeftMaxX)
+        AC_COPY(m_collidedRightMinX)
+        AC_COPY(m_lastGroundedPos)
+
+        // Estados "state*" internos
+        AC_COPY(m_stateOnGround)
+        AC_COPY(m_stateNoStickX)
+        AC_COPY(m_stateNoStickY)
+        AC_COPY(m_stateBoostX)
+        AC_COPY(m_stateBoostY)
+        AC_COPY(m_stateScale)
+        AC_COPY(m_stateNoAutoJump)
+        AC_COPY(m_stateDartSlide)
+        AC_COPY(m_stateHitHead)
+        AC_COPY(m_stateFlipGravity)
+        AC_COPY(m_stateForce)
+        AC_COPY(m_stateForceVector)
+        AC_COPY(m_stateRingJump)
+        AC_COPY(m_stateRingJump2)
+        AC_COPY(m_stateJumpBuffered)
+
+        // Botones
         AC_COPY(m_holdingButtons)
         AC_COPY(m_holdingRight)
         AC_COPY(m_holdingLeft)
         AC_COPY(m_jumpBuffered)
         AC_COPY(m_wasJumpBuffered)
-        AC_COPY(m_stateJumpBuffered)
-        AC_COPY(m_lastGroundedPos)
+        AC_COPY(m_wasRobotJump)
+
+        // Anillos / pads / portales (valores, no punteros a objetos del mundo)
+        AC_COPY(m_touchedRings)
+        AC_COPY(m_touchedRing)
+        AC_COPY(m_touchedCustomRing)
+        AC_COPY(m_touchedPad)
+        AC_COPY(m_touchedGravityPortal)
+        AC_COPY(m_padRingRelated)
+        AC_COPY(m_ringJumpRelated)
+        AC_COPY(m_hasEverHitRing)
+        AC_COPY(m_isBeingSpawnedByDualPortal)
+
+        // Tiempos
         AC_COPY(m_lastLandTime)
         AC_COPY(m_lastJumpTime)
         AC_COPY(m_lastFlipTime)
+        AC_COPY(m_lastSpiderFlipTime)
         AC_COPY(m_totalTime)
         AC_COPY(m_gameModeChangedTime)
         AC_COPY(m_hasEverJumped)
@@ -268,34 +403,61 @@ namespace ac {
         }
     }
 
+    // [FIX 3.3] Verificacion de que el clon empieza igual que el jugador real.
+    void verifySeedOnce(PlayerObject* real) {
+        if (g_seedVerified || !g_ghost || !real) return;
+        g_seedVerified = true;
+
+        const bool posOk =
+            std::abs(g_ghost->getPositionX() - real->getPositionX()) < 0.001f &&
+            std::abs(g_ghost->getPositionY() - real->getPositionY()) < 0.001f;
+        const bool velOk = std::abs(g_ghost->m_yVelocity - real->m_yVelocity) < 0.001;
+        const bool modeOk =
+            g_ghost->m_isShip == real->m_isShip &&
+            g_ghost->m_isBall == real->m_isBall &&
+            g_ghost->m_isDart == real->m_isDart &&
+            g_ghost->m_isUpsideDown == real->m_isUpsideDown;
+
+        if (!posOk || !velOk || !modeOk) {
+            ac_console::line(
+                "[Assisted Click] WARNING seed mismatch | pos=" +
+                std::string(posOk ? "ok" : "BAD") +
+                " yVel=" + (velOk ? "ok" : "BAD") +
+                " mode=" + (modeOk ? "ok" : "BAD")
+            );
+        } else {
+            ac_console::line("[Assisted Click] Ghost seed verified OK");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Proteccion de objetos activados
+    // ------------------------------------------------------------------
     struct ActivationBits {
         bool hasIsActivated = false;
         bool isActivated = false;
-
-        bool hasActivatedP1 = false;
-        bool activatedP1 = false;
-
-        bool hasActivatedP2 = false;
-        bool activatedP2 = false;
+        bool hasP1 = false;
+        bool p1 = false;
+        bool hasP2 = false;
+        bool p2 = false;
     };
 
     template <class O>
     ActivationBits captureActivation(O* obj) {
         ActivationBits state;
+        if (!obj) return state;
 
         if constexpr (requires { obj->m_isActivated; }) {
             state.hasIsActivated = true;
             state.isActivated = obj->m_isActivated;
         }
 
-        if constexpr (requires { obj->m_hasBeenActivated; }) {
-            state.hasActivatedP1 = true;
-            state.activatedP1 = obj->m_hasBeenActivated;
-        }
-
-        if constexpr (requires { obj->m_hasBeenActivatedP2; }) {
-            state.hasActivatedP2 = true;
-            state.activatedP2 = obj->m_hasBeenActivatedP2;
+        // [FIX 3.5] m_activatedByPlayer1/2 viven en EnhancedGameObject (bindings 2.2081).
+        if (auto* enhanced = typeinfo_cast<EnhancedGameObject*>(obj)) {
+            state.hasP1 = true;
+            state.p1 = enhanced->m_activatedByPlayer1;
+            state.hasP2 = true;
+            state.p2 = enhanced->m_activatedByPlayer2;
         }
 
         return state;
@@ -303,137 +465,218 @@ namespace ac {
 
     template <class O>
     void restoreActivation(O* obj, const ActivationBits& state) {
+        if (!obj) return;
+
         if constexpr (requires { obj->m_isActivated = false; }) {
             if (state.hasIsActivated) {
                 obj->m_isActivated = state.isActivated;
             }
         }
 
-        if constexpr (requires { obj->m_hasBeenActivated = false; }) {
-            if (state.hasActivatedP1) {
-                obj->m_hasBeenActivated = state.activatedP1;
-            }
-        }
-
-        if constexpr (requires { obj->m_hasBeenActivatedP2 = false; }) {
-            if (state.hasActivatedP2) {
-                obj->m_hasBeenActivatedP2 = state.activatedP2;
+        if (state.hasP1 || state.hasP2) {
+            if (auto* enhanced = typeinfo_cast<EnhancedGameObject*>(obj)) {
+                if (state.hasP1) enhanced->m_activatedByPlayer1 = state.p1;
+                if (state.hasP2) enhanced->m_activatedByPlayer2 = state.p2;
             }
         }
     }
 
+    // [FIX 4.1] Se captura UNA vez por decision y se restaura tras cada candidato
+    // (antes se recorria y capturaba todo m_objects en cada candidato).
     struct ActivationGuard {
         std::vector<std::pair<GameObject*, ActivationBits>> saved;
 
         explicit ActivationGuard(PlayLayer* layer) {
+            if (!layer || !layer->m_objects) return;
+            saved.reserve(static_cast<size_t>(layer->m_objects->count()));
             for (auto* object : CCArrayExt<GameObject*>(layer->m_objects)) {
                 if (object) {
-                    saved.emplace_back(
-                        object,
-                        captureActivation(object)
-                    );
+                    saved.emplace_back(object, captureActivation(object));
                 }
             }
         }
 
-        ~ActivationGuard() {
+        void restore() {
             for (auto& entry : saved) {
                 if (entry.first) {
                     restoreActivation(entry.first, entry.second);
                 }
             }
         }
-    };
 
-    struct SimulationScope {
-        SimulationScope() {
-            g_simulating = true;
-            g_cloneDied = false;
-            g_triggerEncountered = false;
-        }
-
-        ~SimulationScope() {
-            g_simulating = false;
+        ~ActivationGuard() {
+            restore();
         }
     };
 
     template <class P>
     bool cloneOnSlope(P* player) {
+        if (!player) return false;
         if constexpr (requires { player->m_isOnSlope; }) {
             return player->m_isOnSlope;
         }
-
         return false;
     }
 
     void applyGhostInput(bool down, int button) {
-        if (!g_ghost) {
-            return;
-        }
+        if (!g_ghost) return;
 
         auto playerButton = static_cast<PlayerButton>(button);
-
         if (down) {
             g_ghost->pushButton(playerButton);
-        }
-        else {
+        } else {
             g_ghost->releaseButton(playerButton);
         }
     }
 
-    bool simulateDelay(
+    // ------------------------------------------------------------------
+    // Calculo del tick de aplicacion
+    // ------------------------------------------------------------------
+
+    // [FIX extra] Semantica exacta: delay 0 = proximo update; delay N = N updates despues.
+    // Antes dueTick = g_tick + delay hacia que delay 0 y delay 1 fueran identicos
+    // (ambos se aplicaban en el siguiente update) mientras el simulador los
+    // distinguia -> desfase de 1 tick entre prediccion y realidad.
+    int effectiveDue(int key, int delay) {
+        int due = g_tick + 1 + delay;
+
+        auto it = g_keyState.find(key);
+        if (it != g_keyState.end() && it->second.pending > 0) {
+            // [FIX 2.1/2.3] Solo se impone orden respecto al MISMO boton.
+            due = std::max(due, it->second.lastDue + 1);
+        }
+
+        return due;
+    }
+
+    // ------------------------------------------------------------------
+    // Simulacion
+    // ------------------------------------------------------------------
+    struct SimEvent {
+        int step;
+        bool down;
+        int button;
+    };
+
+    SimResult simulateDelay(
         PlayLayer* layer,
         PlayerObject* real,
         bool down,
         int button,
-        int delay
+        int candidateDue
     ) {
         if (!layer || !real || !g_ghost) {
-            return false;
+            return SimResult::Unknown;
         }
 
-        ActivationGuard activationGuard(layer);
-        bool survived = true;
+        // [FIX 4.3] dt inestable -> el horizonte no es fiable.
+        if (g_dtStable < 2) {
+            if (!g_warnedDt) {
+                g_warnedDt = true;
+                ac_console::line("[Assisted Click] NOTE dt not stable yet -> prediction skipped (Unknown)");
+            }
+            return SimResult::Unknown;
+        }
+
+        const int base = g_tick + 1;
+
+        // [FIX extra] Eventos: cola pendiente real + candidato (antes la cola pendiente
+        // no se tenia en cuenta en la simulacion).
+        std::vector<SimEvent> events;
+        events.reserve(g_queue.size() + 1);
+        for (auto const& q : g_queue) {
+            events.push_back({std::max(0, q.tick - base), q.down, q.button});
+        }
+        events.push_back({std::max(0, candidateDue - base), down, button});
+        std::stable_sort(
+            events.begin(), events.end(),
+            [](SimEvent const& a, SimEvent const& b) { return a.step < b.step; }
+        );
+
+        const int lastStep = events.back().step;
+        const int totalSteps = lastStep + kLookAhead;
+        if (totalSteps > kMaxSimSteps) {
+            return SimResult::Unknown;
+        }
+
+        const float simDt = g_stepDt > 0.0f ? g_stepDt : 0.25f;
+
+        // Foto del jugador real para detectar mutaciones accidentales.
+        const float realX = real->getPositionX();
+        const float realY = real->getPositionY();
+        const double realVy = real->m_yVelocity;
+
+        SimResult result = SimResult::Safe;
 
         {
             SimulationScope scope;
             seedGhost(g_ghost, real);
+            verifySeedOnce(real);
 
-            const int totalSteps = delay + kLookAhead;
+            size_t nextEvent = 0;
 
             for (int step = 0; step < totalSteps; ++step) {
-                if (step == delay) {
-                    applyGhostInput(down, button);
+                while (nextEvent < events.size() && events[nextEvent].step <= step) {
+                    applyGhostInput(events[nextEvent].down, events[nextEvent].button);
+                    ++nextEvent;
                 }
 
                 const float beforeX = g_ghost->getPositionX();
-
-                g_ghost->update(kPhysicsDt);
-
+                g_ghost->update(simDt);
                 const float afterX = g_ghost->getPositionX();
 
+                // [FIX 3.2] Ya no se fuerza el avance del clon con g_lastDx.
                 if (std::abs(afterX - beforeX) < 0.0001f &&
                     std::abs(g_lastDx) > 0.0001f) {
-                    g_ghost->setPositionX(beforeX + g_lastDx);
+                    if constexpr (kForceXCompensation) {
+                        g_ghost->setPositionX(beforeX + g_lastDx);
+                    } else {
+                        if (!g_warnedX) {
+                            g_warnedX = true;
+                            ac_console::line(
+                                "[Assisted Click] WARNING ghost X does not advance "
+                                "while real player does -> Unknown (input unchanged). "
+                                "See kForceXCompensation in main.cpp."
+                            );
+                        }
+                        result = SimResult::Unknown;
+                        break;
+                    }
                 }
 
-                const float collisionDt =
-                    cloneOnSlope(g_ghost) ? kPhysicsDt : 0.0f;
+                const float collisionDt = cloneOnSlope(g_ghost) ? simDt : 0.0f;
+                layer->checkCollisions(g_ghost, collisionDt, false);
 
-                layer->checkCollisions(
-                    g_ghost,
-                    collisionDt,
-                    true
-                );
+                // [FIX 3.1] Orden del motor: update -> collisions -> rotation -> clear log.
+                g_ghost->updateRotation(simDt);
+                g_ghost->resetCollisionLog(false);
 
-                if (g_cloneDied || g_triggerEncountered) {
-                    survived = false;
+                // [FIX 3.4] Trigger = estado no modelado -> Unknown (no muerte).
+                if (g_triggerEncountered) {
+                    result = SimResult::Unknown;
+                    break;
+                }
+
+                // [FIX 3.8] Muerte por hook o por flag del clon.
+                if (g_cloneDied || g_ghost->m_isDead) {
+                    result = SimResult::Died;
                     break;
                 }
             }
         }
 
-        return survived;
+        // [FIX 3.5] Comprobar que el mundo real no cambio.
+        if (std::abs(real->getPositionX() - realX) > 0.0001f ||
+            std::abs(real->getPositionY() - realY) > 0.0001f ||
+            std::abs(real->m_yVelocity - realVy) > 0.0001) {
+            if (!g_warnedWorld) {
+                g_warnedWorld = true;
+                ac_console::line("[Assisted Click] WARNING simulation modified the real player state!");
+            }
+            return SimResult::Unknown;
+        }
+
+        return result;
     }
 
     int predictDelay(
@@ -441,121 +684,201 @@ namespace ac {
         PlayerObject* player,
         bool down,
         int button,
-        bool player2
+        bool isPlayer1
     ) {
         const int limit = windowTicks();
 
         if (!layer || !player || !g_ghost ||
-            player2 || limit <= 0 || g_tick < 2) {
+            !isPlayer1 || limit <= 0 || g_tick < 2 ||
+            player->m_isDead) {
             return 0;
         }
 
-        const bool originalSafe =
-            simulateDelay(layer, player, down, button, 0);
+        const int key = buttonKey(button, isPlayer1);
+        const auto t0 = std::chrono::steady_clock::now();
 
-        if (originalSafe) {
-            return 0;
+        int chosen = 0;
+        ActivationGuard guard(layer);
+
+        int prevDue = effectiveDue(key, 0);
+        const SimResult baseline =
+            simulateDelay(layer, player, down, button, prevDue);
+        guard.restore();
+
+        if (baseline == SimResult::Safe) {
+            ++g_statKept;
         }
+        else if (baseline == SimResult::Unknown) {
+            // [FIX 3.4] No inventar alternativas: se conserva la entrada original.
+            ++g_statUnknown;
+        }
+        else {
+            bool found = false;
 
-        for (int delay = 1; delay <= limit; ++delay) {
-            const bool safe = simulateDelay(
-                layer, player, down, button, delay
-            );
+            for (int delay = 1; delay <= limit; ++delay) {
+                const int due = effectiveDue(key, delay);
+                if (due == prevDue) continue; // mismo tick efectivo, ya probado
+                prevDue = due;
 
-            if (safe) {
-                return delay;
+                const SimResult r = simulateDelay(layer, player, down, button, due);
+                guard.restore();
+
+                if (r == SimResult::Safe) {
+                    chosen = delay;
+                    found = true;
+                    break;
+                }
+            }
+
+            if (found) {
+                ++g_statChanged;
+                ac_console::line(
+                    "[Assisted Click] DECISION | " +
+                    std::string(down ? "PRESS" : "RELEASE") +
+                    " | original predicted DEATH | delay +" +
+                    std::to_string(chosen) +
+                    " | tick " + std::to_string(g_tick) +
+                    " | window " + std::to_string(limit)
+                );
+            } else {
+                ++g_statNoSolution;
+                ac_console::line(
+                    "[Assisted Click] DECISION | " +
+                    std::string(down ? "PRESS" : "RELEASE") +
+                    " | original predicted DEATH | no safe delay in window " +
+                    std::to_string(limit) + " -> unchanged"
+                );
             }
         }
 
-        return 0;
+        const auto t1 = std::chrono::steady_clock::now();
+        g_lastSimUs = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        g_maxSimUs = std::max(g_maxSimUs, g_lastSimUs);
+
+        return chosen;
     }
 
+    // ------------------------------------------------------------------
+    // Cola
+    // ------------------------------------------------------------------
     void queueInput(
         PlayLayer* layer,
         bool down,
         int button,
-        bool player2,
+        bool isPlayer1,
         int delay
     ) {
         if (!layer) {
             return;
         }
 
-        if (delay > 0) {
-            ac_console::line(
-                "[Assisted Click] DELAY SELECTED: +" +
-                std::to_string(delay) +
-                " TICKS | " +
-                (down ? "PRESS" : "RELEASE") +
-                " | tick " +
-                std::to_string(ac::g_tick) +
-                " -> due " +
-                std::to_string(ac::g_tick + delay) +
-                " | limit " +
-                std::to_string(windowTicks())
-            );
-        }
+        const int key = buttonKey(button, isPlayer1);
 
-        if (delay == 0 && g_queue.empty()) {
-            g_applyingQueuedInput = true;
-            layer->handleButton(down, button, player2);
-            g_applyingQueuedInput = false;
+        // [FIX 2.2] Con OFF (delay 0) solo se envia directo si no hay nada pendiente
+        // de ese boton y la cola esta vacia; si no, se mantiene el orden por la cola.
+        auto keyIt = g_keyState.find(key);
+        const bool keyPending =
+            keyIt != g_keyState.end() && keyIt->second.pending > 0;
+
+        if (delay == 0 && g_queue.empty() && !keyPending) {
+            QueuedInputScope scope;
+            layer->handleButton(down, button, isPlayer1);
             return;
         }
 
-        int dueTick = g_tick + delay;
+        // [FIX 2.1] dueTick definitivo (el mismo que uso el simulador).
+        const int dueTick = effectiveDue(key, delay);
 
-        if (!g_queue.empty()) {
-            dueTick = std::max(
-                dueTick,
-                g_queue.back().tick
-            );
+        // [FIX 2.3] Insercion ordenada y estable por tick; botones distintos
+        // pueden compartir tick.
+        auto pos = std::upper_bound(
+            g_queue.begin(), g_queue.end(), dueTick,
+            [](int value, PendingInput const& item) { return value < item.tick; }
+        );
+        g_queue.insert(pos, PendingInput{dueTick, down, button, isPlayer1});
 
-            if (!down) {
-                dueTick = std::max(
-                    dueTick,
-                    g_queue.back().tick + 1
-                );
-            }
-        }
+        auto& state = g_keyState[key];
+        state.lastDue = std::max(state.lastDue, dueTick);
+        ++state.pending;
 
-        g_queue.push_back({
-            dueTick,
-            down,
-            button,
-            player2
-        });
+        ac_console::line(
+            "[Assisted Click] SCHEDULED | " +
+            std::string(down ? "PRESS" : "RELEASE") +
+            " | button " + std::to_string(button) +
+            " | tick " + std::to_string(g_tick) +
+            " -> due " + std::to_string(dueTick) +
+            " (+" + std::to_string(dueTick - (g_tick + 1)) + ")"
+        );
     }
 
     void dispatchPendingInputs(PlayLayer* layer, int nextTick) {
+        if (!layer) return;
+
         while (!g_queue.empty() &&
                g_queue.front().tick <= nextTick) {
             auto input = g_queue.front();
             g_queue.pop_front();
 
-            g_applyingQueuedInput = true;
-            layer->handleButton(
-                input.down,
-                input.button,
-                input.player2
+            // [FIX 2.1] Se libera la marca de pendiente al aplicar.
+            const int key = buttonKey(input.button, input.isPlayer1);
+            auto it = g_keyState.find(key);
+            if (it != g_keyState.end()) {
+                if (--it->second.pending <= 0) {
+                    g_keyState.erase(it);
+                }
+            }
+
+            {
+                QueuedInputScope scope;
+                layer->handleButton(
+                    input.down,
+                    input.button,
+                    input.isPlayer1
+                );
+            }
+
+            ac_console::line(
+                "[Assisted Click] APPLIED | " +
+                std::string(input.down ? "PRESS" : "RELEASE") +
+                " | button " + std::to_string(input.button) +
+                " | due " + std::to_string(input.tick) +
+                " | applied at tick " + std::to_string(nextTick)
             );
-            g_applyingQueuedInput = false;
         }
     }
 
+    // Limpia cola y contadores de entrada (se llama antes Y despues del reset).
     void clearState() {
         g_queue.clear();
-        g_pressDelay.clear();
+        g_keyState.clear();
         g_tick = 0;
         g_lastDx = 0.0f;
+        g_stepDt = 0.25f;
+        g_dtStable = 0;
 
         g_cloneDied = false;
         g_triggerEncountered = false;
         g_applyingQueuedInput = false;
     }
 
+    void clearLevelDiagnostics() {
+        g_seedVerified = false;
+        g_warnedX = false;
+        g_warnedDt = false;
+        g_warnedWorld = false;
+        g_statKept = 0;
+        g_statChanged = 0;
+        g_statNoSolution = 0;
+        g_statUnknown = 0;
+        g_lastSimUs = 0;
+        g_maxSimUs = 0;
+    }
+
 } // namespace ac
 
+// ============================================================================
+// Hooks
+// ============================================================================
 class $modify(ACKeyboard, CCKeyboardDispatcher) {
     bool dispatchKeyboardMSG(
         cocos2d::enumKeyCodes key,
@@ -564,15 +887,12 @@ class $modify(ACKeyboard, CCKeyboardDispatcher) {
         double timestamp
     ) {
         if (key == cocos2d::enumKeyCodes::KEY_F6 && down && !repeat) {
-            ac::g_windowIndex =
-                (ac::g_windowIndex + 1) % 5;
+            ac::g_windowIndex = (ac::g_windowIndex + 1) % 5;
 
             const int currentWindow = ac::windowTicks();
 
             if (currentWindow <= 0) {
-                ac_console::line(
-                    "[Assisted Click] F6 Cycle -> OFF (raw input)"
-                );
+                ac_console::line("[Assisted Click] F6 Cycle -> OFF (raw input)");
             } else {
                 ac_console::line(
                     "[Assisted Click] F6 Cycle -> " +
@@ -582,10 +902,7 @@ class $modify(ACKeyboard, CCKeyboardDispatcher) {
             }
 
             Notification::create(
-                fmt::format(
-                    "Assisted Click: {} ticks",
-                    currentWindow
-                ),
+                fmt::format("Assisted Click: {} ticks", currentWindow),
                 NotificationIcon::None,
                 1.0f
             )->show();
@@ -601,30 +918,28 @@ class $modify(ACPlayLayer, PlayLayer) {
     void setupHasCompleted() {
         PlayLayer::setupHasCompleted();
 
+        // [FIX 5] Reintento de consola si fallo en Loaded.
+        ac_console::showBannerOnce();
+
         ac::g_layer = this;
+        ac::clearState();
+        ac::clearLevelDiagnostics();
 
         if (ac::g_ghost) {
             ac::g_ghost->release();
             ac::g_ghost = nullptr;
         }
 
-        ac::g_ghost = PlayerObject::create(
-            1, 0, this, this, true
-        );
+        ac::g_ghost = PlayerObject::create(1, 0, this, this, true);
 
         if (ac::g_ghost) {
             ac::g_ghost->retain();
             ac::g_ghost->setVisible(false);
 
-            if constexpr (requires {
-                ac::g_ghost->m_playEffects = false;
-            }) {
-                ac::g_ghost->m_playEffects = false;
-            }
+            // m_playEffects existe en PlayerObject (bindings 2.2081).
+            ac::g_ghost->m_playEffects = false;
 
-            ac_console::line(
-                "[Assisted Click] Ghost simulator created"
-            );
+            ac_console::line("[Assisted Click] Ghost simulator created");
         }
         else {
             log::error("[AC] Ghost simulator creation failed");
@@ -632,6 +947,8 @@ class $modify(ACPlayLayer, PlayLayer) {
     }
 
     void resetLevel() {
+        // [FIX 2.4] Invalidar cola ANTES del reinicio y de nuevo despues.
+        ac::clearState();
         PlayLayer::resetLevel();
         ac::clearState();
     }
@@ -650,7 +967,7 @@ class $modify(ACPlayLayer, PlayLayer) {
         PlayLayer::onExit();
     }
 
-    destroyPlayer(PlayerObject* player, GameObject* object) {
+    void destroyPlayer(PlayerObject* player, GameObject* object) {
         if (ac::g_simulating && player == ac::g_ghost) {
             ac::g_cloneDied = true;
             return;
@@ -661,67 +978,39 @@ class $modify(ACPlayLayer, PlayLayer) {
 };
 
 class $modify(ACBaseLayer, GJBaseGameLayer) {
-    void handleButton(bool down, int button, bool player2) {
+    void handleButton(bool down, int button, bool isPlayer1) {
         if (ac::g_applyingQueuedInput || ac::g_simulating) {
-            GJBaseGameLayer::handleButton(
-                down, button, player2
-            );
+            GJBaseGameLayer::handleButton(down, button, isPlayer1);
             return;
         }
 
         auto* layer = PlayLayer::get();
-        if (!layer) {
-            GJBaseGameLayer::handleButton(
-                down, button, player2
-            );
+
+        // [FIX 2.5] Solo interceptar si ESTA capa es el PlayLayer activo.
+        if (!layer ||
+            static_cast<GJBaseGameLayer*>(layer) !=
+                static_cast<GJBaseGameLayer*>(this)) {
+            GJBaseGameLayer::handleButton(down, button, isPlayer1);
             return;
         }
 
-        auto* player = player2 ? layer->m_player2 : layer->m_player1;
-
-        if (!player || ac::windowTicks() == 0) {
-            if (down) {
-                ac::g_pressDelay[
-                    ac::buttonKey(button, player2)
-                ] = 0;
-            }
-            else {
-                ac::g_pressDelay.erase(
-                    ac::buttonKey(button, player2)
-                );
-            }
-
-            GJBaseGameLayer::handleButton(
-                down, button, player2
-            );
+        // Jugador 2: se reenvia sin tocar (selector original conservado).
+        if (!isPlayer1) {
+            GJBaseGameLayer::handleButton(down, button, isPlayer1);
             return;
         }
 
-        int delay = ac::predictDelay(
-            layer,
-            player,
-            down,
-            button,
-            player2
-        );
+        auto* player = layer->m_player1;
 
-        const int key = ac::buttonKey(button, player2);
-
-        if (down) {
-            ac::g_pressDelay[key] = delay;
-        }
-        else {
-            auto it = ac::g_pressDelay.find(key);
-
-            if (it != ac::g_pressDelay.end()) {
-                delay = std::max(delay, it->second);
-                ac::g_pressDelay.erase(it);
-            }
+        // [FIX 2.1] Ya no hay g_pressDelay: la prediccion de cada evento es
+        // independiente y el orden lo impone effectiveDue().
+        int delay = 0;
+        if (player && ac::windowTicks() > 0) {
+            delay = ac::predictDelay(layer, player, down, button, isPlayer1);
         }
 
-        ac::queueInput(
-            layer, down, button, player2, delay
-        );
+        // [FIX 2.2] Aun con OFF (delay 0) se respeta la cola pendiente.
+        ac::queueInput(layer, down, button, isPlayer1, delay);
     }
 };
 
@@ -743,16 +1032,30 @@ class $modify(ACPlayerObject, PlayerObject) {
         PlayerObject::update(dt);
 
         if (isRealPlayer && dt > 0.0f) {
+            // [FIX 4.3] Estabilidad del dt
+            if (std::abs(dt - ac::g_stepDt) < 0.00002f) {
+                ++ac::g_dtStable;
+            } else {
+                ac::g_dtStable = 0;
+            }
+
+            ac::g_stepDt = dt;
             ac::g_lastDx = getPositionX() - beforeX;
             ++ac::g_tick;
 
-            ac_console::tickLine(
-                "[Assisted Click] TICK " +
-                std::to_string(ac::g_tick) +
-                " | dt=" + std::to_string(dt) +
-                " | x=" + std::to_string(getPositionX()) +
-                " | dx=" + std::to_string(ac::g_lastDx)
-            );
+            // [FIX 5] Refresco visual cada 4 ticks (el contador interno va cada paso).
+            if ((ac::g_tick & 3) == 0) {
+                ac_console::tickLine(
+                    "[AC] TICK " + std::to_string(ac::g_tick) +
+                    " | x=" + std::to_string(getPositionX()) +
+                    " | kept=" + std::to_string(ac::g_statKept) +
+                    " chg=" + std::to_string(ac::g_statChanged) +
+                    " nosol=" + std::to_string(ac::g_statNoSolution) +
+                    " unk=" + std::to_string(ac::g_statUnknown) +
+                    " | sim=" + std::to_string(ac::g_lastSimUs) + "us" +
+                    " max=" + std::to_string(ac::g_maxSimUs) + "us"
+                );
+            }
         }
     }
 };
@@ -764,13 +1067,11 @@ class $modify(ACEffectObject, EffectGameObject) {
         gd::vector<int> const* groups
     ) {
         if (ac::g_simulating) {
+            // No se ejecuta durante la simulacion; marca el resultado como Unknown.
             ac::g_triggerEncountered = true;
             return;
         }
 
-        EffectGameObject::triggerObject(
-            layer, id, groups
-        );
+        EffectGameObject::triggerObject(layer, id, groups);
     }
 };
-```[cite: 1]
