@@ -1,4 +1,3 @@
-
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
@@ -179,20 +178,16 @@ namespace ac {
         std::vector<std::pair<GameObject*, ActivationBits>> saved;
 
         explicit ActivationGuard(PlayLayer* layer) {
-
- cocos2d::CCObject* item = nullptr;
-
- CCARRAY_FOREACH(layer->m_objects, item) {
-     auto* object = typeinfo_cast<GameObject*>(item);
-
-     if (object) {
-         saved.emplace_back(
-             object,
-             captureActivation(object)
-         );
-      }
-   }
-};
+            // Actualizado para Geode v5 usando CCArrayExt
+            for (auto* object : CCArrayExt<GameObject*>(layer->m_objects)) {
+                if (object) {
+                    saved.emplace_back(
+                        object,
+                        captureActivation(object)
+                    );
+                }
+            }
+        }
 
         ~ActivationGuard() {
             for (auto& entry : saved) {
