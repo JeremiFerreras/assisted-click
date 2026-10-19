@@ -10,7 +10,6 @@
 #include <Geode/modify/PlayerObject.hpp>
 #include <Geode/modify/CCKeyboardDispatcher.hpp>
 #include <Geode/modify/EffectGameObject.hpp>
-#include <Geode/modify/MenuLayer.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -57,7 +56,10 @@ bool init() {
         return true;
     }
 
-    if (GetConsoleWindow() == nullptr && !AllocConsole()) {
+    // Separarse de cualquier consola heredada o existente y forzar una nueva.
+    FreeConsole();
+
+    if (!AllocConsole()) {
         return false;
     }
 
@@ -65,6 +67,7 @@ bool init() {
 
     if (g_output == nullptr ||
         g_output == INVALID_HANDLE_VALUE) {
+        FreeConsole();
         return false;
     }
 
@@ -155,6 +158,11 @@ inline void showBannerOnce() {}
 #endif
 
 } // namespace ac_console
+
+// Apertura automática al cargar el mod mediante la API de Geode
+$on_mod(Loaded) {
+    ac_console::showBannerOnce();
+}
 
 namespace ac {
 
@@ -439,16 +447,6 @@ namespace ac {
 
         if (!layer || !player || !g_ghost ||
             !player1 || limit <= 0 || g_tick < 2) {
-            log::info(
-                "[AC] PRED SKIP tick={} window={} "
-                "layer={} player={} ghost={} player1={}",
-                g_tick,
-                limit,
-                layer != nullptr,
-                player != nullptr,
-                g_ghost != nullptr,
-                player1
-            );
             return 0;
         }
 
@@ -457,20 +455,7 @@ namespace ac {
         const bool originalSafe =
             simulateDelay(layer, player, down, button, 0);
 
-        log::info(
-            "[AC] PRED tick={} input={} button={} "
-            "window={} delay=0 result={}",
-            g_tick,
-            action,
-            button,
-            limit,
-            originalSafe ? "SAFE" : "UNSAFE"
-        );
-
         if (originalSafe) {
-            log::info(
-                "[AC] DECISION: original timing retained"
-            );
             return 0;
         }
 
@@ -479,29 +464,10 @@ namespace ac {
                 layer, player, down, button, delay
             );
 
-            log::info(
-                "[AC] CANDIDATE tick={} input={} "
-                "delay={} result={}",
-                g_tick,
-                action,
-                delay,
-                safe ? "SAFE" : "UNSAFE"
-            );
-
             if (safe) {
-                log::info(
-                    "[AC] DECISION: input={} delay={} ticks",
-                    action,
-                    delay
-                );
                 return delay;
             }
         }
-
-        log::warn(
-            "[AC] DECISION: no safe delay; "
-            "keeping original timing"
-        );
 
         return 0;
     }
@@ -533,14 +499,6 @@ namespace ac {
         }
 
         if (delay == 0 && g_queue.empty()) {
-            log::info(
-                "[AC] INPUT immediate tick={} input={} "
-                "button={} player1={}",
-                g_tick,
-                down ? "DOWN" : "UP",
-                button,
-                player1
-            );
             g_applyingQueuedInput = true;
             layer->handleButton(down, button, player1);
             g_applyingQueuedInput = false;
@@ -569,16 +527,6 @@ namespace ac {
             button,
             player1
         });
-        log::info(
-            "[AC] INPUT queued tick={} dueTick={} "
-            "delay={} input={} button={} queueSize={}",
-            g_tick,
-            dueTick,
-            delay,
-            down ? "DOWN" : "UP",
-            button,
-            g_queue.size()
-        );
     }
 
     void dispatchPendingInputs(PlayLayer* layer, int nextTick) {
@@ -586,16 +534,6 @@ namespace ac {
                g_queue.front().tick <= nextTick) {
             auto input = g_queue.front();
             g_queue.pop_front();
-
-            log::info(
-                "[AC] INPUT dispatch tick={} dueTick={} "
-                "lateBy={} input={} button={}",
-                nextTick,
-                input.tick,
-                std::max(0, nextTick - input.tick),
-                input.down ? "DOWN" : "UP",
-                input.button
-            );
 
             g_applyingQueuedInput = true;
             layer->handleButton(
@@ -619,18 +557,6 @@ namespace ac {
     }
 
 } // namespace ac
-
-class $modify(ACMenuLayer, MenuLayer) {
-    bool init() {
-        if (!MenuLayer::init()) {
-            return false;
-        }
-
-        ac_console::showBannerOnce();
-
-        return true;
-    }
-};
 
 class $modify(ACKeyboard, CCKeyboardDispatcher) {
     bool dispatchKeyboardMSG(
@@ -656,8 +582,6 @@ class $modify(ACKeyboard, CCKeyboardDispatcher) {
                     " Ticks prediction"
                 );
             }
-
-            log::info("[AC] Prediction window: {} ticks", currentWindow);
 
             Notification::create(
                 fmt::format(
@@ -703,7 +627,6 @@ class $modify(ACPlayLayer, PlayLayer) {
             ac_console::line(
                 "[Assisted Click] Ghost simulator created"
             );
-            log::info("[AC] Ghost simulator created");
         }
         else {
             log::error("[AC] Ghost simulator creation failed");
@@ -711,18 +634,8 @@ class $modify(ACPlayLayer, PlayLayer) {
     }
 
     void resetLevel() {
-        log::info(
-            "[AC] RESET begin tick={}",
-            ac::g_tick
-        );
-
         PlayLayer::resetLevel();
         ac::clearState();
-
-        log::info(
-            "[AC] RESET end tick={}",
-            ac::g_tick
-        );
     }
 
     void onExit() {
