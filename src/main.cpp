@@ -535,8 +535,18 @@ class $modify(ACPlayLayer, PlayLayer) {
     }
 
     void resetLevel() {
+        log::info(
+            "[AC] RESET begin tick={}",
+            ac::g_tick
+        );
+
         PlayLayer::resetLevel();
         ac::clearState();
+
+        log::info(
+            "[AC] RESET end tick={}",
+            ac::g_tick
+        );
     }
 
     void onExit() {
@@ -643,6 +653,16 @@ class $modify(ACPlayerObject, PlayerObject) {
         if (isRealPlayer && dt > 0.0f) {
             ac::g_lastDx = getPositionX() - beforeX;
             ++ac::g_tick;
+
+            if (ac::g_tick == 1 || ac::g_tick % 60 == 0) {
+                log::info(
+                    "[AC] TICK heartbeat tick={} dt={} x={} dx={}",
+                    ac::g_tick,
+                    dt,
+                    getPositionX(),
+                    ac::g_lastDx
+                );
+            }
         }
     }
 };
