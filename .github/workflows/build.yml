@@ -19,7 +19,7 @@ jobs:
         with:
           sdk: nightly
           bindings: geode-sdk/bindings
-          bindings-ref: 1012fcb37243286184d319404b15fd929098fd47
+          bindings-ref: 36e102f0f84d89f92ed9b0bc2fbc5b5934a886d6
 
       - uses: actions/upload-artifact@v4
         with:
