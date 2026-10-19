@@ -15,6 +15,11 @@ jobs:
 
       - name: Build the mod
         uses: geode-sdk/build-geode-mod@main
+        id: build
         with:
-          bindings: geode-sdk/bindings
-          bindings-ref: main
+          sdk: nightly
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Mod Windows
+          path: ${{ steps.build.outputs.build-output }}
