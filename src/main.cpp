@@ -1,9 +1,17 @@
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+
+#include <mutex>
+#include <string>
+
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayerObject.hpp>
 #include <Geode/modify/CCKeyboardDispatcher.hpp>
 #include <Geode/modify/EffectGameObject.hpp>
+#include <Geode/modify/MenuLayer.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -13,6 +21,151 @@
 #include <vector>
 
 using namespace geode::prelude;
+
+namespace ac_console {
+
+#ifdef _WIN32
+
+static std::mutex g_mutex;
+static HANDLE g_output = INVALID_HANDLE_VALUE;
+static bool g_ready = false;
+static bool g_bannerShown = false;
+static bool g_tickLineActive = false;
+static size_t g_tickLineLength = 0;
+
+static void writeRaw(const std::string& text) {
+    if (g_output == nullptr ||
+        g_output == INVALID_HANDLE_VALUE ||
+        text.empty()) {
+        return;
+    }
+
+    DWORD written = 0;
+
+    WriteConsoleA(
+        g_output,
+        text.data(),
+        static_cast<DWORD>(text.size()),
+        &written,
+        nullptr
+    );
+}
+
+// Crea la consola y prepara su salida directa.
+bool init() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    if (g_ready) {
+        return true;
+    }
+
+    // Si el juego ya tiene una consola asociada,
+    // Windows no permite crear otra para el mismo proceso.
+    if (GetConsoleWindow() == nullptr && !AllocConsole()) {
+        return false;
+    }
+
+    g_output = GetStdHandle(STD_OUTPUT_HANDLE);
+
+    if (g_output == nullptr ||
+        g_output == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    SetConsoleTitleA("Assisted Click - Live Console");
+    SetConsoleOutputCP(CP_UTF8);
+
+    g_ready = true;
+    return true;
+}
+
+// Mensaje permanente: aparece en una línea nueva.
+void line(const std::string& message) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    if (!g_ready) {
+        return;
+    }
+
+    // Si había una línea de ticks activa, pasar a la siguiente.
+    if (g_tickLineActive) {
+        writeRaw("\r\n");
+        g_tickLineActive = false;
+        g_tickLineLength = 0;
+    }
+
+    writeRaw(message);
+    writeRaw("\r\n");
+}
+
+// Estado en vivo: reemplaza la línea anterior,
+// en vez de crear cientos de líneas por segundo.
+void tickLine(std::string message) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    if (!g_ready) {
+        return;
+    }
+
+    // Mantener el estado por debajo de 110 caracteres.
+    if (message.size() > 110) {
+        message.resize(110);
+    }
+
+    // Borrar los restos de un mensaje anterior más largo.
+    if (message.size() < g_tickLineLength) {
+        message.append(
+            g_tickLineLength - message.size(),
+            ' '
+        );
+    }
+
+    writeRaw("\r");
+    writeRaw(message);
+
+    g_tickLineLength = message.size();
+    g_tickLineActive = true;
+}
+
+// Banner de inicio, una sola vez.
+void showBannerOnce() {
+    if (!init()) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+
+        if (g_bannerShown) {
+            return;
+        }
+
+        g_bannerShown = true;
+    }
+
+    line("===================================================");
+    line("[Assisted Click] v1.0.0 LOADED");
+    line("[Assisted Click] Live console: direct game events");
+    line("[Assisted Click] Tick status updates in place");
+    line("[Assisted Click] Press F6 in-level to cycle prediction window");
+    line("===================================================");
+}
+
+#else
+
+inline bool init() {
+    return false;
+}
+
+inline void line(const std::string&) {}
+
+inline void tickLine(std::string) {}
+
+inline void showBannerOnce() {}
+
+#endif
+
+} // namespace ac_console
 
 namespace ac {
 
@@ -382,6 +535,21 @@ namespace ac {
             return;
         }
 
+        if (delay > 0) {
+            ac_console::line(
+                "[Assisted Click] DELAY SELECTED: +" +
+                std::to_string(delay) +
+                " TICKS | " +
+                (down ? "PRESS" : "RELEASE") +
+                " | tick " +
+                std::to_string(ac::g_tick) +
+                " -> due " +
+                std::to_string(ac::g_tick + delay) +
+                " | limit " +
+                std::to_string(windowTicks())
+            );
+        }
+
         if (delay == 0 && g_queue.empty()) {
             log::info(
                 "[AC] INPUT immediate tick={} input={} "
@@ -470,6 +638,18 @@ namespace ac {
     }
 }
 
+$modify(ACMenuLayer, MenuLayer) {
+    bool init() {
+        if (!MenuLayer::init()) {
+            return false;
+        }
+
+        ac_console::showBannerOnce();
+
+        return true;
+    }
+};
+
 class $modify(ACKeyboard, CCKeyboardDispatcher) {
     bool dispatchKeyboardMSG(
         cocos2d::enumKeyCodes key,
@@ -481,14 +661,26 @@ class $modify(ACKeyboard, CCKeyboardDispatcher) {
             ac::g_windowIndex =
                 (ac::g_windowIndex + 1) % 5;
 
-            const int ticks = ac::windowTicks();
+            const int currentWindow = ac::windowTicks();
 
-            log::info("[AC] Prediction window: {} ticks", ticks);
+            if (currentWindow <= 0) {
+                ac_console::line(
+                    "[Assisted Click] F6 Cycle -> OFF (raw input)"
+                );
+            } else {
+                ac_console::line(
+                    "[Assisted Click] F6 Cycle -> " +
+                    std::to_string(currentWindow) +
+                    " Ticks prediction"
+                );
+            }
+
+            log::info("[AC] Prediction window: {} ticks", currentWindow);
 
             Notification::create(
                 fmt::format(
                     "Assisted Click: {} ticks",
-                    ticks
+                    currentWindow
                 ),
                 NotificationIcon::None,
                 1.0f
@@ -527,6 +719,9 @@ class $modify(ACPlayLayer, PlayLayer) {
                 ac::g_ghost->m_playEffects = false;
             }
 
+            ac_console::line(
+                "[Assisted Click] Ghost simulator created"
+            );
             log::info("[AC] Ghost simulator created");
         }
         else {
@@ -654,15 +849,13 @@ class $modify(ACPlayerObject, PlayerObject) {
             ac::g_lastDx = getPositionX() - beforeX;
             ++ac::g_tick;
 
-            if (ac::g_tick == 1 || ac::g_tick % 60 == 0) {
-                log::info(
-                    "[AC] TICK heartbeat tick={} dt={} x={} dx={}",
-                    ac::g_tick,
-                    dt,
-                    getPositionX(),
-                    ac::g_lastDx
-                );
-            }
+            ac_console::tickLine(
+                "[Assisted Click] TICK " +
+                std::to_string(ac::g_tick) +
+                " | dt=" + std::to_string(dt) +
+                " | x=" + std::to_string(getPositionX()) +
+                " | dx=" + std::to_string(ac::g_lastDx)
+            );
         }
     }
 };
