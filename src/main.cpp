@@ -1,43 +1,91 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
+#include <Geode/modify/CCKeyboardDispatcher.hpp>
+#include <Geode/ui/Notification.hpp>
+#include <deque>
+#include <algorithm>
 
 using namespace geode::prelude;
 
 namespace {
-    int g_calls = 0;    // llamadas a processCommands desde el ultimo reinicio
-    int g_pattern = 0;  // cuantas llamadas hemos anotado para ver el patron
+    // Unidades que avanza el jugador por tick (medido en los logs)
+    constexpr float kPasoX = 1.2983f;
+
+    struct Pendiente {
+        int aplicarEnTick;
+        bool down;
+        int button;
+        bool isPlayer1;
+        int tickClick;
+        float xClick;
+    };
+
+    std::deque<Pendiente> g_cola;
+    int g_tick = 0;            // llamadas a processCommands desde el reinicio
+    int g_ultimoAplicar = 0;   // para no desordenar clicks si cambia el retraso
+
+    const int kOpciones[] = {0, 1, 2, 4, 8};
+    int g_indice = 0;
+
+    int retrasoActual() { return kOpciones[g_indice]; }
 }
+
+class $modify(MiTeclado, CCKeyboardDispatcher) {
+    bool dispatchKeyboardMSG(enumKeyCodes key, bool down, bool repeat, double timestamp) {
+        if (key == enumKeyCodes::KEY_F6 && down && !repeat) {
+            g_indice = (g_indice + 1) % (sizeof(kOpciones) / sizeof(kOpciones[0]));
+            int d = retrasoActual();
+            log::info("[AC] F6 -> retraso = {} ticks", d);
+            Notification::create(fmt::format("Retraso: {} ticks", d),
+                NotificationIcon::None, 1.0f)->show();
+        }
+        return CCKeyboardDispatcher::dispatchKeyboardMSG(key, down, repeat, timestamp);
+    }
+};
 
 class $modify(MiPlayLayer, PlayLayer) {
     void resetLevel() {
         PlayLayer::resetLevel();
-        g_calls = 0;
-        g_pattern = 0;
-        log::info("[AC] resetLevel: contador a 0");
+        g_cola.clear();
+        g_tick = 0;
+        g_ultimoAplicar = 0;
     }
 };
 
 class $modify(MiBaseLayer, GJBaseGameLayer) {
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
-        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
-        if (!PlayLayer::get()) return;
-
-        g_calls++;
-        // Solo anotamos las primeras 30 llamadas para ver el patron sin llenar el log
-        if (g_pattern < 30) {
-            g_pattern++;
-            log::info("[AC] processCommands #{} dt={:.6f} half={} last={}",
-                g_calls, dt, isHalfTick, isLastTick);
+        if (PlayLayer::get()) {
+            g_tick++;
+            // Aplicar los clicks cuyo momento ya llego, antes de este tick
+            while (!g_cola.empty() && g_cola.front().aplicarEnTick <= g_tick) {
+                Pendiente p = g_cola.front();
+                g_cola.pop_front();
+                if (m_player1) {
+                    float movido = m_player1->getPositionX() - p.xClick;
+                    log::info("[AC] APLICADO {} llamada#{} | esperó {} ticks fisicos (x movida {:.3f})",
+                        p.down ? "ABAJO" : "ARRIBA", g_tick,
+                        std::lround(movido / kPasoX), movido);
+                }
+                // Llamar a la funcion original (no pasa por nuestro retraso)
+                GJBaseGameLayer::handleButton(p.down, p.button, p.isPlayer1);
+            }
         }
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
     }
 
     void handleButton(bool down, int button, bool isPlayer1) {
-        if (PlayLayer::get() && m_player1) {
-            log::info("[AC] BOTON {} button={} p1={} llamada#{} x={:.3f} y={:.3f}",
-                down ? "ABAJO" : "ARRIBA", button, isPlayer1, g_calls,
-                m_player1->getPositionX(), m_player1->getPositionY());
+        int d = retrasoActual();
+        // Sin retraso, al inicio del nivel o fuera de un nivel: comportamiento normal
+        if (d == 0 || g_tick == 0 || !PlayLayer::get() || !m_player1) {
+            GJBaseGameLayer::handleButton(down, button, isPlayer1);
+            return;
         }
-        GJBaseGameLayer::handleButton(down, button, isPlayer1);
+        int cuando = std::max(g_tick + 1 + d, g_ultimoAplicar);
+        g_ultimoAplicar = cuando;
+        g_cola.push_back(Pendiente{cuando, down, button, isPlayer1,
+            g_tick, m_player1->getPositionX()});
+        log::info("[AC] GUARDADO {} retraso={} llamada#{} x={:.3f}",
+            down ? "ABAJO" : "ARRIBA", d, g_tick, m_player1->getPositionX());
     }
 };
