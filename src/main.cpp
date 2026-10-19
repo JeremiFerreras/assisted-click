@@ -178,7 +178,6 @@ namespace ac {
         std::vector<std::pair<GameObject*, ActivationBits>> saved;
 
         explicit ActivationGuard(PlayLayer* layer) {
-            // Actualizado para Geode v5 usando CCArrayExt
             for (auto* object : CCArrayExt<GameObject*>(layer->m_objects)) {
                 if (object) {
                     saved.emplace_back(
@@ -303,31 +302,74 @@ namespace ac {
     ) {
         const int limit = windowTicks();
 
-        // Only Player 1 is covered by this prototype.
-        if (!layer || !player || !g_ghost || !player1 ||
-            limit <= 0 || g_tick < 2) {
+        if (!layer || !player || !g_ghost ||
+            !player1 || limit <= 0 || g_tick < 2) {
             return 0;
         }
 
-        // If the original timing already survives, do not add latency.
-        if (simulateDelay(layer, player, down, button, 0)) {
+        const char* action = down ? "DOWN" : "UP";
+
+        // Primero comprobar si el tiempo original ya parece seguro.
+        const bool originalSafe =
+            simulateDelay(layer, player, down, button, 0);
+
+        log::info(
+            "[AC] PRED tick={} input={} button={} window={} "
+            "candidate=0 result={} deathFlag={} triggerFlag={}",
+            g_tick,
+            action,
+            button,
+            limit,
+            originalSafe ? "SAFE" : "UNSAFE",
+            g_cloneDied,
+            g_triggerEncountered
+        );
+
+        // Si el tiempo original parece seguro, no añadir retraso.
+        if (originalSafe) {
             return 0;
         }
 
-        // Select the first survivable offset.
+        // Probar retrasos desde el más corto hasta el límite configurado.
         for (int delay = 1; delay <= limit; ++delay) {
-            if (simulateDelay(
-                    layer, player, down, button, delay)) {
+            const bool safe = simulateDelay(
+                layer,
+                player,
+                down,
+                button,
+                delay
+            );
+
+            log::info(
+                "[AC] PRED tick={} input={} button={} "
+                "candidate={} result={} deathFlag={} triggerFlag={}",
+                g_tick,
+                action,
+                button,
+                delay,
+                safe ? "SAFE" : "UNSAFE",
+                g_cloneDied,
+                g_triggerEncountered
+            );
+
+            if (safe) {
                 log::info(
-                    "[AC] Predicted safe delay: {} ticks",
+                    "[AC] DECISION tick={} input={} delay={} ticks",
+                    g_tick,
+                    action,
                     delay
                 );
                 return delay;
             }
         }
 
-        // No alternative confirmed: retain the original timing.
-        log::info("[AC] No safe alternative confirmed");
+        log::warn(
+            "[AC] DECISION tick={} input={} "
+            "no safe delay found; keeping original timing",
+            g_tick,
+            action
+        );
+
         return 0;
     }
 
@@ -379,6 +421,15 @@ namespace ac {
                g_queue.front().tick <= nextTick) {
             auto input = g_queue.front();
             g_queue.pop_front();
+
+            log::info(
+                "[AC] APPLY tick={} scheduled={} input={} button={} lateBy={}",
+                nextTick,
+                input.tick,
+                input.down ? "DOWN" : "UP",
+                input.button,
+                std::max(0, nextTick - input.tick)
+            );
 
             g_applyingQueuedInput = true;
             layer->handleButton(
