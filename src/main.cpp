@@ -154,6 +154,7 @@ void showBannerOnce() {
     line("[Assisted Click] Events: DECISION / SCHEDULED / APPLIED");
     line("[Assisted Click] Tick status updates in place (every 4 ticks)");
     line("[Assisted Click] Press F6 in-level to cycle prediction window");
+    line("[Assisted Click] Press F7 for a status dump (also goes to Geode log)");
     line("===================================================");
 }
 
@@ -199,6 +200,15 @@ namespace ac {
     bool g_cloneDied = false;
     bool g_triggerEncountered = false;
     bool g_applyingQueuedInput = false;
+
+    // [DIAG] Una linea por cada clic con el veredicto (SAFE / UNKNOWN(motivo) / DEATH).
+    // Poner en false cuando todo funcione.
+    constexpr bool kVerboseClicks = true;
+    const char* g_unknownReason = "";
+    bool g_loggedFirstUpdate = false;
+    bool g_loggedFirstButton = false;
+    int g_clicksSeen = 0;
+    int g_clicksPredicted = 0;
 
     // Diagnostico (por nivel)
     bool g_seedVerified = false;
@@ -566,6 +576,7 @@ namespace ac {
         int candidateDue
     ) {
         if (!layer || !real || !g_ghost) {
+            g_unknownReason = "no-ghost";
             return SimResult::Unknown;
         }
 
@@ -575,6 +586,7 @@ namespace ac {
                 g_warnedDt = true;
                 ac_console::line("[Assisted Click] NOTE dt not stable yet -> prediction skipped (Unknown)");
             }
+            g_unknownReason = "dt-unstable";
             return SimResult::Unknown;
         }
 
@@ -596,6 +608,7 @@ namespace ac {
         const int lastStep = events.back().step;
         const int totalSteps = lastStep + kLookAhead;
         if (totalSteps > kMaxSimSteps) {
+            g_unknownReason = "too-many-steps";
             return SimResult::Unknown;
         }
 
@@ -639,6 +652,7 @@ namespace ac {
                                 "See kForceXCompensation in main.cpp."
                             );
                         }
+                        g_unknownReason = "ghost-x-static";
                         result = SimResult::Unknown;
                         break;
                     }
@@ -653,6 +667,7 @@ namespace ac {
 
                 // [FIX 3.4] Trigger = estado no modelado -> Unknown (no muerte).
                 if (g_triggerEncountered) {
+                    g_unknownReason = "trigger";
                     result = SimResult::Unknown;
                     break;
                 }
@@ -673,6 +688,7 @@ namespace ac {
                 g_warnedWorld = true;
                 ac_console::line("[Assisted Click] WARNING simulation modified the real player state!");
             }
+            g_unknownReason = "real-state-changed";
             return SimResult::Unknown;
         }
 
@@ -698,6 +714,8 @@ namespace ac {
         const auto t0 = std::chrono::steady_clock::now();
 
         int chosen = 0;
+        ++g_clicksPredicted;
+        g_unknownReason = "";
         ActivationGuard guard(layer);
 
         int prevDue = effectiveDue(key, 0);
@@ -707,10 +725,23 @@ namespace ac {
 
         if (baseline == SimResult::Safe) {
             ++g_statKept;
+            if constexpr (kVerboseClicks) {
+                ac_console::line(
+                    "[Assisted Click] CLICK " + std::string(down ? "PRESS" : "RELEASE") +
+                    " | tick " + std::to_string(g_tick) + " | verdict=SAFE (unchanged)"
+                );
+            }
         }
         else if (baseline == SimResult::Unknown) {
             // [FIX 3.4] No inventar alternativas: se conserva la entrada original.
             ++g_statUnknown;
+            if constexpr (kVerboseClicks) {
+                ac_console::line(
+                    "[Assisted Click] CLICK " + std::string(down ? "PRESS" : "RELEASE") +
+                    " | tick " + std::to_string(g_tick) +
+                    " | verdict=UNKNOWN (" + std::string(g_unknownReason) + ") -> unchanged"
+                );
+            }
         }
         else {
             bool found = false;
@@ -872,6 +903,11 @@ namespace ac {
         g_statUnknown = 0;
         g_lastSimUs = 0;
         g_maxSimUs = 0;
+        g_loggedFirstUpdate = false;
+        g_loggedFirstButton = false;
+        g_clicksSeen = 0;
+        g_clicksPredicted = 0;
+        g_unknownReason = "";
     }
 
 } // namespace ac
@@ -908,6 +944,26 @@ class $modify(ACKeyboard, CCKeyboardDispatcher) {
             )->show();
         }
 
+        // [DIAG] F7: volcado de estado a consola Y al log de Geode.
+        if (key == cocos2d::enumKeyCodes::KEY_F7 && down && !repeat) {
+            auto* pl = PlayLayer::get();
+            std::string msg =
+                "[Assisted Click] STATUS | inLevel=" + std::string(pl ? "yes" : "NO") +
+                " | window=" + std::to_string(ac::windowTicks()) +
+                " | ghost=" + std::string(ac::g_ghost ? "ok" : "NULL") +
+                " | tick=" + std::to_string(ac::g_tick) +
+                " | dtStable=" + std::to_string(ac::g_dtStable) +
+                " | clicksSeen=" + std::to_string(ac::g_clicksSeen) +
+                " | predicted=" + std::to_string(ac::g_clicksPredicted) +
+                " | kept=" + std::to_string(ac::g_statKept) +
+                " chg=" + std::to_string(ac::g_statChanged) +
+                " nosol=" + std::to_string(ac::g_statNoSolution) +
+                " unk=" + std::to_string(ac::g_statUnknown) +
+                " | lastUnknown=" + std::string(ac::g_unknownReason);
+            ac_console::line(msg);
+            log::info("{}", msg);
+        }
+
         return CCKeyboardDispatcher::dispatchKeyboardMSG(
             key, down, repeat, timestamp
         );
@@ -940,9 +996,11 @@ class $modify(ACPlayLayer, PlayLayer) {
             ac::g_ghost->m_playEffects = false;
 
             ac_console::line("[Assisted Click] Ghost simulator created");
+            log::info("[AC] PlayLayer ready, ghost created");
         }
         else {
             log::error("[AC] Ghost simulator creation failed");
+            ac_console::line("[Assisted Click] ERROR: ghost creation FAILED -> no prediction");
         }
     }
 
@@ -985,6 +1043,23 @@ class $modify(ACBaseLayer, GJBaseGameLayer) {
         }
 
         auto* layer = PlayLayer::get();
+
+        ++ac::g_clicksSeen;
+        if (!ac::g_loggedFirstButton) {
+            ac::g_loggedFirstButton = true;
+            const std::string m =
+                "[Assisted Click] First handleButton | down=" + std::to_string(down) +
+                " button=" + std::to_string(button) +
+                " p1=" + std::to_string(isPlayer1) +
+                " playLayer=" + std::string(layer ? "yes" : "NO") +
+                " sameLayer=" + std::string(
+                    (layer && static_cast<GJBaseGameLayer*>(layer) ==
+                              static_cast<GJBaseGameLayer*>(this)) ? "yes" : "NO") +
+                " window=" + std::to_string(ac::windowTicks()) +
+                " ghost=" + std::string(ac::g_ghost ? "ok" : "NULL");
+            ac_console::line(m);
+            log::info("{}", m);
+        }
 
         // [FIX 2.5] Solo interceptar si ESTA capa es el PlayLayer activo.
         if (!layer ||
@@ -1042,6 +1117,15 @@ class $modify(ACPlayerObject, PlayerObject) {
             ac::g_stepDt = dt;
             ac::g_lastDx = getPositionX() - beforeX;
             ++ac::g_tick;
+
+            if (!ac::g_loggedFirstUpdate) {
+                ac::g_loggedFirstUpdate = true;
+                const std::string m =
+                    "[Assisted Click] First real P1 update | dt=" + std::to_string(dt) +
+                    " dx=" + std::to_string(ac::g_lastDx);
+                ac_console::line(m);
+                log::info("{}", m);
+            }
 
             // [FIX 5] Refresco visual cada 4 ticks (el contador interno va cada paso).
             if ((ac::g_tick & 3) == 0) {
