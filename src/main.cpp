@@ -50,7 +50,6 @@ static void writeRaw(const std::string& text) {
     );
 }
 
-// Crea la consola y prepara su salida directa.
 bool init() {
     std::lock_guard<std::mutex> lock(g_mutex);
 
@@ -76,7 +75,6 @@ bool init() {
     return true;
 }
 
-// Mensaje permanente: aparece en una línea nueva.
 void line(const std::string& message) {
     std::lock_guard<std::mutex> lock(g_mutex);
 
@@ -94,7 +92,6 @@ void line(const std::string& message) {
     writeRaw("\r\n");
 }
 
-// Estado en vivo: reemplaza la línea anterior.
 void tickLine(std::string message) {
     std::lock_guard<std::mutex> lock(g_mutex);
 
@@ -120,7 +117,6 @@ void tickLine(std::string message) {
     g_tickLineActive = true;
 }
 
-// Banner de inicio, una sola vez.
 void showBannerOnce() {
     if (!init()) {
         return;
@@ -621,9 +617,10 @@ namespace ac {
         g_triggerEncountered = false;
         g_applyingQueuedInput = false;
     }
+
 } // namespace ac
 
-$modify(ACMenuLayer, MenuLayer) {
+class $modify(ACMenuLayer, MenuLayer) {
     bool init() {
         if (!MenuLayer::init()) {
             return false;
