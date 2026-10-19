@@ -18,8 +18,7 @@ jobs:
         id: build
         with:
           sdk: nightly
-          bindings: geode-sdk/bindings
-          bindings-ref: 36e102f0f84d89f92ed9b0bc2fbc5b5934a886d6
+          configure-args: -DSKIP_BUILDING_CODEGEN=OFF
 
       - uses: actions/upload-artifact@v4
         with:
