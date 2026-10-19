@@ -304,58 +304,58 @@ namespace ac {
 
         if (!layer || !player || !g_ghost ||
             !player1 || limit <= 0 || g_tick < 2) {
+            log::info(
+                "[AC] PRED SKIP tick={} window={} "
+                "layer={} player={} ghost={} player1={}",
+                g_tick,
+                limit,
+                layer != nullptr,
+                player != nullptr,
+                g_ghost != nullptr,
+                player1
+            );
             return 0;
         }
 
         const char* action = down ? "DOWN" : "UP";
 
-        // Primero comprobar si el tiempo original ya parece seguro.
         const bool originalSafe =
             simulateDelay(layer, player, down, button, 0);
 
         log::info(
-            "[AC] PRED tick={} input={} button={} window={} "
-            "candidate=0 result={} deathFlag={} triggerFlag={}",
+            "[AC] PRED tick={} input={} button={} "
+            "window={} delay=0 result={}",
             g_tick,
             action,
             button,
             limit,
-            originalSafe ? "SAFE" : "UNSAFE",
-            g_cloneDied,
-            g_triggerEncountered
+            originalSafe ? "SAFE" : "UNSAFE"
         );
 
-        // Si el tiempo original parece seguro, no añadir retraso.
         if (originalSafe) {
+            log::info(
+                "[AC] DECISION: original timing retained"
+            );
             return 0;
         }
 
-        // Probar retrasos desde el más corto hasta el límite configurado.
         for (int delay = 1; delay <= limit; ++delay) {
             const bool safe = simulateDelay(
-                layer,
-                player,
-                down,
-                button,
-                delay
+                layer, player, down, button, delay
             );
 
             log::info(
-                "[AC] PRED tick={} input={} button={} "
-                "candidate={} result={} deathFlag={} triggerFlag={}",
+                "[AC] CANDIDATE tick={} input={} "
+                "delay={} result={}",
                 g_tick,
                 action,
-                button,
                 delay,
-                safe ? "SAFE" : "UNSAFE",
-                g_cloneDied,
-                g_triggerEncountered
+                safe ? "SAFE" : "UNSAFE"
             );
 
             if (safe) {
                 log::info(
-                    "[AC] DECISION tick={} input={} delay={} ticks",
-                    g_tick,
+                    "[AC] DECISION: input={} delay={} ticks",
                     action,
                     delay
                 );
@@ -364,10 +364,8 @@ namespace ac {
         }
 
         log::warn(
-            "[AC] DECISION tick={} input={} "
-            "no safe delay found; keeping original timing",
-            g_tick,
-            action
+            "[AC] DECISION: no safe delay; "
+            "keeping original timing"
         );
 
         return 0;
@@ -385,6 +383,14 @@ namespace ac {
         }
 
         if (delay == 0 && g_queue.empty()) {
+            log::info(
+                "[AC] INPUT immediate tick={} input={} "
+                "button={} player1={}",
+                g_tick,
+                down ? "DOWN" : "UP",
+                button,
+                player1
+            );
             g_applyingQueuedInput = true;
             layer->handleButton(down, button, player1);
             g_applyingQueuedInput = false;
@@ -414,6 +420,16 @@ namespace ac {
             button,
             player1
         });
+        log::info(
+            "[AC] INPUT queued tick={} dueTick={} "
+            "delay={} input={} button={} queueSize={}",
+            g_tick,
+            dueTick,
+            delay,
+            down ? "DOWN" : "UP",
+            button,
+            g_queue.size()
+        );
     }
 
     void dispatchPendingInputs(PlayLayer* layer, int nextTick) {
@@ -423,12 +439,13 @@ namespace ac {
             g_queue.pop_front();
 
             log::info(
-                "[AC] APPLY tick={} scheduled={} input={} button={} lateBy={}",
+                "[AC] INPUT dispatch tick={} dueTick={} "
+                "lateBy={} input={} button={}",
                 nextTick,
                 input.tick,
+                std::max(0, nextTick - input.tick),
                 input.down ? "DOWN" : "UP",
-                input.button,
-                std::max(0, nextTick - input.tick)
+                input.button
             );
 
             g_applyingQueuedInput = true;
@@ -455,12 +472,12 @@ namespace ac {
 
 class $modify(ACKeyboard, CCKeyboardDispatcher) {
     bool dispatchKeyboardMSG(
-        enumKeyCodes key,
+        cocos2d::enumKeyCodes key,
         bool down,
         bool repeat,
         double timestamp
     ) {
-        if (key == enumKeyCodes::KEY_F6 && down && !repeat) {
+        if (key == cocos2d::enumKeyCodes::KEY_F6 && down && !repeat) {
             ac::g_windowIndex =
                 (ac::g_windowIndex + 1) % 5;
 
@@ -523,16 +540,17 @@ class $modify(ACPlayLayer, PlayLayer) {
     }
 
     void onExit() {
-        PlayLayer::onExit();
-
         ac::clearState();
 
-        if (ac::g_ghost) {
-            ac::g_ghost->release();
-            ac::g_ghost = nullptr;
+        auto* ghost = ac::g_ghost;
+        ac::g_ghost = nullptr;
+        ac::g_layer = nullptr;
+
+        if (ghost) {
+            ghost->release();
         }
 
-        ac::g_layer = nullptr;
+        PlayLayer::onExit();
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
