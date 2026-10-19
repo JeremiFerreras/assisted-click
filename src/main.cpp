@@ -187,7 +187,7 @@ namespace ac {
         int tick;
         bool down;
         int button;
-        bool player1;
+        bool player2;
     };
 
     std::deque<PendingInput> g_queue;
@@ -197,8 +197,8 @@ namespace ac {
         return kWindows[g_windowIndex];
     }
 
-    int buttonKey(int button, bool player1) {
-        return button + (player1 ? 0 : 10000);
+    int buttonKey(int button, bool player2) {
+        return button + (player2 ? 10000 : 0);
     }
 
     template <class P>
@@ -441,16 +441,14 @@ namespace ac {
         PlayerObject* player,
         bool down,
         int button,
-        bool player1
+        bool player2
     ) {
         const int limit = windowTicks();
 
         if (!layer || !player || !g_ghost ||
-            !player1 || limit <= 0 || g_tick < 2) {
+            player2 || limit <= 0 || g_tick < 2) {
             return 0;
         }
-
-        const char* action = down ? "DOWN" : "UP";
 
         const bool originalSafe =
             simulateDelay(layer, player, down, button, 0);
@@ -476,7 +474,7 @@ namespace ac {
         PlayLayer* layer,
         bool down,
         int button,
-        bool player1,
+        bool player2,
         int delay
     ) {
         if (!layer) {
@@ -500,7 +498,7 @@ namespace ac {
 
         if (delay == 0 && g_queue.empty()) {
             g_applyingQueuedInput = true;
-            layer->handleButton(down, button, player1);
+            layer->handleButton(down, button, player2);
             g_applyingQueuedInput = false;
             return;
         }
@@ -525,7 +523,7 @@ namespace ac {
             dueTick,
             down,
             button,
-            player1
+            player2
         });
     }
 
@@ -539,7 +537,7 @@ namespace ac {
             layer->handleButton(
                 input.down,
                 input.button,
-                input.player1
+                input.player2
             );
             g_applyingQueuedInput = false;
         }
@@ -652,7 +650,7 @@ class $modify(ACPlayLayer, PlayLayer) {
         PlayLayer::onExit();
     }
 
-    void destroyPlayer(PlayerObject* player, GameObject* object) {
+    destroyPlayer(PlayerObject* player, GameObject* object) {
         if (ac::g_simulating && player == ac::g_ghost) {
             ac::g_cloneDied = true;
             return;
@@ -663,44 +661,51 @@ class $modify(ACPlayLayer, PlayLayer) {
 };
 
 class $modify(ACBaseLayer, GJBaseGameLayer) {
-    void handleButton(bool down, int button, bool player1) {
+    void handleButton(bool down, int button, bool player2) {
         if (ac::g_applyingQueuedInput || ac::g_simulating) {
             GJBaseGameLayer::handleButton(
-                down, button, player1
+                down, button, player2
             );
             return;
         }
 
         auto* layer = PlayLayer::get();
+        if (!layer) {
+            GJBaseGameLayer::handleButton(
+                down, button, player2
+            );
+            return;
+        }
 
-        if (!layer || !layer->m_player1 ||
-            ac::windowTicks() == 0) {
+        auto* player = player2 ? layer->m_player2 : layer->m_player1;
+
+        if (!player || ac::windowTicks() == 0) {
             if (down) {
                 ac::g_pressDelay[
-                    ac::buttonKey(button, player1)
+                    ac::buttonKey(button, player2)
                 ] = 0;
             }
             else {
                 ac::g_pressDelay.erase(
-                    ac::buttonKey(button, player1)
+                    ac::buttonKey(button, player2)
                 );
             }
 
             GJBaseGameLayer::handleButton(
-                down, button, player1
+                down, button, player2
             );
             return;
         }
 
         int delay = ac::predictDelay(
             layer,
-            layer->m_player1,
+            player,
             down,
             button,
-            player1
+            player2
         );
 
-        const int key = ac::buttonKey(button, player1);
+        const int key = ac::buttonKey(button, player2);
 
         if (down) {
             ac::g_pressDelay[key] = delay;
@@ -715,7 +720,7 @@ class $modify(ACBaseLayer, GJBaseGameLayer) {
         }
 
         ac::queueInput(
-            layer, down, button, player1, delay
+            layer, down, button, player2, delay
         );
     }
 };
@@ -768,3 +773,4 @@ class $modify(ACEffectObject, EffectGameObject) {
         );
     }
 };
+```[cite: 1]
