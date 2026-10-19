@@ -190,9 +190,9 @@ namespace ac {
              object,
              captureActivation(object)
          );
-     }
+      }
    }
-}
+};
 
         ~ActivationGuard() {
             for (auto& entry : saved) {
