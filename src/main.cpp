@@ -179,15 +179,20 @@ namespace ac {
         std::vector<std::pair<GameObject*, ActivationBits>> saved;
 
         explicit ActivationGuard(PlayLayer* layer) {
-            for (auto* object : layer->m_objects) {
-                if (object) {
-                    saved.emplace_back(
-                        object,
-                        captureActivation(object)
-                    );
-                }
-            }
-        }
+
+cocos2d::CCObject* item = nullptr;
+
+CCARRAY_FOREACH(layer->m_objects, item) {
+    auto* object = typeinfo_cast<GameObject*>(item);
+
+    if (object) {
+        saved.emplace_back(
+            object,
+            captureActivation(object)
+        );
+    }
+}
+
 
         ~ActivationGuard() {
             for (auto& entry : saved) {
@@ -431,7 +436,7 @@ class $modify(ACKeyboard, CCKeyboardDispatcher) {
             key, down, repeat, timestamp
         );
     }
-}
+};
 
 class $modify(ACPlayLayer, PlayLayer) {
     void setupHasCompleted() {
@@ -492,7 +497,7 @@ class $modify(ACPlayLayer, PlayLayer) {
 
         PlayLayer::destroyPlayer(player, object);
     }
-}
+};
 
 class $modify(ACBaseLayer, GJBaseGameLayer) {
     void handleButton(bool down, int button, bool player1) {
@@ -551,7 +556,7 @@ class $modify(ACBaseLayer, GJBaseGameLayer) {
             layer, down, button, player1, delay
         );
     }
-}
+};
 
 class $modify(ACPlayerObject, PlayerObject) {
     void update(float dt) {
@@ -576,7 +581,7 @@ class $modify(ACPlayerObject, PlayerObject) {
             ++ac::g_tick;
         }
     }
-}
+};
 
 class $modify(ACEffectObject, EffectGameObject) {
     void triggerObject(
@@ -594,4 +599,4 @@ class $modify(ACEffectObject, EffectGameObject) {
             layer, id, groups
         );
     }
-}
+};
