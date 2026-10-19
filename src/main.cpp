@@ -1,5 +1,4 @@
 #define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
 #include <windows.h>
 
 #include <mutex>
@@ -59,8 +58,6 @@ bool init() {
         return true;
     }
 
-    // Si el juego ya tiene una consola asociada,
-    // Windows no permite crear otra para el mismo proceso.
     if (GetConsoleWindow() == nullptr && !AllocConsole()) {
         return false;
     }
@@ -87,7 +84,6 @@ void line(const std::string& message) {
         return;
     }
 
-    // Si había una línea de ticks activa, pasar a la siguiente.
     if (g_tickLineActive) {
         writeRaw("\r\n");
         g_tickLineActive = false;
@@ -98,8 +94,7 @@ void line(const std::string& message) {
     writeRaw("\r\n");
 }
 
-// Estado en vivo: reemplaza la línea anterior,
-// en vez de crear cientos de líneas por segundo.
+// Estado en vivo: reemplaza la línea anterior.
 void tickLine(std::string message) {
     std::lock_guard<std::mutex> lock(g_mutex);
 
@@ -107,12 +102,10 @@ void tickLine(std::string message) {
         return;
     }
 
-    // Mantener el estado por debajo de 110 caracteres.
     if (message.size() > 110) {
         message.resize(110);
     }
 
-    // Borrar los restos de un mensaje anterior más largo.
     if (message.size() < g_tickLineLength) {
         message.append(
             g_tickLineLength - message.size(),
@@ -204,8 +197,6 @@ namespace ac {
         return button + (player1 ? 0 : 10000);
     }
 
-    // Copy only fields that are available in the active bindings.
-    // This does not constitute a complete PlayerObject snapshot.
     template <class P>
     void seedGhost(P* dst, P* src) {
         dst->resetCollisionLog(true);
@@ -386,8 +377,6 @@ namespace ac {
         }
     }
 
-    // Simulate one candidate delay from the current pre-input state.
-    // Effect triggers invalidate the prediction instead of being activated.
     bool simulateDelay(
         PlayLayer* layer,
         PlayerObject* real,
@@ -417,8 +406,6 @@ namespace ac {
 
                 g_ghost->update(kPhysicsDt);
 
-                // Some detached PlayerObjects do not advance horizontally.
-                // Fall back to the last measured player displacement.
                 const float afterX = g_ghost->getPositionX();
 
                 if (std::abs(afterX - beforeX) < 0.0001f &&
@@ -442,7 +429,6 @@ namespace ac {
             }
         }
 
-        // ActivationGuard restores shared object activation flags here.
         return survived;
     }
 
@@ -573,7 +559,6 @@ namespace ac {
                 g_queue.back().tick
             );
 
-            // Do not let a release collapse onto its queued press.
             if (!down) {
                 dueTick = std::max(
                     dueTick,
@@ -636,7 +621,7 @@ namespace ac {
         g_triggerEncountered = false;
         g_applyingQueuedInput = false;
     }
-}
+} // namespace ac
 
 $modify(ACMenuLayer, MenuLayer) {
     bool init() {
@@ -704,7 +689,6 @@ class $modify(ACPlayLayer, PlayLayer) {
             ac::g_ghost = nullptr;
         }
 
-        // Persistent clone: do not create one on every click.
         ac::g_ghost = PlayerObject::create(
             1, 0, this, this, true
         );
@@ -815,7 +799,6 @@ class $modify(ACBaseLayer, GJBaseGameLayer) {
             auto it = ac::g_pressDelay.find(key);
 
             if (it != ac::g_pressDelay.end()) {
-                // Do not shorten the press/release interval.
                 delay = std::max(delay, it->second);
                 ac::g_pressDelay.erase(it);
             }
@@ -837,7 +820,6 @@ class $modify(ACPlayerObject, PlayerObject) {
             !ac::g_simulating;
 
         if (isRealPlayer) {
-            // Dispatch scheduled inputs before the next physics update.
             ac::dispatchPendingInputs(layer, ac::g_tick + 1);
         }
 
@@ -867,7 +849,6 @@ class $modify(ACEffectObject, EffectGameObject) {
         gd::vector<int> const* groups
     ) {
         if (ac::g_simulating) {
-            // Do not let predicted paths change real level state.
             ac::g_triggerEncountered = true;
             return;
         }
