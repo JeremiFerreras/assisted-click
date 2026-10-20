@@ -107,12 +107,13 @@ namespace ac {
     constexpr Stage kStages[] = { {2, 2}, {4, 4}, {8, 8}, {16, 8}, {0, 0} };
     constexpr int kStageCount = 5;
 
-    // Ticks simulados tras aplicar la entrada. La simulacion MANTIENE el boton en su ultimo
-    // estado todo ese tiempo, pero el jugador real lo cambiara pronto. Un horizonte largo
-    // (antes 64 = 16 frames) daba "muertes" falsas por mantener pulsado/soltado demasiado
-    // (log: PRESS tick 262 -> DEATH y 2 ticks despues RELEASE -> SAFE). Solo importa el
-    // peligro INMEDIATO que provoca el timing del clic.
-    constexpr int kHorizon = 28;
+    // Ventana CRITICA: ticks que se simulan tras aplicar la entrada. La simulacion mantiene
+    // el boton igual todo ese tiempo, pero el jugador real lo cambia pronto (en wave cada
+    // pocos frames). Con 28-64 ticks el fantasma moria siempre al chocar con techo/suelo por
+    // "mantener pulsado" (log: DEATH at step 22-26 sin importar el retraso) y nunca habia
+    // un retraso "seguro". Las muertes que SI dependen del timing del clic ocurren en los
+    // primeros ticks (el video de referencia muestra Frame0: 8). 16 ticks = 4 frames @60fps.
+    constexpr int kHorizon = 16;
     constexpr int kMaxSimSteps = 160;   // tope de seguridad por simulacion
     constexpr bool kLogVerdicts = true; // veredicto por clic -> log de Geode (NO consola)
 
