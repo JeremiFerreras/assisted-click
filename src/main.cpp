@@ -178,6 +178,18 @@ namespace ac {
     int g_statKept = 0, g_statSaved = 0, g_statNoSolution = 0, g_statUnknown = 0;
     bool g_warnedX = false, g_warnedSeed = false, g_warnedWorld = false;
 
+    bool g_loggedFirstUpdate = false;
+
+    std::string statusLine(const char* tag) {
+        return fmt::format(
+            "[IB] {} stage={} ghost={} tick={} dtStable={} clicks={} predicted={} kept={} saved={} "
+            "nosol={} unknown={} lastUnknown={} | skipped: off={} early={} dead={} noGhost={} other={}",
+            tag, g_stage + 1, g_ghost ? "ok" : "NULL", g_tick, g_dtStable, g_clicksSeen,
+            g_clicksPredicted, g_statKept, g_statSaved, g_statNoSolution, g_statUnknown,
+            g_unknownReason, g_skipOff, g_skipEarly, g_skipDead, g_skipNoGhost, g_skipOther
+        );
+    }
+
     enum class SimResult { Safe, Died, Unknown };
 
     struct SimOut {
@@ -241,6 +253,7 @@ namespace ac {
         g_unknownReason = "";
         g_clicksSeen = g_clicksPredicted = 0;
         g_skipOff = g_skipEarly = g_skipDead = g_skipNoGhost = g_skipOther = 0;
+        g_loggedFirstUpdate = false;
         g_statKept = g_statSaved = g_statNoSolution = g_statUnknown = 0;
         g_warnedX = g_warnedSeed = g_warnedWorld = false;
     }
@@ -735,15 +748,7 @@ class $modify(IBKeyboard, CCKeyboardDispatcher) {
                 ac_console::line("[InputBuffer] F6 Cycle -> " + ac::stageText(ac::g_stage));
             }
             else if (key == cocos2d::enumKeyCodes::KEY_F7) {
-                log::info(
-                    "[IB] STATUS stage={} ghost={} tick={} dtStable={} clicks={} predicted={} "
-                    "kept={} saved={} nosol={} unknown={} lastUnknown={} | skipped: off={} early={} "
-                    "dead={} noGhost={} other={}",
-                    ac::g_stage + 1, ac::g_ghost ? "ok" : "NULL", ac::g_tick, ac::g_dtStable,
-                    ac::g_clicksSeen, ac::g_clicksPredicted, ac::g_statKept, ac::g_statSaved,
-                    ac::g_statNoSolution, ac::g_statUnknown, ac::g_unknownReason,
-                    ac::g_skipOff, ac::g_skipEarly, ac::g_skipDead, ac::g_skipNoGhost, ac::g_skipOther
-                );
+                log::info("{}", ac::statusLine("STATUS"));
             }
         }
 
@@ -767,6 +772,10 @@ class $modify(IBPlayLayer, PlayLayer) {
     }
 
     void resetLevel() {
+        // Resumen automatico en cada reinicio/muerte (no hace falta pulsar F7).
+        if (ac::g_clicksSeen > 0 || ac::g_tick > 0) {
+            log::info("{}", ac::statusLine("ATTEMPT"));
+        }
         ac::clearState();
         PlayLayer::resetLevel();
         ac::clearState();
@@ -779,6 +788,9 @@ class $modify(IBPlayLayer, PlayLayer) {
     }
 
     void onQuit() {
+        if (ac::g_clicksSeen > 0 || ac::g_tick > 0) {
+            log::info("{}", ac::statusLine("QUIT"));
+        }
         ac::clearState();
         ac::destroyGhost();
         ac::g_layer = nullptr;
@@ -815,6 +827,13 @@ class $modify(IBBaseLayer, GJBaseGameLayer) {
         }
 
         ++ac::g_clicksSeen;
+        if (ac::g_clicksSeen <= 3) {
+            log::info(
+                "[IB] handleButton #{} down={} button={} stage={} tick={} dtStable={} ghost={} dart={}",
+                ac::g_clicksSeen, down, button, ac::g_stage + 1, ac::g_tick, ac::g_dtStable,
+                ac::g_ghost ? "ok" : "NULL", layer->m_player1 ? layer->m_player1->m_isDart : false
+            );
+        }
 
         int delay = 0;
         auto* player = layer->m_player1;
@@ -917,6 +936,11 @@ class $modify(IBPlayerObject, PlayerObject) {
             ac::g_stepDt = dt;
             ac::g_lastDx = getPositionX() - beforeX;
             ++ac::g_tick;
+
+            if (!ac::g_loggedFirstUpdate) {
+                ac::g_loggedFirstUpdate = true;
+                log::info("[IB] first real update dt={} dx={}", dt, ac::g_lastDx);
+            }
         }
     }
 
