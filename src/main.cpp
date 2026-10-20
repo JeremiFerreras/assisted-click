@@ -107,7 +107,12 @@ namespace ac {
     constexpr Stage kStages[] = { {2, 2}, {4, 4}, {8, 8}, {16, 8}, {0, 0} };
     constexpr int kStageCount = 5;
 
-    constexpr int kHorizon = 64;        // ticks simulados tras aplicar la entrada
+    // Ticks simulados tras aplicar la entrada. La simulacion MANTIENE el boton en su ultimo
+    // estado todo ese tiempo, pero el jugador real lo cambiara pronto. Un horizonte largo
+    // (antes 64 = 16 frames) daba "muertes" falsas por mantener pulsado/soltado demasiado
+    // (log: PRESS tick 262 -> DEATH y 2 ticks despues RELEASE -> SAFE). Solo importa el
+    // peligro INMEDIATO que provoca el timing del clic.
+    constexpr int kHorizon = 28;
     constexpr int kMaxSimSteps = 160;   // tope de seguridad por simulacion
     constexpr bool kLogVerdicts = true; // veredicto por clic -> log de Geode (NO consola)
 
@@ -168,6 +173,7 @@ namespace ac {
     // ---- Diagnostico (solo log de Geode)
     const char* g_unknownReason = "";
     int g_clicksSeen = 0, g_clicksPredicted = 0;
+    int g_skipOff = 0, g_skipEarly = 0, g_skipDead = 0, g_skipNoGhost = 0, g_skipOther = 0;
     int g_statKept = 0, g_statSaved = 0, g_statNoSolution = 0, g_statUnknown = 0;
     bool g_warnedX = false, g_warnedSeed = false, g_warnedWorld = false;
 
@@ -233,6 +239,7 @@ namespace ac {
     void clearStats() {
         g_unknownReason = "";
         g_clicksSeen = g_clicksPredicted = 0;
+        g_skipOff = g_skipEarly = g_skipDead = g_skipNoGhost = g_skipOther = 0;
         g_statKept = g_statSaved = g_statNoSolution = g_statUnknown = 0;
         g_warnedX = g_warnedSeed = g_warnedWorld = false;
     }
@@ -583,8 +590,11 @@ namespace ac {
 
     int predictDelay(PlayLayer* layer, PlayerObject* player, bool down, int button) {
         const int limit = limitFor(player);
-        if (!layer || !player || limit <= 0 || g_tick < 2 || player->m_isDead) return 0;
-        if (!ensureGhost(layer)) return 0;
+        if (!layer || !player) { ++g_skipOther; return 0; }
+        if (limit <= 0)        { ++g_skipOff; return 0; }
+        if (g_tick < 2)        { ++g_skipEarly; return 0; }
+        if (player->m_isDead)  { ++g_skipDead; return 0; }
+        if (!ensureGhost(layer)) { ++g_skipNoGhost; return 0; }
 
         ++g_clicksPredicted;
         g_unknownReason = "";
@@ -613,6 +623,9 @@ namespace ac {
         else {
             bool found = false;
             SimOut best{SimResult::Died, 0};
+            int bestSurvive = 0;
+            int bestDelay = 0;
+            int unknownCands = 0;
 
             for (int d = 1; d <= limit; ++d) {
                 const int due = effectiveDue(key, d);
@@ -628,6 +641,11 @@ namespace ac {
                     found = true;
                     break;
                 }
+                if (r.result == SimResult::Died && r.steps > bestSurvive) {
+                    bestSurvive = r.steps;
+                    bestDelay = d;
+                }
+                if (r.result == SimResult::Unknown) ++unknownCands;
             }
 
             if (found) {
@@ -641,7 +659,12 @@ namespace ac {
             } else {
                 ++g_statNoSolution;
                 if constexpr (kLogVerdicts) {
-                    log::debug("[IB] {} tick {} -> DEATH, no safe delay in {}", down ? "PRESS" : "RELEASE", g_tick, limit);
+                    log::debug(
+                        "[IB] {} tick {} -> DEATH at step {}, no safe delay in {} "
+                        "(best +{} survives {} steps, unknownCandidates={}, wave={})",
+                        down ? "PRESS" : "RELEASE", g_tick, base.steps, limit,
+                        bestDelay, bestSurvive, unknownCands, player->m_isDart
+                    );
                 }
             }
         }
@@ -713,10 +736,12 @@ class $modify(IBKeyboard, CCKeyboardDispatcher) {
             else if (key == cocos2d::enumKeyCodes::KEY_F7) {
                 log::info(
                     "[IB] STATUS stage={} ghost={} tick={} dtStable={} clicks={} predicted={} "
-                    "kept={} saved={} nosol={} unknown={} lastUnknown={}",
+                    "kept={} saved={} nosol={} unknown={} lastUnknown={} | skipped: off={} early={} "
+                    "dead={} noGhost={} other={}",
                     ac::g_stage + 1, ac::g_ghost ? "ok" : "NULL", ac::g_tick, ac::g_dtStable,
                     ac::g_clicksSeen, ac::g_clicksPredicted, ac::g_statKept, ac::g_statSaved,
-                    ac::g_statNoSolution, ac::g_statUnknown, ac::g_unknownReason
+                    ac::g_statNoSolution, ac::g_statUnknown, ac::g_unknownReason,
+                    ac::g_skipOff, ac::g_skipEarly, ac::g_skipDead, ac::g_skipNoGhost, ac::g_skipOther
                 );
             }
         }
@@ -794,6 +819,8 @@ class $modify(IBBaseLayer, GJBaseGameLayer) {
         auto* player = layer->m_player1;
         if (player && ac::kStages[ac::g_stage].all > 0) {
             delay = ac::predictDelay(layer, player, down, button);
+        } else {
+            ++ac::g_skipOff;
         }
 
         ac::queueInput(layer, down, button, isPlayer1, delay);
