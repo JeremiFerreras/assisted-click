@@ -195,6 +195,7 @@ namespace ac {
 
     PlayLayer* g_layer = nullptr;
     PlayerObject* g_ghost = nullptr;
+    PlayLayer* g_ghostOwner = nullptr; // capa a la que pertenece el fantasma
 
     bool g_simulating = false;
     bool g_cloneDied = false;
@@ -695,6 +696,38 @@ namespace ac {
         return result;
     }
 
+    // [FIX ghost lifetime] El fantasma se (re)crea bajo demanda y esta ligado a su
+    // PlayLayer. Antes se destruia en PlayLayer::onExit, que cocos dispara tambien al
+    // pausar / cambiar de escena, dejando g_ghost = NULL a mitad de nivel
+    // (log: "ghost=NULL | clicksSeen=36 | predicted=0").
+    bool ensureGhost(PlayLayer* layer) {
+        if (!layer) return false;
+        if (g_ghost && g_ghostOwner == layer) return true;
+
+        // Fantasma de otra capa: la capa vieja puede estar ya destruida, asi que se
+        // suelta el puntero SIN release (fuga minima, evita tocar memoria invalida).
+        g_ghost = nullptr;
+        g_ghostOwner = nullptr;
+
+        auto* ghost = PlayerObject::create(1, 0, layer, layer, true);
+        if (!ghost) {
+            log::error("[AC] Ghost simulator creation failed");
+            ac_console::line("[Assisted Click] ERROR: ghost creation FAILED -> no prediction");
+            return false;
+        }
+
+        ghost->retain();
+        ghost->setVisible(false);
+        ghost->m_playEffects = false;
+
+        g_ghost = ghost;
+        g_ghostOwner = layer;
+
+        ac_console::line("[Assisted Click] Ghost simulator (re)created");
+        log::info("[AC] ghost (re)created");
+        return true;
+    }
+
     int predictDelay(
         PlayLayer* layer,
         PlayerObject* player,
@@ -704,9 +737,12 @@ namespace ac {
     ) {
         const int limit = windowTicks();
 
-        if (!layer || !player || !g_ghost ||
-            !isPlayer1 || limit <= 0 || g_tick < 2 ||
-            player->m_isDead) {
+        if (!layer || !player || !isPlayer1 || limit <= 0 ||
+            g_tick < 2 || player->m_isDead) {
+            return 0;
+        }
+
+        if (!ensureGhost(layer)) {
             return 0;
         }
 
@@ -981,27 +1017,10 @@ class $modify(ACPlayLayer, PlayLayer) {
         ac::clearState();
         ac::clearLevelDiagnostics();
 
-        if (ac::g_ghost) {
-            ac::g_ghost->release();
-            ac::g_ghost = nullptr;
-        }
-
-        ac::g_ghost = PlayerObject::create(1, 0, this, this, true);
-
-        if (ac::g_ghost) {
-            ac::g_ghost->retain();
-            ac::g_ghost->setVisible(false);
-
-            // m_playEffects existe en PlayerObject (bindings 2.2081).
-            ac::g_ghost->m_playEffects = false;
-
-            ac_console::line("[Assisted Click] Ghost simulator created");
-            log::info("[AC] PlayLayer ready, ghost created");
-        }
-        else {
-            log::error("[AC] Ghost simulator creation failed");
-            ac_console::line("[Assisted Click] ERROR: ghost creation FAILED -> no prediction");
-        }
+        // Fantasma anterior (de otro nivel): se suelta sin release, su capa ya no existe.
+        ac::g_ghost = nullptr;
+        ac::g_ghostOwner = nullptr;
+        ac::ensureGhost(this);
     }
 
     void resetLevel() {
@@ -1011,18 +1030,28 @@ class $modify(ACPlayLayer, PlayLayer) {
         ac::clearState();
     }
 
+    // [FIX ghost lifetime] onExit tambien se llama al pausar / cambiar de escena:
+    // NO se destruye nada aqui, solo se invalida la cola de entradas pendientes.
     void onExit() {
+        ac::g_queue.clear();
+        ac::g_keyState.clear();
+        PlayLayer::onExit();
+    }
+
+    // Salida real del nivel: aqui si se libera el fantasma (la capa sigue viva).
+    void onQuit() {
         ac::clearState();
 
         auto* ghost = ac::g_ghost;
         ac::g_ghost = nullptr;
+        ac::g_ghostOwner = nullptr;
         ac::g_layer = nullptr;
 
         if (ghost) {
             ghost->release();
         }
 
-        PlayLayer::onExit();
+        PlayLayer::onQuit();
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
