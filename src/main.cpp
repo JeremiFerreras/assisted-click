@@ -1,21 +1,26 @@
-// InputBuffer - src/main.cpp -- v6.0 (basado en xdBot: show_trajectory.cpp + practice_fixes/player.cpp)
+// Assisted Click / Geode Predictive Input Buffer - src/main.cpp
 //
-// Que hace: al recibir un clic (PRESS/RELEASE) simula un jugador "falso" tick a tick
-// (paso de 1/240 s = 0.25 frames @ 60fps). Si con el timing original el falso muere,
-// busca el menor retraso dentro del limite de la etapa con el que consiga pasar el hueco
-// y aplica la entrada retrasada.
+// Que hace: al recibir un clic (PRESS/RELEASE) simula un jugador "fantasma" tick a tick
+// (paso de 1/240 s = 0.25 frames @ 60fps). Si con el timing original el fantasma muere dentro
+// de la ventana CRITICA, busca el menor retraso (en ticks) dentro del limite de la etapa con el
+// que el fantasma sobreviva y aplica la entrada retrasada. Si no hay retraso seguro, o la
+// simulacion toca algo que no sabe modelar, el clic pasa SIN tocar (fail-safe).
 //
-// Tecnicas tomadas de xdBot (ZiLko/xdBot):
+// Tecnicas tomadas de xdBot (ZiLko/xdBot, show_trajectory.cpp + practice_fixes/player.cpp):
 //  - jugador falso creado con PlayerObject::create y anadido a m_objectLayer
-//  - copia COMPLETA del estado del jugador (saveData/applyData)
+//  - copia del estado del jugador (saveData/applyData)
 //  - por paso: update -> updateRotation -> updatePlayerScale -> limpiar logs -> checkCollisions
-//  - mientras se simula se bloquean TODOS los efectos secundarios (sfx, triggers, aros,
-//    particulas, estela, animacion de fin de nivel...) y los objetos no modelados se
-//    desactivan solo durante la llamada de colisiones (collisionCheckObjects).
+//  - mientras se simula se bloquean los efectos secundarios (sfx, triggers, aros, particulas,
+//    estela, animacion de fin de nivel...) y los objetos no modelados se desactivan solo
+//    durante la llamada de colisiones (collisionCheckObjects).
 //
-// Uso personal / offline. No sirve para enviar records a listas.
+// Uso personal / offline. Esta herramienta altera el timing de tus clics: NO la uses para
+// enviar records, verificaciones ni completados a listas o rankings.
 //
-// Consola: SOLO banner, ciclo F6 y lineas "SAVED". Todo lo demas va al log de Geode.
+// Consola: SOLO banner, ciclo F6 y lineas "SAVED". Todo lo demas va al log de Geode (F7 = estado).
+//
+// Fidelidad con el video de referencia (v4.6): titulo de consola, banner, texto de etapas,
+// formato de la linea SAVED y numeros "Frame0: N -> Delayed: M" (65 en wave / 160 en el resto).
 
 #ifdef _WIN32
     #ifndef WIN32_LEAN_AND_MEAN
@@ -42,6 +47,7 @@
 #include <algorithm>
 #include <cmath>
 #include <deque>
+#include <exception>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -60,21 +66,56 @@ static std::mutex g_mutex;
 static HANDLE g_output = INVALID_HANDLE_VALUE;
 static bool g_ready = false;
 
+// Ctrl+C / Ctrl+Break en la consola cerrarian el juego entero: se ignoran.
+static BOOL WINAPI ctrlHandler(DWORD type) {
+    return (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT) ? TRUE : FALSE;
+}
+
 static bool init() {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_ready) return true;
 
-    // Never detach/free a console owned by the host or another mod.
-    // Create one only when the process is not already attached to a console.
-    if (GetConsoleWindow() == nullptr && !AllocConsole()) return false;
+    FreeConsole();
+    if (!AllocConsole()) return false;
 
-    g_output = GetStdHandle(STD_OUTPUT_HANDLE);
+    // CONOUT$ en vez de GetStdHandle: no depende de que stdout del juego este redirigido.
+    g_output = CreateFileA(
+        "CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr, OPEN_EXISTING, 0, nullptr
+    );
     if (g_output == nullptr || g_output == INVALID_HANDLE_VALUE) {
         g_output = INVALID_HANDLE_VALUE;
+        FreeConsole();
         return false;
     }
 
-    SetConsoleTitleA("InputBuffer - Live Console");
+    // Estabilidad 1: con "QuickEdit" activo, un clic en la consola congela WriteConsole y,
+    // como se escribe desde el hilo del juego, congelaria el juego hasta pulsar Enter.
+    HANDLE input = CreateFileA(
+        "CONIN$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr, OPEN_EXISTING, 0, nullptr
+    );
+    if (input != nullptr && input != INVALID_HANDLE_VALUE) {
+        DWORD mode = 0;
+        if (GetConsoleMode(input, &mode)) {
+            mode &= ~static_cast<DWORD>(ENABLE_QUICK_EDIT_MODE);
+            mode |= ENABLE_EXTENDED_FLAGS;
+            SetConsoleMode(input, mode);
+        }
+        CloseHandle(input);
+    }
+
+    // Estabilidad 2: cerrar la ventana de consola termina el proceso (el juego). Se quita el boton X.
+    if (HWND window = GetConsoleWindow()) {
+        if (HMENU menu = GetSystemMenu(window, FALSE)) {
+            DeleteMenu(menu, SC_CLOSE, MF_BYCOMMAND);
+        }
+    }
+
+    // Estabilidad 3: Ctrl+C no debe matar el juego.
+    SetConsoleCtrlHandler(ctrlHandler, TRUE);
+
+    SetConsoleTitleA("Geode Predictive Input Buffer - Live Console");
     SetConsoleOutputCP(CP_UTF8);
     g_ready = true;
     return true;
@@ -108,14 +149,22 @@ namespace ac {
     constexpr Stage kStages[] = { {2, 2}, {4, 4}, {8, 8}, {16, 8}, {0, 0} };
     constexpr int kStageCount = 5;
 
-    // Ventana CRITICA: ticks que se simulan tras aplicar la entrada. La simulacion mantiene
-    // el boton igual todo ese tiempo, pero el jugador real lo cambia pronto (en wave cada
-    // pocos frames). Con 28-64 ticks el fantasma moria siempre al chocar con techo/suelo por
-    // "mantener pulsado" (log: DEATH at step 22-26 sin importar el retraso) y nunca habia
-    // un retraso "seguro". Las muertes que SI dependen del timing del clic ocurren en los
-    // primeros ticks (el video de referencia muestra Frame0: 8). 16 ticks = 4 frames @60fps.
-    constexpr int kHorizon = 16;
+    // Ventana CRITICA: ticks (contados desde la ULTIMA entrada simulada) en los que una muerte
+    // del fantasma SI cuenta. La simulacion mantiene el boton igual todo el tiempo, pero el
+    // jugador real lo cambia pronto (en wave cada pocos frames), asi que una muerte tardia casi
+    // siempre es un falso positivo por "mantener pulsado" (en pruebas: DEATH at step 22-26 sin
+    // importar el retraso). 20 ticks (5 frames @60fps) es lo bastante largo para ver muertes
+    // como "Frame0: 17" del video y menor que el primer falso positivo observado.
+    constexpr int kCritical = 20;
+
+    // Lookahead informativo: tras elegir un retraso seguro se vuelve a simular mas lejos solo
+    // para medir cuanto sobrevive el fantasma (el "Delayed: N" de la consola). 65 en wave y 160
+    // en el resto son los valores del video. Una muerte/objeto no modelado DESPUES de la ventana
+    // critica solo corta esa medicion; nunca invalida el retraso.
+    constexpr int kLookaheadWave = 65;
+    constexpr int kLookaheadOther = 160;
     constexpr int kMaxSimSteps = 160;   // tope de seguridad por simulacion
+    constexpr int kJumpButton = 1;      // PlayerButton::Jump (2/3 = izquierda/derecha en platformer)
     constexpr bool kLogVerdicts = true; // veredicto por clic -> log de Geode (NO consola)
 
     int g_stage = 0; // empieza en STAGE 1
@@ -137,19 +186,29 @@ namespace ac {
         );
     }
 
+    // Linea "SAVED" de la consola (formato identico al del video de referencia).
+    std::string savedText(int ticks, bool down, int frame0, int delayed, int limit) {
+        return fmt::format(
+            "[InputBuffer] *** SAVED +{} TICKS ({:.2f} frames @ 60fps) {}! "
+            "(Frame0: {} -> Delayed: {}) [Limit: {}] ***",
+            ticks, ticks * 0.25, down ? "PRESS" : "RELEASE", frame0, delayed, limit
+        );
+    }
+
     void showBannerOnce() {
         static bool shown = false;
         if (shown || !ac_console::init()) return;
         shown = true;
 
         auto const& s = kStages[0];
-        ac_console::line("===================================================");
-        ac_console::line("[InputBuffer] v6.1.0 LOADED (xdBot Trajectory Core)");
+        const std::string bar(60, '=');
+        ac_console::line(bar);
+        ac_console::line(" [InputBuffer] v4.6 LOADED (Wave Spikes/Saws Trajectory Fix)");
         ac_console::line(fmt::format(
-            "[InputBuffer] Starting Mode: STAGE 1 ({} All / {} Wave)", s.all, s.wave
+            " [InputBuffer] Starting Mode: STAGE 1 ({} All / {} Wave)", s.all, s.wave
         ));
-        ac_console::line("[InputBuffer] Press F6 in-level to cycle: 2/2 -> 4/4 -> 8/8 -> 16/8 -> OFF");
-        ac_console::line("===================================================");
+        ac_console::line(" [InputBuffer] Press F6 in-level to cycle: 2/2 -> 4/4 -> 8/8 -> 16/8 -> OFF");
+        ac_console::line(bar);
     }
 
     int limitFor(PlayerObject* p) {
@@ -320,15 +379,6 @@ namespace ac {
     void seedGhost(P* dst, P* src) {
         if (!dst || !src) return;
 
-        // Clear clone-only transient collision state before seeding it from the real player.
-        // The requires checks keep this source compatible with binding variations.
-        if constexpr (requires { dst->resetCollisionLog(true); }) {
-            dst->resetCollisionLog(true);
-        }
-        if constexpr (requires { dst->resetCollisionValues(); }) {
-            dst->resetCollisionValues();
-        }
-
         dst->setPosition(src->getPosition());
         dst->setRotation(src->getRotation());
         dst->setScale(src->getScale());
@@ -407,18 +457,12 @@ namespace ac {
     // Igual que xdBot: dos PlayerObject::create y anadidos a m_objectLayer. Aqui solo uno.
     // Vive ligado a su PlayLayer; se libera en PlayLayer::onQuit (NO en onExit).
     bool ensureGhost(PlayLayer* layer) {
-        if (!layer || !layer->m_objectLayer) return false;
+        if (!layer) return false;
         if (g_ghost && g_ghostOwner == layer) return true;
 
-        // The retained clone can outlive its old layer. Release our retain without
-        // dereferencing g_ghostOwner (which may already be stale).
-        if (g_ghost) {
-            auto* staleGhost = g_ghost;
-            g_ghost = nullptr;
-            g_ghostOwner = nullptr;
-            staleGhost->removeFromParentAndCleanup(true);
-            staleGhost->release();
-        }
+        // Fantasma de otra capa (posiblemente ya destruida): se suelta sin tocar.
+        g_ghost = nullptr;
+        g_ghostOwner = nullptr;
 
         auto* ghost = PlayerObject::create(1, 1, layer, layer, true);
         if (!ghost) {
@@ -516,7 +560,10 @@ namespace ac {
         return {SimResult::Unknown, 0};
     }
 
-    SimOut simulate(PlayLayer* layer, PlayerObject* real, bool down, int button, int candidateDue) {
+    // extended = false: solo la ventana critica (decide si un retraso es seguro).
+    // extended = true : sigue hasta el lookahead para medir cuanto sobrevive (solo informativo).
+    SimOut simulate(PlayLayer* layer, PlayerObject* real, bool down, int button,
+                    int candidateDue, bool extended) {
         if (!layer || !real || !g_ghost) return unknown("no-ghost");
         if (g_dtStable < 2) return unknown("dt-unstable");
 
@@ -532,8 +579,14 @@ namespace ac {
         std::stable_sort(events.begin(), events.end(),
             [](SimEvent const& a, SimEvent const& b) { return a.step < b.step; });
 
-        const int totalSteps = events.back().step + kHorizon + 1;
-        if (totalSteps > kMaxSimSteps) return unknown("too-many-steps");
+        const int criticalEnd = events.back().step + kCritical;
+        if (criticalEnd > kMaxSimSteps) return unknown("too-many-steps");
+
+        int totalSteps = criticalEnd;
+        if (extended) {
+            const int lookahead = real->m_isDart ? kLookaheadWave : kLookaheadOther;
+            totalSteps = std::min(kMaxSimSteps, std::max(criticalEnd, lookahead));
+        }
 
         const float dt = g_stepDt > 0.0f ? g_stepDt : 0.25f;
 
@@ -561,35 +614,13 @@ namespace ac {
 
             size_t next = 0;
             for (int step = 0; step < totalSteps; ++step) {
-                // Mirror xdBot's trajectory tick: collide at the current position first,
-                // then apply this tick's input and advance physics. Reversing this order
-                // shifts collision decisions by one physics step.
-                g_ghost->m_collisionLogTop->removeAllObjects();
-                g_ghost->m_collisionLogBottom->removeAllObjects();
-                g_ghost->m_collisionLogLeft->removeAllObjects();
-                g_ghost->m_collisionLogRight->removeAllObjects();
-                layer->checkCollisions(g_ghost, dt, false);
-
-                if (g_unmodeled) {
-                    out = unknown("unmodeled-object");
-                    break;
-                }
-                if (g_cloneDied || g_ghost->m_isDead) {
-                    out = {SimResult::Died, step + 1};
-                    break;
-                }
-
-                // Inputs are applied after collision processing and before this physics update.
+                // Entradas de este paso (xdBot: pushButton/releaseButton antes de update)
                 while (next < events.size() && events[next].step <= step) {
                     auto pb = static_cast<PlayerButton>(events[next].button);
                     if (events[next].down) g_ghost->pushButton(pb);
                     else g_ghost->releaseButton(pb);
                     ++next;
                 }
-
-                // The last iteration only observes the final collision sample; do not
-                // advance one extra, unobserved physics step after the horizon ends.
-                if (step + 1 >= totalSteps) break;
 
                 const float bx = g_ghost->getPositionX();
                 g_ghost->update(dt);
@@ -606,6 +637,28 @@ namespace ac {
 
                 g_ghost->updateRotation(dt);
                 g_ghost->updatePlayerScale();
+
+                // Limpiar registros de colision (xdBot) y comprobar colisiones con el mismo dt.
+                g_ghost->m_collisionLogTop->removeAllObjects();
+                g_ghost->m_collisionLogBottom->removeAllObjects();
+                g_ghost->m_collisionLogLeft->removeAllObjects();
+                g_ghost->m_collisionLogRight->removeAllObjects();
+
+                layer->checkCollisions(g_ghost, dt, false);
+
+                const bool inCritical = step < criticalEnd;
+
+                if (g_unmodeled) {
+                    // Dentro de la ventana critica no sabemos el resultado -> Unknown.
+                    // Despues solo se corta la medicion informativa.
+                    out = inCritical ? unknown("unmodeled-object") : SimOut{SimResult::Safe, step};
+                    break;
+                }
+                if (g_cloneDied || g_ghost->m_isDead) {
+                    out = inCritical ? SimOut{SimResult::Died, step + 1}
+                                     : SimOut{SimResult::Safe, step};
+                    break;
+                }
             }
         }
 
@@ -638,11 +691,10 @@ namespace ac {
         ActivationGuard guard(layer);
 
         int prevDue = effectiveDue(key, 0);
-        const SimOut base = simulate(layer, player, down, button, prevDue);
+        const SimOut base = simulate(layer, player, down, button, prevDue, false);
         guard.restore();
 
         int chosen = 0;
-        int chosenDue = g_tick + 1;
 
         if (base.result == SimResult::Safe) {
             ++g_statKept;
@@ -658,7 +710,7 @@ namespace ac {
         }
         else {
             bool found = false;
-            SimOut best{SimResult::Died, 0};
+            int foundDue = 0;
             int bestSurvive = 0;
             int bestDelay = 0;
             int unknownCands = 0;
@@ -668,13 +720,12 @@ namespace ac {
                 if (due == prevDue) continue;
                 prevDue = due;
 
-                const SimOut r = simulate(layer, player, down, button, due);
+                const SimOut r = simulate(layer, player, down, button, due, false);
                 guard.restore();
 
                 if (r.result == SimResult::Safe) {
                     chosen = d;
-                    chosenDue = due;
-                    best = r;
+                    foundDue = due;
                     found = true;
                     break;
                 }
@@ -686,14 +737,18 @@ namespace ac {
             }
 
             if (found) {
+                // Medicion informativa del "Delayed: N". Si por algo no es Safe, se usa la
+                // ventana critica (el retraso ya fue validado arriba).
+                int delayedSteps = base.steps;
+                {
+                    const SimOut ext = simulate(layer, player, down, button, foundDue, true);
+                    guard.restore();
+                    delayedSteps = (ext.result == SimResult::Safe) ? ext.steps
+                                 : (chosen + kCritical);
+                }
+
                 ++g_statSaved;
-                ac_console::line(fmt::format(
-                    "[InputBuffer] *** SAVED +{} TICKS ({:.2f} frames @ 60fps) {}! "
-                    "(Frame0: {} -> Delayed: {}) [Limit: {}] ***",
-                    std::max(0, chosenDue - (g_tick + 1)),
-                    std::max(0, chosenDue - (g_tick + 1)) * 0.25,
-                    down ? "PRESS" : "RELEASE", base.steps, best.steps, limit
-                ));
+                ac_console::line(savedText(chosen, down, base.steps, delayedSteps, limit));
             } else {
                 ++g_statNoSolution;
                 if constexpr (kLogVerdicts) {
@@ -767,14 +822,12 @@ $on_mod(Loaded) {
 class $modify(IBKeyboard, CCKeyboardDispatcher) {
     bool dispatchKeyboardMSG(cocos2d::enumKeyCodes key, bool down, bool repeat, double timestamp) {
         if (down && !repeat) {
-            if (key == cocos2d::enumKeyCodes::KEY_F6 && PlayLayer::get()) {
+            if (key == cocos2d::enumKeyCodes::KEY_F6) {
                 ac::g_stage = (ac::g_stage + 1) % ac::kStageCount;
                 ac_console::line("[InputBuffer] F6 Cycle -> " + ac::stageText(ac::g_stage));
             }
-            else if (key == cocos2d::enumKeyCodes::KEY_F7 && PlayLayer::get()) {
-                const auto status = ac::statusLine("STATUS");
-                ac_console::line(status);
-                log::info("{}", status);
+            else if (key == cocos2d::enumKeyCodes::KEY_F7) {
+                log::info("{}", ac::statusLine("STATUS"));
             }
         }
 
@@ -791,7 +844,9 @@ class $modify(IBPlayLayer, PlayLayer) {
         ac::clearState();
         ac::clearStats();
 
-        // ensureGhost cleans up the retained clone from any previous PlayLayer.
+        // Fantasma de un nivel anterior: su capa ya no existe, se suelta sin tocar.
+        ac::g_ghost = nullptr;
+        ac::g_ghostOwner = nullptr;
         ac::ensureGhost(this);
     }
 
@@ -803,7 +858,6 @@ class $modify(IBPlayLayer, PlayLayer) {
         ac::clearState();
         PlayLayer::resetLevel();
         ac::clearState();
-        ac::clearStats(); // Keep ATTEMPT diagnostics scoped to one attempt.
     }
 
     // onExit tambien se dispara al pausar: no se destruye nada.
@@ -851,6 +905,13 @@ class $modify(IBBaseLayer, GJBaseGameLayer) {
             return;
         }
 
+        // Platformer (izquierda/derecha) y botones que no son salto: el fantasma no los modela.
+        const bool platformer = layer->m_levelSettings && layer->m_levelSettings->m_platformerMode;
+        if (platformer || button != ac::kJumpButton) {
+            GJBaseGameLayer::handleButton(down, button, isPlayer1);
+            return;
+        }
+
         ++ac::g_clicksSeen;
         if (ac::g_clicksSeen <= 3) {
             log::info(
@@ -860,10 +921,19 @@ class $modify(IBBaseLayer, GJBaseGameLayer) {
             );
         }
 
+        // Fail-safe: cualquier fallo en la prediccion = el clic pasa con su timing original.
         int delay = 0;
         auto* player = layer->m_player1;
         if (player && ac::kStages[ac::g_stage].all > 0) {
-            delay = ac::predictDelay(layer, player, down, button);
+            try {
+                delay = ac::predictDelay(layer, player, down, button);
+            } catch (std::exception const& e) {
+                delay = 0;
+                log::error("[IB] prediction failed: {}", e.what());
+            } catch (...) {
+                delay = 0;
+                log::error("[IB] prediction failed: unknown exception");
+            }
         } else {
             ++ac::g_skipOff;
         }
