@@ -1,4 +1,4 @@
-// Assisted Click - src/main.cpp -- v1.4.1 (retry calibration lifecycle fix)
+// Assisted Click - src/main.cpp -- v1.4.2 (persistent input timing + collision evidence)
 //
 // Que hace: al recibir un clic (PRESS/RELEASE) simula un jugador nativo clonado en pasos
 // medidos de PlayerObject::update, usando PlayLayer::checkCollisions del propio juego. Solo
@@ -32,6 +32,7 @@
 #include <string>
 #include <limits>
 #include <chrono>
+#include <cstdint>
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -120,7 +121,7 @@ namespace ac {
     constexpr int kMaxSimSteps = 144;   // allows a slow-speed wave to reach a nearby validation corridor
     constexpr int kMaxStepsPerInput = 2048; // aggregate simulated ticks
     constexpr int kMaxClearanceEstimate = 128; // max estimated physics updates to the validation corridor
-    constexpr int kMaxEdgeProfileTicks = 96; // keep observed future edges inside the 144-step trajectory cap
+    constexpr int kMaxEdgeProfileTicks = 512; // observe across retries; long intervals are represented as no edge inside the modeled horizon
     constexpr int kPostClearanceSteps = 2; // collision samples after validation corridor
     constexpr float kPostClearanceDistance = 24.0f; // inspect nearby chained hazards without an excessive fixed tail
     constexpr float kHazardClearancePadding = 8.0f;
@@ -156,7 +157,7 @@ namespace ac {
 
         auto const& s = kStages[0];
         ac_console::line("===================================================");
-        ac_console::line("[InputBuffer] v1.4.1 LOADED (retry dt calibration retained safely)");
+        ac_console::line("[InputBuffer] v1.4.2 LOADED (input timing survives retries; collision evidence diagnostics)");
         ac_console::line(fmt::format(
             "[InputBuffer] Starting Mode: STAGE 1 ({} All / {} Wave)", s.all, s.wave
         ));
@@ -171,7 +172,8 @@ namespace ac {
     }
 
     // ---- Estado de la partida
-    int g_tick = 0;           // updates reales del jugador 1 con dt > 0
+    int g_tick = 0;           // updates reales del jugador 1 dentro del intento actual
+    std::int64_t g_physicsSerialTick = 0; // monotonic across retries; input intervals must not use resettable g_tick
     float g_stepDt = 0.0f;    // mediana de dt medida, nunca asumida
     float g_lastDx = 0.0f;
     int g_dtStable = 0;
@@ -270,11 +272,12 @@ namespace ac {
     std::unordered_map<int, int> g_activePressDelay;
 
     // Recent real input intervals only; synthetic validation edges never train this profile.
+    // Timestamps use g_physicsSerialTick, because g_tick is reset on every retry.
     struct EdgeProfile {
         bool initialized = false;
         bool lastDown = false;
-        int pressStartTick = -1;
-        int releaseTick = -1;
+        std::int64_t pressStartTick = -1;
+        std::int64_t releaseTick = -1;
         std::deque<int> holdTicks;
         std::deque<int> releaseGapTicks;
     };
@@ -296,42 +299,55 @@ namespace ac {
         if (!profile.initialized) {
             profile.initialized = true;
             profile.lastDown = down;
-            profile.pressStartTick = down ? g_tick : -1;
-            profile.releaseTick = down ? -1 : g_tick;
+            profile.pressStartTick = down ? g_physicsSerialTick : -1;
+            profile.releaseTick = down ? -1 : g_physicsSerialTick;
             return;
         }
         if (profile.lastDown == down) return; // duplicate edge, not a timing sample
         if (down) {
-            if (profile.releaseTick >= 0) pushBounded(profile.releaseGapTicks, g_tick - profile.releaseTick);
-            profile.pressStartTick = g_tick;
+            if (profile.releaseTick >= 0) {
+                const auto gap = g_physicsSerialTick - profile.releaseTick;
+                if (gap <= std::numeric_limits<int>::max()) pushBounded(profile.releaseGapTicks, static_cast<int>(gap));
+            }
+            profile.pressStartTick = g_physicsSerialTick;
             profile.lastDown = true;
         } else {
-            if (profile.pressStartTick >= 0) pushBounded(profile.holdTicks, g_tick - profile.pressStartTick);
-            profile.releaseTick = g_tick;
+            if (profile.pressStartTick >= 0) {
+                const auto hold = g_physicsSerialTick - profile.pressStartTick;
+                if (hold <= std::numeric_limits<int>::max()) pushBounded(profile.holdTicks, static_cast<int>(hold));
+            }
+            profile.releaseTick = g_physicsSerialTick;
             profile.lastDown = false;
         }
     }
 
     void resetEdgeProfileClocks(bool discardSamples) {
-        if (discardSamples) { g_edgeProfiles.clear(); return; }
-        for (auto& [key, profile] : g_edgeProfiles) {
-            (void)key;
-            profile.initialized = false;
-            profile.lastDown = false;
-            profile.pressStartTick = -1;
-            profile.releaseTick = -1;
+        if (discardSamples) {
+            g_edgeProfiles.clear();
+            return;
         }
+        // A death/retry resets g_tick, not the physical input history. Keep the last raw
+        // button state and its monotonic timestamps so a release delivered just after reset
+        // still closes the hold interval from the previous attempt. Rebasing here made
+        // holdTicks/releaseGapTicks permanently empty for inputs that caused a death.
     }
 
-    std::vector<int> futureEdgeOffsets(int key, bool currentDown) {
+    std::vector<int> futureEdgeOffsets(int key, bool currentDown, int maxCandidateDelay) {
         auto it = g_edgeProfiles.find(key);
         if (it == g_edgeProfiles.end()) return {};
         auto const& samples = currentDown ? it->second.holdTicks : it->second.releaseGapTicks;
         if (samples.size() < kMinimumEdgeSamples) return {};
         std::vector<int> offsets;
+        // A learned opposite edge that happens after the largest trajectory we can certify
+        // is represented by 0 (no opposite edge inside that simulated horizon). Otherwise the
+        // timestamp would force simulate() to extend past its strict step cap and always return
+        // UNKNOWN, even when the event is observed much later than the hazard corridor.
+        const int maxRepresentableOffset = std::max(1,
+            kMaxSimSteps - kHorizon - std::max(0, maxCandidateDelay) - 1);
         for (int n : samples) {
+            const int modeled = (n > maxRepresentableOffset) ? 0 : n;
             if (n > 0 && n <= kMaxEdgeProfileTicks &&
-                std::find(offsets.begin(), offsets.end(), n) == offsets.end()) offsets.push_back(n);
+                std::find(offsets.begin(), offsets.end(), modeled) == offsets.end()) offsets.push_back(modeled);
         }
         return offsets;
     }
@@ -397,6 +413,7 @@ namespace ac {
     void clearState(bool retainInputTimingProfile = false, bool retainPhysicsCalibration = false) {
         clearInputs();
         resetEdgeProfileClocks(!retainInputTimingProfile);
+        if (!retainInputTimingProfile) g_physicsSerialTick = 0;
         g_tick = 0;
         g_lastDx = 0.0f;
 
@@ -482,6 +499,36 @@ namespace ac {
         if (!o || !isPhysical(o)) return false;
         if (o->m_objectType == GameObjectType::AnimatedHazard) return true;
         return o->numberOfRunningActions() > 0;
+    }
+
+
+    bool rectsOverlap(cocos2d::CCRect const& a, cocos2d::CCRect const& b) {
+        return a.getMinX() <= b.getMaxX() && a.getMaxX() >= b.getMinX() &&
+               a.getMinY() <= b.getMaxY() && a.getMaxY() >= b.getMinY();
+    }
+
+    // If destroyPlayer's object argument is null or unusable, search the current level's
+    // authoritative object array for static physical objects whose bounding boxes overlap the
+    // ghost's final hitbox. This is broad-phase evidence, not proof of exact shape contact, so
+    // choose the rightmost overlapping candidate (conservative clearance) and still require the
+    // full later trajectory validation. Never fabricate a target from deathX alone.
+    GameObject* findStaticDeathColliderFromObjects(PlayLayer* layer, PlayerObject* player) {
+        if (!layer || !layer->m_objects || !player) return nullptr;
+        const auto playerRect = player->GameObject::getObjectRect();
+        GameObject* best = nullptr;
+        float bestRight = -std::numeric_limits<float>::infinity();
+        for (auto* object : CCArrayExt<GameObject*>(layer->m_objects)) {
+            if (!object || object->m_isDisabled || object->m_isDisabled2 ||
+                !isClearancePhysical(object) || hasDynamicPhysicalMotion(object)) continue;
+            const auto objectRect = object->getObjectRect();
+            if (!rectsOverlap(playerRect, objectRect)) continue;
+            const float right = objectRect.getMaxX();
+            if (std::isfinite(right) && right > bestRight) {
+                best = object;
+                bestRight = right;
+            }
+        }
+        return best;
     }
 
     bool hasDynamicPhysicalObjectInXRange(PlayLayer* layer, float minX, float maxX) {
@@ -1175,7 +1222,7 @@ namespace ac {
                 std::abs(playerRect.size.width) * 0.5f
             );
             const float hazardClearTargetX = base.deathObjectRight + halfPlayerWidth + kHazardClearancePadding;
-            // Do not call one cleared obstacle "safe" immediately. Continue through a 48-unit
+            // Do not call one cleared obstacle "safe" immediately. Continue through a 24-unit
             // corridor so nearby chained hazards are checked by native collision simulation.
             const float validationTargetX = hazardClearTargetX + kPostClearanceDistance;
             if (!std::isfinite(validationTargetX) ||
@@ -1210,12 +1257,16 @@ namespace ac {
                 return safeFallbackDelay;
             }
 
-            const auto calibratedEdgeOffsets = futureEdgeOffsets(key, down);
+            const auto calibratedEdgeOffsets = futureEdgeOffsets(key, down, limit);
             if (calibratedEdgeOffsets.empty()) {
                 ++g_statUnknown;
                 g_unknownReason = "future-edge-history-not-calibrated";
-                log::debug("[IB] {} tick {} -> UNKNOWN (need {} measured hold/gap samples)",
-                    down ? "PRESS" : "RELEASE", g_tick, kMinimumEdgeSamples);
+                auto profileIt = g_edgeProfiles.find(key);
+                const size_t available = profileIt == g_edgeProfiles.end() ? 0 :
+                    (down ? profileIt->second.holdTicks.size() : profileIt->second.releaseGapTicks.size());
+                log::debug("[IB] {} tick {} -> UNKNOWN (edge history {}/{}; serialTick={}, profile={} samples)",
+                    down ? "PRESS" : "RELEASE", g_tick, available, kMinimumEdgeSamples,
+                    g_physicsSerialTick, down ? "hold" : "gap");
                 return safeFallbackDelay;
             }
 
@@ -1617,14 +1668,40 @@ class $modify(IBPlayLayer, PlayLayer) {
             ac::g_cloneDeathObjectKnown = false;
             ac::g_cloneDeathObjectRight = 0.0f;
             ac::g_cloneDeathObject = nullptr;
-            if (object && ac::isClearancePhysical(object) && !ac::hasDynamicPhysicalMotion(object)) {
-                const auto rect = object->getObjectRect();
+
+            GameObject* evidence = object;
+            const char* evidenceSource = "destroyPlayer-argument";
+            const bool argumentIsUsable = evidence && ac::isClearancePhysical(evidence) &&
+                !ac::hasDynamicPhysicalMotion(evidence);
+            if (!argumentIsUsable) {
+                // Use a second evidence source when the engine's argument is absent or not a
+                // usable static target. The fallback scans only this level's objects and requires
+                // overlap with the ghost's final hitbox; later clearance validation is still mandatory.
+                auto* recovered = ac::findStaticDeathColliderFromObjects(this, player);
+                if (recovered) {
+                    evidence = recovered;
+                    evidenceSource = "static-object-overlap-scan";
+                }
+            }
+            if (evidence && ac::isClearancePhysical(evidence) && !ac::hasDynamicPhysicalMotion(evidence)) {
+                const auto rect = evidence->getObjectRect();
                 const float right = rect.getMaxX();
                 if (std::isfinite(right)) {
                     ac::g_cloneDeathObjectRight = right;
                     ac::g_cloneDeathObjectKnown = true;
-                    ac::g_cloneDeathObject = object;
+                    ac::g_cloneDeathObject = evidence;
+                    if (evidence != object) {
+                        log::debug("[IB] clone death collider recovered from {}: objectID={} type={} right={:.2f}",
+                            evidenceSource, evidence->m_objectID, static_cast<int>(evidence->m_objectType), right);
+                    }
                 }
+            }
+            if (!ac::g_cloneDeathObjectKnown) {
+                log::debug("[IB] clone death target unresolved: arg={} id={} type={} dynamic={} x={:.2f} y={:.2f}; fail closed",
+                    static_cast<void*>(object), object ? object->m_objectID : -1,
+                    object ? static_cast<int>(object->m_objectType) : -1,
+                    object ? ac::hasDynamicPhysicalMotion(object) : false,
+                    ac::g_cloneDeathX, player ? player->getPositionY() : 0.0f);
             }
             return;
         }
@@ -1813,6 +1890,10 @@ class $modify(IBPlayerObject, PlayerObject) {
         }
 
         const float beforeX = getPositionX();
+        // Increment the monotonic input-history clock before entering the native update: death
+        // and resetLevel can happen synchronously inside PlayerObject::update, and the tick that
+        // caused that death must be included in the press/release interval.
+        if (advancingTick) ++ac::g_physicsSerialTick;
         PlayerObject::update(dt);
 
         if (advancingTick) {
