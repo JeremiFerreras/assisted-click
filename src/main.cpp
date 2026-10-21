@@ -1,4 +1,4 @@
-// Assisted Click - src/main.cpp -- v1.4.0 (bounded prediction reliability audit)
+// Assisted Click - src/main.cpp -- v1.4.1 (retry calibration lifecycle fix)
 //
 // Que hace: al recibir un clic (PRESS/RELEASE) simula un jugador nativo clonado en pasos
 // medidos de PlayerObject::update, usando PlayLayer::checkCollisions del propio juego. Solo
@@ -156,7 +156,7 @@ namespace ac {
 
         auto const& s = kStages[0];
         ac_console::line("===================================================");
-        ac_console::line("[InputBuffer] v1.4.0 LOADED (bounded prediction + observed input timing)");
+        ac_console::line("[InputBuffer] v1.4.1 LOADED (retry dt calibration retained safely)");
         ac_console::line(fmt::format(
             "[InputBuffer] Starting Mode: STAGE 1 ({} All / {} Wave)", s.all, s.wave
         ));
@@ -394,16 +394,23 @@ namespace ac {
         g_dtStable = static_cast<int>(g_recentDt.size());
     }
 
-    void clearState(bool retainInputTimingProfile = false) {
+    void clearState(bool retainInputTimingProfile = false, bool retainPhysicsCalibration = false) {
         clearInputs();
         resetEdgeProfileClocks(!retainInputTimingProfile);
         g_tick = 0;
-        // Never use a nominal timestep during recalibration; prediction stays disabled until
-        // a complete stable window of real update deltas has been observed.
-        g_stepDt = 0.0f;
         g_lastDx = 0.0f;
-        g_dtStable = 0;
-        g_recentDt.clear();
+
+        // A retry resets the player/tick state, but not the physics clock itself. Keep a
+        // fully measured, stable dt window across retries of the SAME PlayLayer. The next
+        // real updates immediately replace the oldest samples; if timing changed, the normal
+        // full-window range check invalidates calibration before later predictions can run.
+        // New PlayLayer / quit paths pass retainPhysicsCalibration=false.
+        if (!retainPhysicsCalibration) {
+            g_stepDt = 0.0f;
+            g_dtStable = 0;
+            g_recentDt.clear();
+        }
+
         g_cloneDied = false;
         g_unmodeled = false;
         g_applyingQueuedInput = false;
@@ -1061,7 +1068,14 @@ namespace ac {
         const int limit = limitFor(player);
         if (!layer || !player) { ++g_skipOther; return safeFallbackDelay; }
         if (limit <= 0)        { ++g_skipOff; return safeFallbackDelay; }
-        if (g_tick < 2)        { ++g_skipEarly; return safeFallbackDelay; }
+        // On the first attempt there is no observed clock yet, so fail open and keep the
+        // user's immediate input. On retries, a previously stable measured dt window may be
+        // reused at tick 0; otherwise every first input after reset would be skipped forever.
+        if (g_tick < 2 && g_dtStable < static_cast<int>(kDtCalibrationSamples)) {
+            ++g_skipEarly;
+            g_unknownReason = "early-input-before-physics-calibration";
+            return safeFallbackDelay;
+        }
         if (player->m_isDead)  { ++g_skipDead; return safeFallbackDelay; }
         if (player->m_isPlatformer || button != 1 || layer->m_gameState.m_isDualMode) {
             ++g_skipOther;
@@ -1562,7 +1576,7 @@ class $modify(IBPlayLayer, PlayLayer) {
 
         ac::showBannerOnce();
         ac::g_layer = this;
-        ac::clearState(false);
+        ac::clearState(false, false);
         ac::clearStats();
 
         // ensureGhost cleans up the retained clone from any previous PlayLayer.
@@ -1574,9 +1588,9 @@ class $modify(IBPlayLayer, PlayLayer) {
         if (ac::g_clicksSeen > 0 || ac::g_tick > 0) {
             log::info("{}", ac::statusLine("ATTEMPT"));
         }
-        ac::clearState(true);
+        ac::clearState(true, true);
         PlayLayer::resetLevel();
-        ac::clearState(true);
+        ac::clearState(true, true);
         ac::clearStats(); // Keep ATTEMPT diagnostics scoped to one attempt.
     }
 
@@ -1590,7 +1604,7 @@ class $modify(IBPlayLayer, PlayLayer) {
         if (ac::g_clicksSeen > 0 || ac::g_tick > 0) {
             log::info("{}", ac::statusLine("QUIT"));
         }
-        ac::clearState();
+        ac::clearState(false, false);
         ac::destroyGhost();
         ac::g_layer = nullptr;
         PlayLayer::onQuit();
