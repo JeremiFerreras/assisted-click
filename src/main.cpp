@@ -1,4 +1,4 @@
-// Assisted Click - src/main.cpp -- v1.2.1 (false-positive and runtime-budget hardening)
+// Assisted Click - src/main.cpp -- v1.3.2 (input-edge robust frame-perfect prediction)
 //
 // Que hace: al recibir un clic (PRESS/RELEASE) simula un jugador "falso" tick a tick
 // (paso de 1/240 s = 0.25 frames @ 60fps). Si con el timing original el falso muere,
@@ -120,7 +120,7 @@ namespace ac {
     // a candidate is safe. Candidate validation runs until it clears the baseline hazard.
     constexpr int kHorizon = 16;
     constexpr int kMaxSimSteps = 96;    // hard cap per trajectory
-    constexpr int kMaxStepsPerInput = 512; // aggregate budget across all candidate trajectories
+    constexpr int kMaxStepsPerInput = 2048; // aggregate budget; exhaustion fails closed
     constexpr int kMaxClearanceEstimate = 48; // far targets fail closed rather than stall a frame
     constexpr int kPostClearanceSteps = 2; // also sample collisions just after the target edge
     constexpr float kHazardClearancePadding = 8.0f;
@@ -153,7 +153,7 @@ namespace ac {
 
         auto const& s = kStages[0];
         ac_console::line("===================================================");
-        ac_console::line("[InputBuffer] v1.2.1 LOADED (fail-closed predictive core)");
+        ac_console::line("[InputBuffer] v1.3.2 LOADED (input-edge robust predictive core)");
         ac_console::line(fmt::format(
             "[InputBuffer] Starting Mode: STAGE 1 ({} All / {} Wave)", s.all, s.wave
         ));
@@ -168,9 +168,13 @@ namespace ac {
 
     // ---- Estado de la partida
     int g_tick = 0;           // updates reales del jugador 1 con dt > 0
-    float g_stepDt = 0.25f;   // ultimo dt real (xdBot: t.delta)
+    float g_stepDt = 0.25f;   // mediana de una ventana estable de dt
     float g_lastDx = 0.0f;
     int g_dtStable = 0;
+    std::deque<float> g_recentDt;
+    constexpr size_t kDtCalibrationSamples = 8;
+    constexpr float kDtRelativeRangeTolerance = 0.001f; // max 0.1% de rango en toda la ventana
+    constexpr float kDtAbsoluteRangeTolerance = 0.000001f;
 
     PlayLayer* g_layer = nullptr;
     PlayerObject* g_ghost = nullptr;
@@ -203,6 +207,12 @@ namespace ac {
 
     enum class SimResult { Safe, Died, Unknown };
 
+    struct SimPerturbation {
+        float dtScale = 1.0f;
+        float startYOffset = 0.0f;
+        float yVelocityOffset = 0.0f;
+    };
+
     struct SimOut {
         SimResult result;
         int steps;
@@ -222,6 +232,11 @@ namespace ac {
         bool endIsSpider = false;
         bool endIsSwing = false;
         bool endIsUpsideDown = false;
+        bool endIsOnGround = false;
+        bool endJumpBuffered = false;
+        bool endInputsLocked = false;
+        bool endControlsDisabled = false;
+        bool endStateFlipGravity = false;
     };
 
     // Populated only when the clone dies inside PlayLayer::destroyPlayer.
@@ -245,6 +260,9 @@ namespace ac {
 
     std::deque<PendingInput> g_queue;
     std::unordered_map<int, KeyState> g_keys;
+    // Delay selected for the active press of each button. A release inherits this offset,
+    // so a delayed press/release pair does not collapse to a one-tick hold.
+    std::unordered_map<int, int> g_activePressDelay;
 
     int buttonKey(int button, bool isPlayer1) {
         return button + (isPlayer1 ? 0 : 10000);
@@ -273,14 +291,51 @@ namespace ac {
     void clearInputs() {
         g_queue.clear();
         g_keys.clear();
+        g_activePressDelay.clear();
+    }
+
+    // A pairwise dt comparison permits gradual clock drift (each step can differ by 1% while
+    // the long-run timestep changes dramatically). Calibrate against the full recent window.
+    // After any out-of-family sample, restart calibration rather than trusting the new value.
+    void observePhysicsDt(float dt) {
+        if (!std::isfinite(dt) || dt <= 0.0f) {
+            g_recentDt.clear();
+            g_dtStable = 0;
+            g_stepDt = 0.0f;
+            return;
+        }
+        g_recentDt.push_back(dt);
+        while (g_recentDt.size() > kDtCalibrationSamples) g_recentDt.pop_front();
+        g_stepDt = dt;
+        g_dtStable = 0;
+        if (g_recentDt.size() < kDtCalibrationSamples) return;
+
+        std::vector<float> ordered(g_recentDt.begin(), g_recentDt.end());
+        std::sort(ordered.begin(), ordered.end());
+        const float median = (ordered[3] + ordered[4]) * 0.5f;
+        const float range = ordered.back() - ordered.front();
+        const float tolerance = std::max(kDtAbsoluteRangeTolerance,
+            std::abs(median) * kDtRelativeRangeTolerance);
+        if (!std::isfinite(median) || median <= 0.0f || range > tolerance) {
+            // Keep only this sample and wait for a new complete stable window.
+            g_recentDt.clear();
+            g_recentDt.push_back(dt);
+            g_stepDt = dt;
+            return;
+        }
+        g_stepDt = median;
+        g_dtStable = static_cast<int>(g_recentDt.size());
     }
 
     void clearState() {
         clearInputs();
         g_tick = 0;
-        g_stepDt = 0.25f;
+        // Never use a nominal timestep during recalibration; prediction stays disabled until
+        // a complete stable window of real update deltas has been observed.
+        g_stepDt = 0.0f;
         g_lastDx = 0.0f;
         g_dtStable = 0;
+        g_recentDt.clear();
         g_cloneDied = false;
         g_unmodeled = false;
         g_applyingQueuedInput = false;
@@ -362,6 +417,25 @@ namespace ac {
             const auto rect = obj->getObjectRect();
             if (rect.getMaxX() < minX || rect.getMinX() > maxX) continue;
             if (hasDynamicPhysicalMotion(obj)) return true;
+        }
+        return false;
+    }
+
+    // Trigger objects can move geometry or change physics without ever overlapping the player's
+    // hitbox (their own rectangles are often placed at floor height). The ghost does not advance
+    // the level's trigger timeline, so collision-only checks are insufficient. Reject any
+    // unsupported EffectGameObject in the X corridor; only the portals handled below are exempt.
+    bool hasUnsupportedEffectObjectInXRange(PlayLayer* layer, float minX, float maxX) {
+        if (!layer || !layer->m_objects || !std::isfinite(minX) || !std::isfinite(maxX)) {
+            return true; // cannot establish that the simulated world is static
+        }
+        for (auto* obj : CCArrayExt<GameObject*>(layer->m_objects)) {
+            if (!obj || obj->m_isDisabled || obj->m_isDisabled2) continue;
+            const auto rect = obj->getObjectRect();
+            if (rect.getMaxX() < minX || rect.getMinX() > maxX) continue;
+            if (!typeinfo_cast<EffectGameObject*>(obj)) continue;
+            if (kModeledPortals.contains(obj->m_objectID)) continue;
+            return true;
         }
         return false;
     }
@@ -580,7 +654,14 @@ namespace ac {
     // ========================================================================
     // Simulacion (misma secuencia que ShowTrajectory::createTrajectory)
     // ========================================================================
-    struct SimEvent { int step; bool down; int button; bool candidate; };
+    struct SimEvent {
+        int step;
+        bool down;
+        int button;
+        bool candidate;
+        bool beforeCollision;
+        bool syntheticOpposite = false; // prediction-only stress edge, never forwarded to the game
+    };
 
     static SimOut unknown(const char* why) {
         g_unknownReason = why;
@@ -593,6 +674,14 @@ namespace ac {
         // GD maintains a separate position member in some bindings/builds.
         if constexpr (requires { player->m_position.x = x; }) {
             player->m_position.x = x;
+        }
+    }
+
+    template <class P>
+    void setCloneY(P* player, float y) {
+        player->setPositionY(y);
+        if constexpr (requires { player->m_position.y = y; }) {
+            player->m_position.y = y;
         }
     }
 
@@ -618,7 +707,10 @@ namespace ac {
             a.endIsDart == b.endIsDart && a.endIsShip == b.endIsShip &&
             a.endIsBall == b.endIsBall && a.endIsBird == b.endIsBird &&
             a.endIsRobot == b.endIsRobot && a.endIsSpider == b.endIsSpider &&
-            a.endIsSwing == b.endIsSwing && a.endIsUpsideDown == b.endIsUpsideDown;
+            a.endIsSwing == b.endIsSwing && a.endIsUpsideDown == b.endIsUpsideDown &&
+            a.endIsOnGround == b.endIsOnGround && a.endJumpBuffered == b.endJumpBuffered &&
+            a.endInputsLocked == b.endInputsLocked && a.endControlsDisabled == b.endControlsDisabled &&
+            a.endStateFlipGravity == b.endStateFlipGravity;
     }
 
     SimOut simulate(
@@ -628,10 +720,13 @@ namespace ac {
         int button,
         int candidateDue,
         std::optional<float> clearTargetX = std::nullopt,
-        int stepBudget = kMaxSimSteps
+        int stepBudget = kMaxSimSteps,
+        bool candidateImmediate = false,
+        SimPerturbation perturbation = {},
+        int oppositeEdgeAfterCandidateTicks = 0
     ) {
         if (!layer || !real || !g_ghost) return unknown("no-ghost");
-        if (g_dtStable < 2) return unknown("dt-unstable");
+        if (g_dtStable < static_cast<int>(kDtCalibrationSamples)) return unknown("dt-window-not-calibrated");
         if (!std::isfinite(g_stepDt) || g_stepDt <= 0.0f) return unknown("invalid-dt");
         if (stepBudget <= 0) return unknown("per-click-budget-exhausted");
         if (!g_ghost->m_collisionLogTop || !g_ghost->m_collisionLogBottom ||
@@ -640,14 +735,30 @@ namespace ac {
         }
 
         const int base = g_tick + 1;
+        if (oppositeEdgeAfterCandidateTicks < 0) return unknown("invalid-opposite-edge-offset");
         std::vector<SimEvent> events;
-        events.reserve(g_queue.size() + 1);
+        events.reserve(g_queue.size() + (oppositeEdgeAfterCandidateTicks > 0 ? 2 : 1));
         for (auto const& q : g_queue) {
-            events.push_back({std::max(0, q.tick - base), q.down, q.button, false});
+            events.push_back({std::max(0, q.tick - base), q.down, q.button, false, false});
         }
-        events.push_back({std::max(0, candidateDue - base), down, button, true});
-        std::stable_sort(events.begin(), events.end(),
-            [](SimEvent const& a, SimEvent const& b) { return a.step < b.step; });
+        // The actual immediate path calls handleButton synchronously, before the next
+        // collision pass. Delayed/queued inputs are dispatched from PlayerObject::update,
+        // after that tick's collision pass. Treating both paths identically creates a
+        // one-collision-phase error precisely at tight frame-perfect gaps.
+        const bool applyCandidateBeforeCollision = candidateImmediate && candidateDue == base;
+        const int candidateStep = std::max(0, candidateDue - base);
+        events.push_back({candidateStep, down, button, true, applyCandidateBeforeCollision});
+        if (oppositeEdgeAfterCandidateTicks > 0) {
+            // The actual future raw edge is not known when the current click is predicted.
+            // Stress each possible opposite edge within the stage's timing envelope. This
+            // synthetic event affects only the ghost, never PlayLayer/the real player.
+            events.push_back({candidateStep + oppositeEdgeAfterCandidateTicks, !down, button,
+                false, false, true});
+        }
+        std::stable_sort(events.begin(), events.end(), [](SimEvent const& a, SimEvent const& b) {
+            if (a.step != b.step) return a.step < b.step;
+            return a.beforeCollision && !b.beforeCollision;
+        });
 
         const int latestEventStep = events.back().step;
         if (latestEventStep >= kMaxSimSteps) return unknown("too-many-steps");
@@ -677,13 +788,16 @@ namespace ac {
         }
         const int totalSteps = std::min(plannedSteps, stepBudget);
         const bool budgetTruncated = totalSteps < plannedSteps;
-        const float dt = g_stepDt;
+        const float dt = g_stepDt * perturbation.dtScale;
+        if (!std::isfinite(dt) || dt <= 0.0f) return unknown("perturbed-dt-invalid");
         const float rx = real->getPositionX();
         const float ry = real->getPositionY();
         const double rv = real->m_yVelocity;
 
         SimOut out{SimResult::Safe, totalSteps};
         bool candidateApplied = false;
+        bool oppositeEdgeApplied = false;
+        int oppositeEdgeStep = -1;
         bool clearedTarget = false;
         int targetCrossStep = -1;
 
@@ -707,7 +821,26 @@ namespace ac {
                 g_ghost->m_isSpider == real->m_isSpider &&
                 g_ghost->m_isSwing == real->m_isSwing &&
                 g_ghost->m_isUpsideDown == real->m_isUpsideDown &&
-                g_ghost->m_isPlatformer == real->m_isPlatformer;
+                g_ghost->m_isPlatformer == real->m_isPlatformer &&
+                // Match state that changes the next frame's jump/gravity response, not just pose.
+                g_ghost->m_isOnGround == real->m_isOnGround &&
+                g_ghost->m_isOnGround2 == real->m_isOnGround2 &&
+                g_ghost->m_isOnGround3 == real->m_isOnGround3 &&
+                g_ghost->m_isOnGround4 == real->m_isOnGround4 &&
+                g_ghost->m_jumpBuffered == real->m_jumpBuffered &&
+                g_ghost->m_wasJumpBuffered == real->m_wasJumpBuffered &&
+                g_ghost->m_stateJumpBuffered == real->m_stateJumpBuffered &&
+                g_ghost->m_stateFlipGravity == real->m_stateFlipGravity &&
+                g_ghost->m_controlsDisabled == real->m_controlsDisabled &&
+                g_ghost->m_inputsLocked == real->m_inputsLocked &&
+                g_ghost->m_isOnSlope == real->m_isOnSlope &&
+                g_ghost->m_wasOnSlope == real->m_wasOnSlope &&
+                g_ghost->m_isCollidingWithSlope == real->m_isCollidingWithSlope &&
+                nearFloat(g_ghost->m_gravity, real->m_gravity, 0.0001f) &&
+                nearFloat(g_ghost->m_fallSpeed, real->m_fallSpeed, 0.001f) &&
+                nearFloat(g_ghost->m_yStart, real->m_yStart, 0.001f) &&
+                nearFloat(g_ghost->m_slopeVelocity, real->m_slopeVelocity, 0.001f) &&
+                nearFloat(g_ghost->m_currentSlopeYVelocity, real->m_currentSlopeYVelocity, 0.001f);
 
             if (!g_warnedSeed) {
                 g_warnedSeed = true;
@@ -717,9 +850,36 @@ namespace ac {
             if (!seedOK) {
                 out = unknown("ghost-seed-mismatch");
             } else {
+                // Candidate stress tests deliberately perturb the copy by tiny amounts. A
+                // candidate that only survives one exact floating-point trajectory is too
+                // brittle to authorize an automated delay.
+                if (perturbation.startYOffset != 0.0f) {
+                    setCloneY(g_ghost, g_ghost->getPositionY() + perturbation.startYOffset);
+                }
+                if (perturbation.yVelocityOffset != 0.0f) {
+                    g_ghost->m_yVelocity += perturbation.yVelocityOffset;
+                }
                 size_t next = 0;
+                auto applySimEvent = [&](SimEvent const& event) {
+                    auto pb = static_cast<PlayerButton>(event.button);
+                    if (event.down) g_ghost->pushButton(pb);
+                    else g_ghost->releaseButton(pb);
+                    if (event.candidate) candidateApplied = true;
+                    if (event.syntheticOpposite) {
+                        oppositeEdgeApplied = true;
+                        oppositeEdgeStep = event.step;
+                    }
+                };
+
                 for (int step = 0; step < totalSteps; ++step) {
-                    // Same engine phase ordering as xdBot: collision sample, input, physics.
+                    // Direct inputs are already active before the next collision pass. Inputs
+                    // held in the queue are applied after the due tick's collision pass, matching
+                    // dispatchPending() from the PlayerObject::update hook.
+                    while (next < events.size() && events[next].step <= step &&
+                           events[next].beforeCollision) {
+                        applySimEvent(events[next++]);
+                    }
+
                     g_ghost->m_collisionLogTop->removeAllObjects();
                     g_ghost->m_collisionLogBottom->removeAllObjects();
                     g_ghost->m_collisionLogLeft->removeAllObjects();
@@ -743,7 +903,9 @@ namespace ac {
                     if (clearTargetX && candidateApplied &&
                         g_ghost->getPositionX() >= *clearTargetX) {
                         if (targetCrossStep < 0) targetCrossStep = step;
-                        if (step - targetCrossStep >= kPostClearanceSteps) {
+                        const bool oppositeEdgeSettled = oppositeEdgeAfterCandidateTicks == 0 ||
+                            (oppositeEdgeApplied && step - oppositeEdgeStep >= kPostClearanceSteps);
+                        if (step - targetCrossStep >= kPostClearanceSteps && oppositeEdgeSettled) {
                             out = {SimResult::Safe, step + 1};
                             clearedTarget = true;
                             break;
@@ -751,12 +913,9 @@ namespace ac {
                     }
 
                     while (next < events.size() && events[next].step <= step) {
-                        auto const& event = events[next];
-                        auto pb = static_cast<PlayerButton>(event.button);
-                        if (event.down) g_ghost->pushButton(pb);
-                        else g_ghost->releaseButton(pb);
-                        if (event.candidate) candidateApplied = true;
-                        ++next;
+                        // beforeCollision events were consumed above. Because equal-step events
+                        // are sorted with those first, all remaining events belong after collision.
+                        applySimEvent(events[next++]);
                     }
 
                     if (step + 1 >= totalSteps) break;
@@ -765,14 +924,12 @@ namespace ac {
                     g_ghost->update(dt);
                     const float movedX = g_ghost->getPositionX() - beforeX;
 
-                    // Detached clones may update Y but not X. Fall back to the clone's current
-                    // portal-aware velocity, then to the measured live-player X delta.
+                    // Never advance the simulated player using the LIVE player's last X delta:
+                    // it leaks a future measurement into the prediction and becomes wrong at
+                    // speed changes. Use only the clone's own current velocity; otherwise UNKNOWN.
                     if (std::abs(movedX) < 0.0001f) {
                         const double vx = g_ghost->getCurrentXVelocity();
-                        float fallbackDx = static_cast<float>(vx * dt);
-                        if (!std::isfinite(fallbackDx) || std::abs(fallbackDx) < 0.0001f) {
-                            fallbackDx = g_lastDx;
-                        }
+                        const float fallbackDx = static_cast<float>(vx * dt);
                         if (!std::isfinite(fallbackDx) || std::abs(fallbackDx) < 0.0001f) {
                             if (!g_warnedX) {
                                 g_warnedX = true;
@@ -790,7 +947,7 @@ namespace ac {
                         }
                         if (!g_warnedFallbackX) {
                             g_warnedFallbackX = true;
-                            log::info("[IB] clone X fallback active (vx={} dt={} dx={})", vx, dt, fallbackDx);
+                            log::info("[IB] clone X advanced using clone velocity only (vx={} dt={} dx={})", vx, dt, fallbackDx);
                         }
                     }
 
@@ -813,6 +970,11 @@ namespace ac {
             out.endIsSpider = g_ghost->m_isSpider;
             out.endIsSwing = g_ghost->m_isSwing;
             out.endIsUpsideDown = g_ghost->m_isUpsideDown;
+            out.endIsOnGround = g_ghost->m_isOnGround;
+            out.endJumpBuffered = g_ghost->m_jumpBuffered;
+            out.endInputsLocked = g_ghost->m_inputsLocked;
+            out.endControlsDisabled = g_ghost->m_controlsDisabled;
+            out.endStateFlipGravity = g_ghost->m_stateFlipGravity;
         }
 
         if (clearTargetX && !clearedTarget && out.result == SimResult::Safe) {
@@ -833,52 +995,65 @@ namespace ac {
         return out;
     }
 
-    int predictDelay(PlayLayer* layer, PlayerObject* player, bool down, int button) {
+    int predictDelay(PlayLayer* layer, PlayerObject* player, bool down, int button,
+        int inheritedPressDelay = 0) {
+        const int safeFallbackDelay = std::max(0, inheritedPressDelay);
         const int limit = limitFor(player);
-        if (!layer || !player) { ++g_skipOther; return 0; }
-        if (limit <= 0)        { ++g_skipOff; return 0; }
-        if (g_tick < 2)        { ++g_skipEarly; return 0; }
-        if (player->m_isDead)  { ++g_skipDead; return 0; }
+        if (!layer || !player) { ++g_skipOther; return safeFallbackDelay; }
+        if (limit <= 0)        { ++g_skipOff; return safeFallbackDelay; }
+        if (g_tick < 2)        { ++g_skipEarly; return safeFallbackDelay; }
+        if (player->m_isDead)  { ++g_skipDead; return safeFallbackDelay; }
         if (player->m_isPlatformer || button != 1) {
             ++g_skipOther;
-            return 0; // directional/platformer input isn't modeled by this predictor
+            return safeFallbackDelay; // directional/platformer input isn't modeled by this predictor
         }
-        if (!ensureGhost(layer)) { ++g_skipNoGhost; return 0; }
+        if (!ensureGhost(layer)) { ++g_skipNoGhost; return safeFallbackDelay; }
 
         const int key = buttonKey(button, true);
         auto keyIt = g_keys.find(key);
         if (keyIt != g_keys.end() && keyIt->second.pending > 0) {
             ++g_skipOther;
-            return 0; // never predict a second press/release while the matching key is pending
+            return safeFallbackDelay; // never predict a second press/release while the matching key is pending
         }
 
         const int baselineTick = g_tick + 1;
-        const int immediateDue = effectiveDue(key, 0);
-        if (immediateDue - baselineTick > limit) {
+        const int requestedBaselineDelay = std::max(0, inheritedPressDelay);
+        const int immediateDue = effectiveDue(key, requestedBaselineDelay);
+        const int baselineDelay = std::max(0, immediateDue - baselineTick);
+        if (baselineDelay > limit) {
             ++g_skipOther;
-            log::debug("[IB] {} tick {} -> NO-SEARCH (queue already beyond cap: +{} > {})",
-                down ? "PRESS" : "RELEASE", g_tick, immediateDue - baselineTick, limit);
-            return 0;
+            log::debug("[IB] {} tick {} -> PRESERVE-DELAY +{} (stage cap {})",
+                down ? "PRESS" : "RELEASE", g_tick, baselineDelay, limit);
+            return baselineDelay; // preserve the paired press/release offset even outside search cap
         }
 
         ++g_clicksPredicted;
         g_unknownReason = "";
 
+        // A raw input with no queue is applied synchronously. Otherwise even a zero-delay event
+        // is queued and lands after the due tick's collision pass. This boolean fixes the phase
+        // used by the baseline simulation; candidate delays > baseline are always queued.
+        const bool baselineImmediate = g_queue.empty() && baselineDelay == 0;
+
         ActivationGuard guard(layer);
         int remainingSteps = kMaxStepsPerInput;
-        auto runSimulation = [&](int due, std::optional<float> clearTarget = std::nullopt) -> SimOut {
+        auto runSimulation = [&](int due, std::optional<float> clearTarget = std::nullopt,
+                                 bool directInput = false,
+                                 SimPerturbation perturbation = {},
+                                 int oppositeEdgeAfterTicks = 0) -> SimOut {
             if (remainingSteps <= 0) return unknown("per-click-budget-exhausted");
             const SimOut result = simulate(layer, player, down, button, due, clearTarget,
-                std::min(kMaxSimSteps, remainingSteps));
+                std::min(kMaxSimSteps, remainingSteps), directInput, perturbation,
+                oppositeEdgeAfterTicks);
             remainingSteps = std::max(0, remainingSteps - std::max(1, result.steps));
             return result;
         };
 
-        const SimOut base = runSimulation(immediateDue);
+        const SimOut base = runSimulation(immediateDue, std::nullopt, baselineImmediate);
         guard.restore();
 
-        int chosen = 0;
-        int chosenDue = baselineTick;
+        int chosen = baselineDelay;
+        int chosenDue = immediateDue;
 
         if (base.result == SimResult::Safe) {
             ++g_statKept;
@@ -903,17 +1078,17 @@ namespace ac {
                 g_unknownReason = "death-without-known-static-physical-object";
                 log::debug("[IB] {} tick {} -> UNKNOWN ({})",
                     down ? "PRESS" : "RELEASE", g_tick, g_unknownReason);
-                return 0;
+                return safeFallbackDelay;
             }
 
-            const SimOut baselineConfirm = runSimulation(immediateDue);
+            const SimOut baselineConfirm = runSimulation(immediateDue, std::nullopt, baselineImmediate);
             guard.restore();
             if (!sameBaselineDeath(base, baselineConfirm)) {
                 ++g_statUnknown;
                 g_unknownReason = "nondeterministic-baseline-death";
                 log::warn("[IB] tick {} rejected: baseline death did not reproduce ({} vs {})",
                     g_tick, base.steps, baselineConfirm.steps);
-                return 0;
+                return safeFallbackDelay;
             }
 
             const auto playerRect = player->GameObject::getObjectRect();
@@ -929,7 +1104,7 @@ namespace ac {
                 g_unknownReason = "invalid-hazard-clearance-target";
                 log::debug("[IB] tick {} -> UNKNOWN ({}) targetX={:.2f} deathX={:.2f}",
                     g_tick, g_unknownReason, clearTargetX, base.deathX);
-                return 0;
+                return safeFallbackDelay;
             }
 
             // Geometry moved by actions/triggers is not advanced by checkCollisions(clone).
@@ -940,28 +1115,41 @@ namespace ac {
                 ++g_statUnknown;
                 g_unknownReason = "dynamic-physical-object-in-corridor";
                 log::debug("[IB] tick {} -> UNKNOWN ({})", g_tick, g_unknownReason);
-                return 0;
+                return safeFallbackDelay;
+            }
+
+            // A moving trigger need not touch the ghost's hitbox to affect the path. The world
+            // does not advance inside simulate(), so never certify a static clone trajectory if
+            // an unsupported effect object can fire anywhere before the clearance target.
+            if (hasUnsupportedEffectObjectInXRange(
+                    layer, player->getPositionX() - 32.0f, clearTargetX + 24.0f)) {
+                ++g_statUnknown;
+                g_unknownReason = "unsupported-effect-object-in-corridor";
+                log::debug("[IB] tick {} -> UNKNOWN ({})", g_tick, g_unknownReason);
+                return safeFallbackDelay;
             }
 
             bool found = false;
             bool unstable = false;
             int unknownCands = 0;
+            int fragileCandidates = 0;
             int bestSurvive = 0;
             int bestDelay = 0;
             int chosenClearSteps = 0;
+            int chosenEdgeBranches = 0;
 
             int lastDueChecked = immediateDue;
-            for (int d = 1; d <= limit; ++d) {
+            for (int totalDelay = baselineDelay + 1; totalDelay <= limit; ++totalDelay) {
                 if (remainingSteps <= 0) {
                     g_unknownReason = "per-click-budget-exhausted";
                     unstable = true;
                     break;
                 }
-                const int due = effectiveDue(key, d);
+                const int due = effectiveDue(key, totalDelay);
                 const int effectiveDelay = due - baselineTick;
                 if (due == lastDueChecked) continue;
                 lastDueChecked = due;
-                if (effectiveDelay <= 0 || effectiveDelay > limit) continue;
+                if (effectiveDelay <= baselineDelay || effectiveDelay > limit) continue;
 
                 const SimOut r = runSimulation(due, clearTargetX);
                 guard.restore();
@@ -979,15 +1167,159 @@ namespace ac {
                         unstable = true;
                         break;
                     }
-                    chosen = d;
-                    chosenDue = due;
-                    chosenClearSteps = confirm.steps;
+
+                    // Robustness envelope: validate the chosen timing under small, symmetric
+                    // perturbations of timestep, initial Y, and Y velocity. These are not claimed
+                    // to be alternate GD physics; they are a conservative sensitivity check for
+                    // a candidate that depends on a razor-thin numerical boundary.
+                    const SimPerturbation lowerEnvelope{0.999f, -0.05f, -0.01f};
+                    const SimOut lower = runSimulation(due, clearTargetX, false, lowerEnvelope);
+                    guard.restore();
+                    if (lower.result == SimResult::Unknown) {
+                        ++unknownCands;
+                        g_unknownReason = "lower-sensitivity-envelope-unknown";
+                        unstable = true;
+                        break;
+                    }
+                    if (lower.result != SimResult::Safe) {
+                        ++fragileCandidates;
+                        continue;
+                    }
+
+                    const SimPerturbation upperEnvelope{1.001f, 0.05f, 0.01f};
+                    const SimOut upper = runSimulation(due, clearTargetX, false, upperEnvelope);
+                    guard.restore();
+                    if (upper.result == SimResult::Unknown) {
+                        ++unknownCands;
+                        g_unknownReason = "upper-sensitivity-envelope-unknown";
+                        unstable = true;
+                        break;
+                    }
+                    if (upper.result != SimResult::Safe) {
+                        ++fragileCandidates;
+                        continue;
+                    }
+
+                    // Do not choose the first safe tick at the boundary of a one-tick window.
+                    // Require three consecutive nominally-clear timings, then choose their
+                    // middle tick and validate that selected middle timing independently.
+                    // This trades some coverage for a discrete timing margin on either side.
+                    const int centerRequested = totalDelay + 1;
+                    const int tailRequested = totalDelay + 2;
+                    if (tailRequested > limit) {
+                        ++fragileCandidates;
+                        continue;
+                    }
+                    const int centerDue = effectiveDue(key, centerRequested);
+                    const int tailDue = effectiveDue(key, tailRequested);
+                    const int centerDelay = centerDue - baselineTick;
+                    const int tailDelay = tailDue - baselineTick;
+                    if (centerDelay != effectiveDelay + 1 || tailDelay != centerDelay + 1 ||
+                        tailDelay > limit) {
+                        ++fragileCandidates;
+                        continue;
+                    }
+
+                    const SimOut centerProbe = runSimulation(centerDue, clearTargetX);
+                    guard.restore();
+                    if (centerProbe.result == SimResult::Unknown) {
+                        ++unknownCands;
+                        g_unknownReason = "timing-window-center-unknown";
+                        unstable = true;
+                        break;
+                    }
+                    const SimOut tailProbe = runSimulation(tailDue, clearTargetX);
+                    guard.restore();
+                    if (tailProbe.result == SimResult::Unknown) {
+                        ++unknownCands;
+                        g_unknownReason = "timing-window-tail-unknown";
+                        unstable = true;
+                        break;
+                    }
+                    if (centerProbe.result != SimResult::Safe || tailProbe.result != SimResult::Safe) {
+                        ++fragileCandidates;
+                        continue;
+                    }
+
+                    // Replay the actual selected center timing; the first robust tick is not
+                    // the one sent to the game. The center itself must pass replay + envelope.
+                    const SimOut centerConfirm = runSimulation(centerDue, clearTargetX);
+                    guard.restore();
+                    if (!sameSafeClearance(centerProbe, centerConfirm)) {
+                        ++unknownCands;
+                        g_unknownReason = "timing-window-center-replay-differs";
+                        unstable = true;
+                        break;
+                    }
+
+                    const SimOut centerLower = runSimulation(centerDue, clearTargetX, false, lowerEnvelope);
+                    guard.restore();
+                    if (centerLower.result == SimResult::Unknown) {
+                        ++unknownCands;
+                        g_unknownReason = "timing-window-center-lower-unknown";
+                        unstable = true;
+                        break;
+                    }
+                    if (centerLower.result != SimResult::Safe) {
+                        ++fragileCandidates;
+                        continue;
+                    }
+
+                    const SimOut centerUpper = runSimulation(centerDue, clearTargetX, false, upperEnvelope);
+                    guard.restore();
+                    if (centerUpper.result == SimResult::Unknown) {
+                        ++unknownCands;
+                        g_unknownReason = "timing-window-center-upper-unknown";
+                        unstable = true;
+                        break;
+                    }
+                    if (centerUpper.result != SimResult::Safe) {
+                        ++fragileCandidates;
+                        continue;
+                    }
+
+                    // The next opposite edge is not yet known at prediction time. A press may
+                    // be released quickly (or a release followed by another press). Validate
+                    // the chosen middle timing against every opposite-edge offset from 1 until
+                    // the simulated clearance horizon (capped at kMaxClearanceEstimate). The
+                    // stage delay cap is NOT a safe proxy for hold duration. Each branch must run
+                    // through obstacle clearance and two post-edge collision samples. If any
+                    // branch dies or is unknown, this timing is not certified.
+                    bool inputEdgeRobust = true;
+                    int inputEdgeBranchesPassed = 0;
+                    const int ticksAfterCandidate = std::max(1, centerConfirm.steps - centerDelay);
+                    const int maxOppositeOffset = std::min(kMaxClearanceEstimate, ticksAfterCandidate);
+                    for (int oppositeOffset = 1; oppositeOffset <= maxOppositeOffset; ++oppositeOffset) {
+                        const SimOut edgeBranch = runSimulation(
+                            centerDue, clearTargetX, false, {}, oppositeOffset);
+                        guard.restore();
+                        if (edgeBranch.result == SimResult::Unknown) {
+                            ++unknownCands;
+                            g_unknownReason = "input-edge-envelope-unknown";
+                            unstable = true;
+                            inputEdgeRobust = false;
+                            break;
+                        }
+                        if (edgeBranch.result != SimResult::Safe) {
+                            ++fragileCandidates;
+                            inputEdgeRobust = false;
+                            break;
+                        }
+                        ++inputEdgeBranchesPassed;
+                    }
+                    if (unstable) break;
+                    if (!inputEdgeRobust) continue;
+
+                    chosen = centerDelay;
+                    chosenDue = centerDue;
+                    chosenClearSteps = centerConfirm.steps;
+                    chosenEdgeBranches = inputEdgeBranchesPassed;
                     found = true;
-                    break; // first stable clearance is the minimum delay
+                    break; // center of a three-tick clear window, replayed and sensitivity-checked
                 }
                 if (r.result == SimResult::Died && r.steps > bestSurvive) {
                     bestSurvive = r.steps;
-                    bestDelay = d;
+                    bestDelay = effectiveDelay;
                 }
                 if (r.result == SimResult::Unknown) {
                     ++unknownCands;
@@ -1015,21 +1347,22 @@ namespace ac {
                     base.steps, base.deathObjectRight, chosenClearSteps, limit
                 ));
                 log::info(
-                    "[IB] SAVED validated-twice event={} tick={} delay={} limit={} targetX={:.2f} "
-                    "validatedThroughStep={} remainingBudget={}",
+                    "[IB] SAVED edge-robust event={} tick={} delay={} limit={} targetX={:.2f} "
+                    "validatedThroughStep={} oppositeEdgeBranches={} remainingBudget={}",
                     down ? "PRESS" : "RELEASE", g_tick, actualDelay, limit, clearTargetX,
-                    chosenClearSteps, remainingSteps
+                    chosenClearSteps, chosenEdgeBranches, remainingSteps
                 );
             }
             else {
                 ++g_statNoSolution;
                 if constexpr (kLogVerdicts) {
                     log::debug(
-                        "[IB] {} tick {} -> NO SAFE CLEARANCE in {} ticks "
+                        "[IB] {} tick {} -> NO SAFE CLEARANCE beyond baseline +{} (limit {}) "
                         "(baseDeathStep={}, objectRight={:.2f}, bestDelay={}, surviveSteps={}, "
-                        "unknownCandidates={}, remainingBudget={})",
-                        down ? "PRESS" : "RELEASE", g_tick, limit, base.steps,
-                        base.deathObjectRight, bestDelay, bestSurvive, unknownCands, remainingSteps
+                        "unknownCandidates={}, fragileCandidates={}, remainingBudget={})",
+                        down ? "PRESS" : "RELEASE", g_tick, baselineDelay, limit, base.steps,
+                        base.deathObjectRight, bestDelay, bestSurvive, unknownCands,
+                        fragileCandidates, remainingSteps
                     );
                 }
             }
@@ -1049,12 +1382,17 @@ namespace ac {
         const bool keyPending = it != g_keys.end() && it->second.pending > 0;
 
         if (delay == 0 && g_queue.empty() && !keyPending) {
+            if (down) g_activePressDelay[key] = 0;
             QueuedInputScope scope;
             layer->handleButton(down, button, isPlayer1);
+            if (!down) g_activePressDelay.erase(key);
             return;
         }
 
+        const int baseTick = g_tick + 1;
         const int due = effectiveDue(key, delay);
+        const int scheduledShift = std::max(0, due - baseTick);
+        if (down) g_activePressDelay[key] = scheduledShift;
 
         auto pos = std::upper_bound(
             g_queue.begin(), g_queue.end(), due,
@@ -1064,6 +1402,9 @@ namespace ac {
         auto& ks = g_keys[key];
         ks.lastDue = std::max(ks.lastDue, due);
         ++ks.pending;
+        // This is the logical state of the latest raw edge, not a report of delivery. Clear it
+        // when release is captured so a later queued press can establish a new hold shift.
+        if (!down) g_activePressDelay.erase(key);
     }
 
     void dispatchPending(PlayLayer* layer, int nextTick) {
@@ -1203,10 +1544,31 @@ class $modify(IBBaseLayer, GJBaseGameLayer) {
 
         int delay = 0;
         auto* player = layer->m_player1;
+        const int key = ac::buttonKey(button, isPlayer1);
+        auto keyIt = ac::g_keys.find(key);
+        const bool keyPending = keyIt != ac::g_keys.end() && keyIt->second.pending > 0;
+        auto activeIt = ac::g_activePressDelay.find(key);
+        const bool hasActivePress = activeIt != ac::g_activePressDelay.end();
+        const int inheritedDelay = hasActivePress ? activeIt->second : 0;
+
         if (player && ac::kStages[ac::g_stage].all > 0) {
-            delay = ac::predictDelay(layer, player, down, button);
+            if (keyPending) {
+                // An edge that arrives while a same-button edge is pending cannot be simulated
+                // independently. Preserve order and inherit the current press shift.
+                delay = inheritedDelay;
+                ++ac::g_skipOther;
+            } else if (down && hasActivePress) {
+                // Duplicate down edge while this hold is active: do not independently retime it.
+                delay = inheritedDelay;
+                ++ac::g_skipOther;
+            } else {
+                delay = ac::predictDelay(layer, player, down, button,
+                    (!down && hasActivePress) ? inheritedDelay : 0);
+            }
         } else {
             ++ac::g_skipOff;
+            // Turning assistance OFF during a delayed hold must not shift only one edge.
+            if (hasActivePress) delay = inheritedDelay;
         }
 
         ac::queueInput(layer, down, button, isPlayer1, delay);
@@ -1316,11 +1678,7 @@ class $modify(IBPlayerObject, PlayerObject) {
         PlayerObject::update(dt);
 
         if (advancingTick) {
-            const float dtTolerance = std::max(0.0001f, std::abs(ac::g_stepDt) * 0.01f);
-            if (std::abs(dt - ac::g_stepDt) <= dtTolerance) ++ac::g_dtStable;
-            else ac::g_dtStable = 0;
-
-            ac::g_stepDt = dt;
+            ac::observePhysicsDt(dt);
             ac::g_lastDx = getPositionX() - beforeX;
             ++ac::g_tick;
 
