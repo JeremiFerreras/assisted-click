@@ -1,9 +1,9 @@
-// Assisted Click - src/main.cpp -- v1.3.2 (input-edge robust frame-perfect prediction)
+// Assisted Click - src/main.cpp -- v1.4.0 (bounded prediction reliability audit)
 //
-// Que hace: al recibir un clic (PRESS/RELEASE) simula un jugador "falso" tick a tick
-// (paso de 1/240 s = 0.25 frames @ 60fps). Si con el timing original el falso muere,
-// busca el menor retraso dentro del limite de la etapa con el que consiga pasar el hueco
-// y aplica la entrada retrasada.
+// Que hace: al recibir un clic (PRESS/RELEASE) simula un jugador nativo clonado en pasos
+// medidos de PlayerObject::update, usando PlayLayer::checkCollisions del propio juego. Solo
+// busca retrasos tras una muerte de referencia repetible contra geometria fisica estatica.
+// No modela fase subtick de CBF/Click Between Steps; esas herramientas deben desactivarse.
 //
 // Tecnicas tomadas de xdBot (ZiLko/xdBot):
 //  - jugador falso creado con PlayerObject::create y anadido a m_objectLayer
@@ -31,6 +31,7 @@
 #include <optional>
 #include <string>
 #include <limits>
+#include <chrono>
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -105,25 +106,27 @@ static void line(std::string const&) {}
 // ============================================================================
 namespace ac {
 
-    // ---- Etapas: {ticks para todo, ticks para wave}. 1 tick = 0.25 frames @ 60fps
+    // ---- Etapas: ticks de actualización de PlayerObject, no sub-ticks de CBF.
     struct Stage { int all; int wave; };
     constexpr Stage kStages[] = { {2, 2}, {4, 4}, {8, 8}, {16, 8}, {0, 0} };
     constexpr int kStageCount = 5;
 
     // Ventana CRITICA: ticks que se simulan tras aplicar la entrada. La simulacion mantiene
-    // el boton igual todo ese tiempo, pero el jugador real lo cambia pronto (en wave cada
-    // pocos frames). Con 28-64 ticks el fantasma moria siempre al chocar con techo/suelo por
-    // "mantener pulsado" (log: DEATH at step 22-26 sin importar el retraso) y nunca habia
-    // un retraso "seguro". Las muertes que SI dependen del timing del clic ocurren en los
-    // primeros ticks (el video de referencia muestra Frame0: 8). 16 ticks = 4 frames @60fps.
+    // Lookahead breve para decidir si tiene sentido buscar: no es el veredicto de seguridad.
+    // La validacion posterior comprueba un corredor mayor con colisiones nativas y presupuesto.
     // Short baseline lookahead: this is only a trigger for searching, NOT proof that
     // a candidate is safe. Candidate validation runs until it clears the baseline hazard.
-    constexpr int kHorizon = 16;
-    constexpr int kMaxSimSteps = 96;    // hard cap per trajectory
-    constexpr int kMaxStepsPerInput = 2048; // aggregate budget; exhaustion fails closed
-    constexpr int kMaxClearanceEstimate = 48; // far targets fail closed rather than stall a frame
-    constexpr int kPostClearanceSteps = 2; // also sample collisions just after the target edge
+    constexpr int kHorizon = 16; // trigger for search only; never proof of safety
+    constexpr int kMaxSimSteps = 144;   // allows a slow-speed wave to reach a nearby validation corridor
+    constexpr int kMaxStepsPerInput = 2048; // aggregate simulated ticks
+    constexpr int kMaxClearanceEstimate = 128; // max estimated physics updates to the validation corridor
+    constexpr int kMaxEdgeProfileTicks = 96; // keep observed future edges inside the 144-step trajectory cap
+    constexpr int kPostClearanceSteps = 2; // collision samples after validation corridor
+    constexpr float kPostClearanceDistance = 24.0f; // inspect nearby chained hazards without an excessive fixed tail
     constexpr float kHazardClearancePadding = 8.0f;
+    constexpr auto kPredictionWallBudget = std::chrono::milliseconds(6);
+    constexpr int kEdgeProfileSamples = 4;
+    constexpr int kMinimumEdgeSamples = 2;
     constexpr float kMinConservativeHalfWidth = 20.0f; // covers normal-size and rotating hitboxes
     constexpr bool kLogVerdicts = true; // veredicto por clic -> log de Geode (NO consola)
 
@@ -136,13 +139,13 @@ namespace ac {
         }
         if (s.all == s.wave) {
             return fmt::format(
-                "STAGE {}: {} Ticks All | {} Ticks Wave ({:.1f}f @ 60fps)",
-                i + 1, s.all, s.wave, s.all * 0.25
+                "STAGE {}: {} update ticks All | {} update ticks Wave",
+                i + 1, s.all, s.wave
             );
         }
         return fmt::format(
-            "STAGE {}: {} Ticks All | {} Ticks Wave ({:.1f}f / {:.1f}f @ 60fps)",
-            i + 1, s.all, s.wave, s.all * 0.25, s.wave * 0.25
+            "STAGE {}: {} update ticks All | {} update ticks Wave",
+            i + 1, s.all, s.wave
         );
     }
 
@@ -153,11 +156,12 @@ namespace ac {
 
         auto const& s = kStages[0];
         ac_console::line("===================================================");
-        ac_console::line("[InputBuffer] v1.3.2 LOADED (input-edge robust predictive core)");
+        ac_console::line("[InputBuffer] v1.4.0 LOADED (bounded prediction + observed input timing)");
         ac_console::line(fmt::format(
             "[InputBuffer] Starting Mode: STAGE 1 ({} All / {} Wave)", s.all, s.wave
         ));
-        ac_console::line("[InputBuffer] Press F6 in-level to cycle: 2/2 -> 4/4 -> 8/8 -> 16/8 -> OFF");
+        ac_console::line("[InputBuffer] F6: 2/2 -> 4/4 -> 8/8 -> 16/8 -> OFF");
+        ac_console::line("[InputBuffer] Tick-based only; disable CBF / Click Between Steps / Click Between Ticks");
         ac_console::line("===================================================");
     }
 
@@ -168,7 +172,7 @@ namespace ac {
 
     // ---- Estado de la partida
     int g_tick = 0;           // updates reales del jugador 1 con dt > 0
-    float g_stepDt = 0.25f;   // mediana de una ventana estable de dt
+    float g_stepDt = 0.0f;    // mediana de dt medida, nunca asumida
     float g_lastDx = 0.0f;
     int g_dtStable = 0;
     std::deque<float> g_recentDt;
@@ -191,17 +195,18 @@ namespace ac {
     int g_skipOff = 0, g_skipEarly = 0, g_skipDead = 0, g_skipNoGhost = 0, g_skipOther = 0;
     int g_statKept = 0, g_statSaved = 0, g_statNoSolution = 0, g_statUnknown = 0;
     bool g_warnedX = false, g_warnedSeed = false, g_warnedWorld = false;
-    bool g_warnedFallbackX = false;
+    bool g_warnedFallbackX = false, g_warnedDualMode = false, g_warnedDeathQueue = false;
+    long long g_lastPredictionMicros = 0;
 
     bool g_loggedFirstUpdate = false;
 
     std::string statusLine(const char* tag) {
         return fmt::format(
             "[IB] {} stage={} ghost={} tick={} dtStable={} clicks={} predicted={} kept={} saved={} "
-            "nosol={} unknown={} lastUnknown={} | skipped: off={} early={} dead={} noGhost={} other={}",
+            "nosol={} unknown={} lastUnknown={} predictUs={} | skipped: off={} early={} dead={} noGhost={} other={}",
             tag, g_stage + 1, g_ghost ? "ok" : "NULL", g_tick, g_dtStable, g_clicksSeen,
             g_clicksPredicted, g_statKept, g_statSaved, g_statNoSolution, g_statUnknown,
-            g_unknownReason, g_skipOff, g_skipEarly, g_skipDead, g_skipNoGhost, g_skipOther
+            g_unknownReason, g_lastPredictionMicros, g_skipOff, g_skipEarly, g_skipDead, g_skipNoGhost, g_skipOther
         );
     }
 
@@ -264,8 +269,71 @@ namespace ac {
     // so a delayed press/release pair does not collapse to a one-tick hold.
     std::unordered_map<int, int> g_activePressDelay;
 
+    // Recent real input intervals only; synthetic validation edges never train this profile.
+    struct EdgeProfile {
+        bool initialized = false;
+        bool lastDown = false;
+        int pressStartTick = -1;
+        int releaseTick = -1;
+        std::deque<int> holdTicks;
+        std::deque<int> releaseGapTicks;
+    };
+    std::unordered_map<int, EdgeProfile> g_edgeProfiles;
+    using SteadyClock = std::chrono::steady_clock;
+
     int buttonKey(int button, bool isPlayer1) {
         return button + (isPlayer1 ? 0 : 10000);
+    }
+
+    void pushBounded(std::deque<int>& values, int value) {
+        if (value <= 0 || value > kMaxEdgeProfileTicks) return;
+        values.push_back(value);
+        while (values.size() > kEdgeProfileSamples) values.pop_front();
+    }
+
+    void observeRawInputEdge(int key, bool down) {
+        auto& profile = g_edgeProfiles[key];
+        if (!profile.initialized) {
+            profile.initialized = true;
+            profile.lastDown = down;
+            profile.pressStartTick = down ? g_tick : -1;
+            profile.releaseTick = down ? -1 : g_tick;
+            return;
+        }
+        if (profile.lastDown == down) return; // duplicate edge, not a timing sample
+        if (down) {
+            if (profile.releaseTick >= 0) pushBounded(profile.releaseGapTicks, g_tick - profile.releaseTick);
+            profile.pressStartTick = g_tick;
+            profile.lastDown = true;
+        } else {
+            if (profile.pressStartTick >= 0) pushBounded(profile.holdTicks, g_tick - profile.pressStartTick);
+            profile.releaseTick = g_tick;
+            profile.lastDown = false;
+        }
+    }
+
+    void resetEdgeProfileClocks(bool discardSamples) {
+        if (discardSamples) { g_edgeProfiles.clear(); return; }
+        for (auto& [key, profile] : g_edgeProfiles) {
+            (void)key;
+            profile.initialized = false;
+            profile.lastDown = false;
+            profile.pressStartTick = -1;
+            profile.releaseTick = -1;
+        }
+    }
+
+    std::vector<int> futureEdgeOffsets(int key, bool currentDown) {
+        auto it = g_edgeProfiles.find(key);
+        if (it == g_edgeProfiles.end()) return {};
+        auto const& samples = currentDown ? it->second.holdTicks : it->second.releaseGapTicks;
+        if (samples.size() < kMinimumEdgeSamples) return {};
+        std::vector<int> offsets;
+        for (int n : samples) {
+            if (n > 0 && n <= kMaxEdgeProfileTicks &&
+                std::find(offsets.begin(), offsets.end(), n) == offsets.end()) offsets.push_back(n);
+        }
+        return offsets;
     }
 
     struct SimulationScope {
@@ -294,9 +362,8 @@ namespace ac {
         g_activePressDelay.clear();
     }
 
-    // A pairwise dt comparison permits gradual clock drift (each step can differ by 1% while
-    // the long-run timestep changes dramatically). Calibrate against the full recent window.
-    // After any out-of-family sample, restart calibration rather than trusting the new value.
+    // Calibrate against the full recent window; reject clock drift rather than substituting
+    // nominal physics. The strict tolerance is intentional until live dt measurements justify it.
     void observePhysicsDt(float dt) {
         if (!std::isfinite(dt) || dt <= 0.0f) {
             g_recentDt.clear();
@@ -327,8 +394,9 @@ namespace ac {
         g_dtStable = static_cast<int>(g_recentDt.size());
     }
 
-    void clearState() {
+    void clearState(bool retainInputTimingProfile = false) {
         clearInputs();
+        resetEdgeProfileClocks(!retainInputTimingProfile);
         g_tick = 0;
         // Never use a nominal timestep during recalibration; prediction stays disabled until
         // a complete stable window of real update deltas has been observed.
@@ -348,7 +416,8 @@ namespace ac {
         g_loggedFirstUpdate = false;
         g_statKept = g_statSaved = g_statNoSolution = g_statUnknown = 0;
         g_warnedX = g_warnedSeed = g_warnedWorld = false;
-        g_warnedFallbackX = false;
+        g_warnedFallbackX = g_warnedDualMode = g_warnedDeathQueue = false;
+        g_lastPredictionMicros = 0;
     }
 
     // ========================================================================
@@ -669,15 +738,6 @@ namespace ac {
     }
 
     template <class P>
-    void setCloneX(P* player, float x) {
-        player->setPositionX(x);
-        // GD maintains a separate position member in some bindings/builds.
-        if constexpr (requires { player->m_position.x = x; }) {
-            player->m_position.x = x;
-        }
-    }
-
-    template <class P>
     void setCloneY(P* player, float y) {
         player->setPositionY(y);
         if constexpr (requires { player->m_position.y = y; }) {
@@ -723,7 +783,8 @@ namespace ac {
         int stepBudget = kMaxSimSteps,
         bool candidateImmediate = false,
         SimPerturbation perturbation = {},
-        int oppositeEdgeAfterCandidateTicks = 0
+        int oppositeEdgeAfterCandidateTicks = 0,
+        SteadyClock::time_point deadline = SteadyClock::time_point::max()
     ) {
         if (!layer || !real || !g_ghost) return unknown("no-ghost");
         if (g_dtStable < static_cast<int>(kDtCalibrationSamples)) return unknown("dt-window-not-calibrated");
@@ -872,6 +933,11 @@ namespace ac {
                 };
 
                 for (int step = 0; step < totalSteps; ++step) {
+                    if (SteadyClock::now() >= deadline) {
+                        out = unknown("prediction-wall-budget-exhausted");
+                        out.steps = step;
+                        break;
+                    }
                     // Direct inputs are already active before the next collision pass. Inputs
                     // held in the queue are applied after the due tick's collision pass, matching
                     // dispatchPending() from the PlayerObject::update hook.
@@ -924,31 +990,17 @@ namespace ac {
                     g_ghost->update(dt);
                     const float movedX = g_ghost->getPositionX() - beforeX;
 
-                    // Never advance the simulated player using the LIVE player's last X delta:
-                    // it leaks a future measurement into the prediction and becomes wrong at
-                    // speed changes. Use only the clone's own current velocity; otherwise UNKNOWN.
+                    // Do not synthesize horizontal movement. The clone must advance through
+                    // PlayerObject::update like xdBot's native trajectory. If this state does not
+                    // move X naturally, fail closed instead of making a path by hand.
                     if (std::abs(movedX) < 0.0001f) {
-                        const double vx = g_ghost->getCurrentXVelocity();
-                        const float fallbackDx = static_cast<float>(vx * dt);
-                        if (!std::isfinite(fallbackDx) || std::abs(fallbackDx) < 0.0001f) {
-                            if (!g_warnedX) {
-                                g_warnedX = true;
-                                log::warn("[IB] clone X cannot be advanced reliably; fail closed");
-                            }
-                            out = unknown("ghost-x-static");
-                            out.steps = step + 1;
-                            break;
+                        if (!g_warnedX) {
+                            g_warnedX = true;
+                            log::warn("[IB] native clone X did not advance; refusing prediction");
                         }
-                        setCloneX(g_ghost, beforeX + fallbackDx);
-                        if (std::abs(g_ghost->getPositionX() - beforeX) < 0.0001f) {
-                            out = unknown("ghost-x-set-failed");
-                            out.steps = step + 1;
-                            break;
-                        }
-                        if (!g_warnedFallbackX) {
-                            g_warnedFallbackX = true;
-                            log::info("[IB] clone X advanced using clone velocity only (vx={} dt={} dx={})", vx, dt, fallbackDx);
-                        }
+                        out = unknown("ghost-x-did-not-advance-natively");
+                        out.steps = step + 1;
+                        break;
                     }
 
                     g_ghost->updateRotation(dt);
@@ -995,6 +1047,14 @@ namespace ac {
         return out;
     }
 
+    struct PredictionTimer {
+        SteadyClock::time_point start = SteadyClock::now();
+        ~PredictionTimer() {
+            g_lastPredictionMicros = std::chrono::duration_cast<std::chrono::microseconds>(
+                SteadyClock::now() - start).count();
+        }
+    };
+
     int predictDelay(PlayLayer* layer, PlayerObject* player, bool down, int button,
         int inheritedPressDelay = 0) {
         const int safeFallbackDelay = std::max(0, inheritedPressDelay);
@@ -1003,9 +1063,9 @@ namespace ac {
         if (limit <= 0)        { ++g_skipOff; return safeFallbackDelay; }
         if (g_tick < 2)        { ++g_skipEarly; return safeFallbackDelay; }
         if (player->m_isDead)  { ++g_skipDead; return safeFallbackDelay; }
-        if (player->m_isPlatformer || button != 1) {
+        if (player->m_isPlatformer || button != 1 || layer->m_gameState.m_isDualMode) {
             ++g_skipOther;
-            return safeFallbackDelay; // directional/platformer input isn't modeled by this predictor
+            return safeFallbackDelay; // platformer, dual, or directional input is not modeled
         }
         if (!ensureGhost(layer)) { ++g_skipNoGhost; return safeFallbackDelay; }
 
@@ -1027,8 +1087,10 @@ namespace ac {
             return baselineDelay; // preserve the paired press/release offset even outside search cap
         }
 
+        PredictionTimer timer;
         ++g_clicksPredicted;
         g_unknownReason = "";
+        const auto deadline = SteadyClock::now() + kPredictionWallBudget;
 
         // A raw input with no queue is applied synchronously. Otherwise even a zero-delay event
         // is queued and lands after the due tick's collision pass. This boolean fixes the phase
@@ -1042,10 +1104,12 @@ namespace ac {
                                  SimPerturbation perturbation = {},
                                  int oppositeEdgeAfterTicks = 0) -> SimOut {
             if (remainingSteps <= 0) return unknown("per-click-budget-exhausted");
+            if (SteadyClock::now() >= deadline) return unknown("prediction-wall-budget-exhausted");
             const SimOut result = simulate(layer, player, down, button, due, clearTarget,
                 std::min(kMaxSimSteps, remainingSteps), directInput, perturbation,
-                oppositeEdgeAfterTicks);
+                oppositeEdgeAfterTicks, deadline);
             remainingSteps = std::max(0, remainingSteps - std::max(1, result.steps));
+            if (SteadyClock::now() >= deadline) return unknown("prediction-wall-budget-exhausted");
             return result;
         };
 
@@ -1096,14 +1160,17 @@ namespace ac {
                 kMinConservativeHalfWidth,
                 std::abs(playerRect.size.width) * 0.5f
             );
-            const float clearTargetX = base.deathObjectRight + halfPlayerWidth + kHazardClearancePadding;
-            if (!std::isfinite(clearTargetX) ||
-                clearTargetX <= player->getPositionX() + 0.1f ||
-                clearTargetX <= base.deathX + 0.1f) {
+            const float hazardClearTargetX = base.deathObjectRight + halfPlayerWidth + kHazardClearancePadding;
+            // Do not call one cleared obstacle "safe" immediately. Continue through a 48-unit
+            // corridor so nearby chained hazards are checked by native collision simulation.
+            const float validationTargetX = hazardClearTargetX + kPostClearanceDistance;
+            if (!std::isfinite(validationTargetX) ||
+                hazardClearTargetX <= player->getPositionX() + 0.1f ||
+                hazardClearTargetX <= base.deathX + 0.1f || validationTargetX <= hazardClearTargetX) {
                 ++g_statUnknown;
-                g_unknownReason = "invalid-hazard-clearance-target";
-                log::debug("[IB] tick {} -> UNKNOWN ({}) targetX={:.2f} deathX={:.2f}",
-                    g_tick, g_unknownReason, clearTargetX, base.deathX);
+                g_unknownReason = "invalid-hazard-validation-target";
+                log::debug("[IB] tick {} -> UNKNOWN ({}) hazardX={:.2f} validationX={:.2f} deathX={:.2f}",
+                    g_tick, g_unknownReason, hazardClearTargetX, validationTargetX, base.deathX);
                 return safeFallbackDelay;
             }
 
@@ -1111,7 +1178,7 @@ namespace ac {
             // If a physical moving/animated object exists in the predicted X corridor, do not
             // use the static-world simulation to authorize a delayed click.
             if (hasDynamicPhysicalObjectInXRange(
-                    layer, player->getPositionX() - 32.0f, clearTargetX + 120.0f)) {
+                    layer, player->getPositionX() - 32.0f, validationTargetX + 24.0f)) {
                 ++g_statUnknown;
                 g_unknownReason = "dynamic-physical-object-in-corridor";
                 log::debug("[IB] tick {} -> UNKNOWN ({})", g_tick, g_unknownReason);
@@ -1122,10 +1189,19 @@ namespace ac {
             // does not advance inside simulate(), so never certify a static clone trajectory if
             // an unsupported effect object can fire anywhere before the clearance target.
             if (hasUnsupportedEffectObjectInXRange(
-                    layer, player->getPositionX() - 32.0f, clearTargetX + 24.0f)) {
+                    layer, player->getPositionX() - 32.0f, validationTargetX + 24.0f)) {
                 ++g_statUnknown;
                 g_unknownReason = "unsupported-effect-object-in-corridor";
                 log::debug("[IB] tick {} -> UNKNOWN ({})", g_tick, g_unknownReason);
+                return safeFallbackDelay;
+            }
+
+            const auto calibratedEdgeOffsets = futureEdgeOffsets(key, down);
+            if (calibratedEdgeOffsets.empty()) {
+                ++g_statUnknown;
+                g_unknownReason = "future-edge-history-not-calibrated";
+                log::debug("[IB] {} tick {} -> UNKNOWN (need {} measured hold/gap samples)",
+                    down ? "PRESS" : "RELEASE", g_tick, kMinimumEdgeSamples);
                 return safeFallbackDelay;
             }
 
@@ -1151,13 +1227,13 @@ namespace ac {
                 lastDueChecked = due;
                 if (effectiveDelay <= baselineDelay || effectiveDelay > limit) continue;
 
-                const SimOut r = runSimulation(due, clearTargetX);
+                const SimOut r = runSimulation(due, validationTargetX);
                 guard.restore();
 
                 if (r.result == SimResult::Safe) {
                     // A positive verdict is replayed from a freshly seeded clone. The same
                     // clearance step and end-state must be reproduced before any click moves.
-                    const SimOut confirm = runSimulation(due, clearTargetX);
+                    const SimOut confirm = runSimulation(due, validationTargetX);
                     guard.restore();
                     if (!sameSafeClearance(r, confirm)) {
                         ++unknownCands;
@@ -1173,7 +1249,7 @@ namespace ac {
                     // to be alternate GD physics; they are a conservative sensitivity check for
                     // a candidate that depends on a razor-thin numerical boundary.
                     const SimPerturbation lowerEnvelope{0.999f, -0.05f, -0.01f};
-                    const SimOut lower = runSimulation(due, clearTargetX, false, lowerEnvelope);
+                    const SimOut lower = runSimulation(due, validationTargetX, false, lowerEnvelope);
                     guard.restore();
                     if (lower.result == SimResult::Unknown) {
                         ++unknownCands;
@@ -1187,7 +1263,7 @@ namespace ac {
                     }
 
                     const SimPerturbation upperEnvelope{1.001f, 0.05f, 0.01f};
-                    const SimOut upper = runSimulation(due, clearTargetX, false, upperEnvelope);
+                    const SimOut upper = runSimulation(due, validationTargetX, false, upperEnvelope);
                     guard.restore();
                     if (upper.result == SimResult::Unknown) {
                         ++unknownCands;
@@ -1200,27 +1276,28 @@ namespace ac {
                         continue;
                     }
 
-                    // Do not choose the first safe tick at the boundary of a one-tick window.
-                    // Require three consecutive nominally-clear timings, then choose their
-                    // middle tick and validate that selected middle timing independently.
-                    // This trades some coverage for a discrete timing margin on either side.
+                    // The original 3-tick margin made every SAVED impossible when the wave cap
+                    // was 2: a fatal baseline plus three safe delays cannot fit in that range.
+                    // Use a 3-tick contiguous window where available, otherwise a 2-tick window
+                    // and choose the later tick. Sensitivity and replay checks still apply.
+                    const bool twoTickWindow = (limit - baselineDelay) < 3;
                     const int centerRequested = totalDelay + 1;
                     const int tailRequested = totalDelay + 2;
-                    if (tailRequested > limit) {
+                    if (centerRequested > limit || (!twoTickWindow && tailRequested > limit)) {
                         ++fragileCandidates;
                         continue;
                     }
                     const int centerDue = effectiveDue(key, centerRequested);
-                    const int tailDue = effectiveDue(key, tailRequested);
+                    const int tailDue = twoTickWindow ? centerDue : effectiveDue(key, tailRequested);
                     const int centerDelay = centerDue - baselineTick;
                     const int tailDelay = tailDue - baselineTick;
-                    if (centerDelay != effectiveDelay + 1 || tailDelay != centerDelay + 1 ||
-                        tailDelay > limit) {
+                    if (centerDelay != effectiveDelay + 1 ||
+                        (!twoTickWindow && (tailDelay != centerDelay + 1 || tailDelay > limit))) {
                         ++fragileCandidates;
                         continue;
                     }
 
-                    const SimOut centerProbe = runSimulation(centerDue, clearTargetX);
+                    const SimOut centerProbe = runSimulation(centerDue, validationTargetX);
                     guard.restore();
                     if (centerProbe.result == SimResult::Unknown) {
                         ++unknownCands;
@@ -1228,22 +1305,28 @@ namespace ac {
                         unstable = true;
                         break;
                     }
-                    const SimOut tailProbe = runSimulation(tailDue, clearTargetX);
-                    guard.restore();
-                    if (tailProbe.result == SimResult::Unknown) {
-                        ++unknownCands;
-                        g_unknownReason = "timing-window-tail-unknown";
-                        unstable = true;
-                        break;
-                    }
-                    if (centerProbe.result != SimResult::Safe || tailProbe.result != SimResult::Safe) {
+                    if (centerProbe.result != SimResult::Safe) {
                         ++fragileCandidates;
                         continue;
+                    }
+                    if (!twoTickWindow) {
+                        const SimOut tailProbe = runSimulation(tailDue, validationTargetX);
+                        guard.restore();
+                        if (tailProbe.result == SimResult::Unknown) {
+                            ++unknownCands;
+                            g_unknownReason = "timing-window-tail-unknown";
+                            unstable = true;
+                            break;
+                        }
+                        if (tailProbe.result != SimResult::Safe) {
+                            ++fragileCandidates;
+                            continue;
+                        }
                     }
 
                     // Replay the actual selected center timing; the first robust tick is not
                     // the one sent to the game. The center itself must pass replay + envelope.
-                    const SimOut centerConfirm = runSimulation(centerDue, clearTargetX);
+                    const SimOut centerConfirm = runSimulation(centerDue, validationTargetX);
                     guard.restore();
                     if (!sameSafeClearance(centerProbe, centerConfirm)) {
                         ++unknownCands;
@@ -1252,7 +1335,7 @@ namespace ac {
                         break;
                     }
 
-                    const SimOut centerLower = runSimulation(centerDue, clearTargetX, false, lowerEnvelope);
+                    const SimOut centerLower = runSimulation(centerDue, validationTargetX, false, lowerEnvelope);
                     guard.restore();
                     if (centerLower.result == SimResult::Unknown) {
                         ++unknownCands;
@@ -1265,7 +1348,7 @@ namespace ac {
                         continue;
                     }
 
-                    const SimOut centerUpper = runSimulation(centerDue, clearTargetX, false, upperEnvelope);
+                    const SimOut centerUpper = runSimulation(centerDue, validationTargetX, false, upperEnvelope);
                     guard.restore();
                     if (centerUpper.result == SimResult::Unknown) {
                         ++unknownCands;
@@ -1278,37 +1361,31 @@ namespace ac {
                         continue;
                     }
 
-                    // The next opposite edge is not yet known at prediction time. A press may
-                    // be released quickly (or a release followed by another press). Validate
-                    // the chosen middle timing against every opposite-edge offset from 1 until
-                    // the simulated clearance horizon (capped at kMaxClearanceEstimate). The
-                    // stage delay cap is NOT a safe proxy for hold duration. Each branch must run
-                    // through obstacle clearance and two post-edge collision samples. If any
-                    // branch dies or is unknown, this timing is not certified.
-                    bool inputEdgeRobust = true;
+                    // Test only observed recent hold/gap durations, not every arbitrary tick.
+                    // The all-offset sweep made wave candidates fail on hypothetical edge times
+                    // that the player never uses and routinely exhausted the work budget.
+                    bool inputEdgeProfileRobust = true;
                     int inputEdgeBranchesPassed = 0;
-                    const int ticksAfterCandidate = std::max(1, centerConfirm.steps - centerDelay);
-                    const int maxOppositeOffset = std::min(kMaxClearanceEstimate, ticksAfterCandidate);
-                    for (int oppositeOffset = 1; oppositeOffset <= maxOppositeOffset; ++oppositeOffset) {
+                    for (int oppositeOffset : calibratedEdgeOffsets) {
                         const SimOut edgeBranch = runSimulation(
-                            centerDue, clearTargetX, false, {}, oppositeOffset);
+                            centerDue, validationTargetX, false, {}, oppositeOffset);
                         guard.restore();
                         if (edgeBranch.result == SimResult::Unknown) {
                             ++unknownCands;
-                            g_unknownReason = "input-edge-envelope-unknown";
+                            g_unknownReason = "measured-input-edge-branch-unknown";
                             unstable = true;
-                            inputEdgeRobust = false;
+                            inputEdgeProfileRobust = false;
                             break;
                         }
                         if (edgeBranch.result != SimResult::Safe) {
                             ++fragileCandidates;
-                            inputEdgeRobust = false;
+                            inputEdgeProfileRobust = false;
                             break;
                         }
                         ++inputEdgeBranchesPassed;
                     }
                     if (unstable) break;
-                    if (!inputEdgeRobust) continue;
+                    if (!inputEdgeProfileRobust) continue;
 
                     chosen = centerDelay;
                     chosenDue = centerDue;
@@ -1330,6 +1407,11 @@ namespace ac {
                 }
             }
 
+            if (SteadyClock::now() >= deadline) {
+                unstable = true;
+                found = false;
+                g_unknownReason = "prediction-wall-budget-exhausted";
+            }
             if (unstable) {
                 ++g_statUnknown;
                 if (!g_unknownReason || g_unknownReason[0] == '\0') g_unknownReason = "candidate-simulation-unknown";
@@ -1339,17 +1421,17 @@ namespace ac {
             else if (found) {
                 ++g_statSaved;
                 const int actualDelay = chosenDue - baselineTick;
-                const float nominalFrames = actualDelay * 0.25f;
+                const float nominalFrames = actualDelay * g_stepDt * 60.0f;
                 ac_console::line(fmt::format(
-                    "[InputBuffer] *** SAVED +{} TICKS ({:.2f} nominal frames @ 60fps) {}! "
-                    "(base death step={} object-right={:.2f} -> validated through step={}) [Limit: {}] ***",
+                    "[InputBuffer] *** SAVED +{} UPDATE-TICKS ({:.2f} measured frames @ 60fps) {}! "
+                    "(base death step={} object-right={:.2f} -> validation-X={:.2f}, step={}) [Limit: {}] ***",
                     actualDelay, nominalFrames, down ? "PRESS" : "RELEASE",
-                    base.steps, base.deathObjectRight, chosenClearSteps, limit
+                    base.steps, base.deathObjectRight, validationTargetX, chosenClearSteps, limit
                 ));
                 log::info(
-                    "[IB] SAVED edge-robust event={} tick={} delay={} limit={} targetX={:.2f} "
+                    "[IB] SAVED profile-validated event={} tick={} delay={} limit={} validationX={:.2f} "
                     "validatedThroughStep={} oppositeEdgeBranches={} remainingBudget={}",
-                    down ? "PRESS" : "RELEASE", g_tick, actualDelay, limit, clearTargetX,
+                    down ? "PRESS" : "RELEASE", g_tick, actualDelay, limit, validationTargetX,
                     chosenClearSteps, chosenEdgeBranches, remainingSteps
                 );
             }
@@ -1409,6 +1491,14 @@ namespace ac {
 
     void dispatchPending(PlayLayer* layer, int nextTick) {
         if (!layer) return;
+        if (!layer->m_player1 || layer->m_player1->m_isDead) {
+            if (!g_queue.empty() && !g_warnedDeathQueue) {
+                g_warnedDeathQueue = true;
+                log::warn("[IB] pending inputs discarded because the real player is dead");
+            }
+            clearInputs();
+            return;
+        }
 
         while (!g_queue.empty() && g_queue.front().tick <= nextTick) {
             const auto input = g_queue.front();
@@ -1422,6 +1512,21 @@ namespace ac {
             QueuedInputScope scope;
             layer->handleButton(input.down, input.button, input.isPlayer1);
         }
+    }
+
+    void flushPendingNow(PlayLayer* layer) {
+        if (!layer || !layer->m_player1 || layer->m_player1->m_isDead) {
+            clearInputs();
+            return;
+        }
+        while (!g_queue.empty()) {
+            const auto input = g_queue.front();
+            g_queue.pop_front();
+            QueuedInputScope scope;
+            layer->handleButton(input.down, input.button, input.isPlayer1);
+        }
+        g_keys.clear();
+        g_activePressDelay.clear();
     }
 
 } // namespace ac
@@ -1457,7 +1562,7 @@ class $modify(IBPlayLayer, PlayLayer) {
 
         ac::showBannerOnce();
         ac::g_layer = this;
-        ac::clearState();
+        ac::clearState(false);
         ac::clearStats();
 
         // ensureGhost cleans up the retained clone from any previous PlayLayer.
@@ -1469,9 +1574,9 @@ class $modify(IBPlayLayer, PlayLayer) {
         if (ac::g_clicksSeen > 0 || ac::g_tick > 0) {
             log::info("{}", ac::statusLine("ATTEMPT"));
         }
-        ac::clearState();
+        ac::clearState(true);
         PlayLayer::resetLevel();
-        ac::clearState();
+        ac::clearState(true);
         ac::clearStats(); // Keep ATTEMPT diagnostics scoped to one attempt.
     }
 
@@ -1509,6 +1614,14 @@ class $modify(IBPlayLayer, PlayLayer) {
             }
             return;
         }
+        if (!ac::g_simulating) {
+            auto* liveLayer = PlayLayer::get();
+            if (liveLayer && player == liveLayer->m_player1) {
+                const auto discarded = ac::g_queue.size();
+                ac::clearInputs();
+                if (discarded > 0) log::warn("[IB] cancelled {} pending edge(s) on player death", discarded);
+            }
+        }
         PlayLayer::destroyPlayer(player, object);
     }
 
@@ -1533,6 +1646,16 @@ class $modify(IBBaseLayer, GJBaseGameLayer) {
             return;
         }
 
+        if (layer->m_gameState.m_isDualMode) {
+            if (!ac::g_warnedDualMode) {
+                ac::g_warnedDualMode = true;
+                log::warn("[IB] dual mode detected: prediction disabled; passing raw input");
+            }
+            ac::flushPendingNow(layer);
+            GJBaseGameLayer::handleButton(down, button, isPlayer1);
+            return;
+        }
+
         ++ac::g_clicksSeen;
         if (ac::g_clicksSeen <= 3) {
             log::info(
@@ -1545,6 +1668,7 @@ class $modify(IBBaseLayer, GJBaseGameLayer) {
         int delay = 0;
         auto* player = layer->m_player1;
         const int key = ac::buttonKey(button, isPlayer1);
+        ac::observeRawInputEdge(key, down);
         auto keyIt = ac::g_keys.find(key);
         const bool keyPending = keyIt != ac::g_keys.end() && keyIt->second.pending > 0;
         auto activeIt = ac::g_activePressDelay.find(key);
