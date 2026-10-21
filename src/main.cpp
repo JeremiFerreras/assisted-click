@@ -1000,7 +1000,7 @@ namespace ac {
 
             if (unstable) {
                 ++g_statUnknown;
-                if (g_unknownReason.empty()) g_unknownReason = "candidate-simulation-unknown";
+                if (!g_unknownReason || g_unknownReason[0] == '\0') g_unknownReason = "candidate-simulation-unknown";
                 log::debug("[IB] {} tick {} -> UNKNOWN ({}, testedStepsLeft={})",
                     down ? "PRESS" : "RELEASE", g_tick, g_unknownReason, remainingSteps);
             }
