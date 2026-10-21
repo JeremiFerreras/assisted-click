@@ -1,26 +1,21 @@
-// Assisted Click / Geode Predictive Input Buffer - src/main.cpp
+// Assisted Click - src/main.cpp -- v1.2.1 (false-positive and runtime-budget hardening)
 //
-// Que hace: al recibir un clic (PRESS/RELEASE) simula un jugador "fantasma" tick a tick
-// (paso de 1/240 s = 0.25 frames @ 60fps). Si con el timing original el fantasma muere dentro
-// de la ventana CRITICA, busca el menor retraso (en ticks) dentro del limite de la etapa con el
-// que el fantasma sobreviva y aplica la entrada retrasada. Si no hay retraso seguro, o la
-// simulacion toca algo que no sabe modelar, el clic pasa SIN tocar (fail-safe).
+// Que hace: al recibir un clic (PRESS/RELEASE) simula un jugador "falso" tick a tick
+// (paso de 1/240 s = 0.25 frames @ 60fps). Si con el timing original el falso muere,
+// busca el menor retraso dentro del limite de la etapa con el que consiga pasar el hueco
+// y aplica la entrada retrasada.
 //
-// Tecnicas tomadas de xdBot (ZiLko/xdBot, show_trajectory.cpp + practice_fixes/player.cpp):
+// Tecnicas tomadas de xdBot (ZiLko/xdBot):
 //  - jugador falso creado con PlayerObject::create y anadido a m_objectLayer
-//  - copia del estado del jugador (saveData/applyData)
-//  - por paso: update -> updateRotation -> updatePlayerScale -> limpiar logs -> checkCollisions
-//  - mientras se simula se bloquean los efectos secundarios (sfx, triggers, aros, particulas,
-//    estela, animacion de fin de nivel...) y los objetos no modelados se desactivan solo
-//    durante la llamada de colisiones (collisionCheckObjects).
+//  - copia amplia del estado de PlayerObject mediante seedGhost/AC_COPY; no se asume completa
+//  - por paso: limpiar logs -> checkCollisions -> aplicar entrada -> update -> rotacion/escala
+//  - mientras se simula se bloquean TODOS los efectos secundarios (sfx, triggers, aros,
+//    particulas, estela, animacion de fin de nivel...) y los objetos no modelados se
+//    desactivan solo durante la llamada de colisiones (collisionCheckObjects).
 //
-// Uso personal / offline. Esta herramienta altera el timing de tus clics: NO la uses para
-// enviar records, verificaciones ni completados a listas o rankings.
+// Uso personal / offline. No sirve para enviar records a listas.
 //
-// Consola: SOLO banner, ciclo F6 y lineas "SAVED". Todo lo demas va al log de Geode (F7 = estado).
-//
-// Fidelidad con el video de referencia (v4.6): titulo de consola, banner, texto de etapas,
-// formato de la linea SAVED y numeros "Frame0: N -> Delayed: M" (65 en wave / 160 en el resto).
+// Consola: banner, ciclos F6, estado F7 y eventos "SAVED"; el diagnóstico detallado va al log de Geode.
 
 #ifdef _WIN32
     #ifndef WIN32_LEAN_AND_MEAN
@@ -33,7 +28,9 @@
 #endif
 
 #include <mutex>
+#include <optional>
 #include <string>
+#include <limits>
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -47,7 +44,6 @@
 #include <algorithm>
 #include <cmath>
 #include <deque>
-#include <exception>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -66,56 +62,21 @@ static std::mutex g_mutex;
 static HANDLE g_output = INVALID_HANDLE_VALUE;
 static bool g_ready = false;
 
-// Ctrl+C / Ctrl+Break en la consola cerrarian el juego entero: se ignoran.
-static BOOL WINAPI ctrlHandler(DWORD type) {
-    return (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT) ? TRUE : FALSE;
-}
-
 static bool init() {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_ready) return true;
 
-    FreeConsole();
-    if (!AllocConsole()) return false;
+    // Never detach/free a console owned by the host or another mod.
+    // Create one only when the process is not already attached to a console.
+    if (GetConsoleWindow() == nullptr && !AllocConsole()) return false;
 
-    // CONOUT$ en vez de GetStdHandle: no depende de que stdout del juego este redirigido.
-    g_output = CreateFileA(
-        "CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-        nullptr, OPEN_EXISTING, 0, nullptr
-    );
+    g_output = GetStdHandle(STD_OUTPUT_HANDLE);
     if (g_output == nullptr || g_output == INVALID_HANDLE_VALUE) {
         g_output = INVALID_HANDLE_VALUE;
-        FreeConsole();
         return false;
     }
 
-    // Estabilidad 1: con "QuickEdit" activo, un clic en la consola congela WriteConsole y,
-    // como se escribe desde el hilo del juego, congelaria el juego hasta pulsar Enter.
-    HANDLE input = CreateFileA(
-        "CONIN$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-        nullptr, OPEN_EXISTING, 0, nullptr
-    );
-    if (input != nullptr && input != INVALID_HANDLE_VALUE) {
-        DWORD mode = 0;
-        if (GetConsoleMode(input, &mode)) {
-            mode &= ~static_cast<DWORD>(ENABLE_QUICK_EDIT_MODE);
-            mode |= ENABLE_EXTENDED_FLAGS;
-            SetConsoleMode(input, mode);
-        }
-        CloseHandle(input);
-    }
-
-    // Estabilidad 2: cerrar la ventana de consola termina el proceso (el juego). Se quita el boton X.
-    if (HWND window = GetConsoleWindow()) {
-        if (HMENU menu = GetSystemMenu(window, FALSE)) {
-            DeleteMenu(menu, SC_CLOSE, MF_BYCOMMAND);
-        }
-    }
-
-    // Estabilidad 3: Ctrl+C no debe matar el juego.
-    SetConsoleCtrlHandler(ctrlHandler, TRUE);
-
-    SetConsoleTitleA("Geode Predictive Input Buffer - Live Console");
+    SetConsoleTitleA("InputBuffer - Live Console");
     SetConsoleOutputCP(CP_UTF8);
     g_ready = true;
     return true;
@@ -149,22 +110,21 @@ namespace ac {
     constexpr Stage kStages[] = { {2, 2}, {4, 4}, {8, 8}, {16, 8}, {0, 0} };
     constexpr int kStageCount = 5;
 
-    // Ventana CRITICA: ticks (contados desde la ULTIMA entrada simulada) en los que una muerte
-    // del fantasma SI cuenta. La simulacion mantiene el boton igual todo el tiempo, pero el
-    // jugador real lo cambia pronto (en wave cada pocos frames), asi que una muerte tardia casi
-    // siempre es un falso positivo por "mantener pulsado" (en pruebas: DEATH at step 22-26 sin
-    // importar el retraso). 20 ticks (5 frames @60fps) es lo bastante largo para ver muertes
-    // como "Frame0: 17" del video y menor que el primer falso positivo observado.
-    constexpr int kCritical = 20;
-
-    // Lookahead informativo: tras elegir un retraso seguro se vuelve a simular mas lejos solo
-    // para medir cuanto sobrevive el fantasma (el "Delayed: N" de la consola). 65 en wave y 160
-    // en el resto son los valores del video. Una muerte/objeto no modelado DESPUES de la ventana
-    // critica solo corta esa medicion; nunca invalida el retraso.
-    constexpr int kLookaheadWave = 65;
-    constexpr int kLookaheadOther = 160;
-    constexpr int kMaxSimSteps = 160;   // tope de seguridad por simulacion
-    constexpr int kJumpButton = 1;      // PlayerButton::Jump (2/3 = izquierda/derecha en platformer)
+    // Ventana CRITICA: ticks que se simulan tras aplicar la entrada. La simulacion mantiene
+    // el boton igual todo ese tiempo, pero el jugador real lo cambia pronto (en wave cada
+    // pocos frames). Con 28-64 ticks el fantasma moria siempre al chocar con techo/suelo por
+    // "mantener pulsado" (log: DEATH at step 22-26 sin importar el retraso) y nunca habia
+    // un retraso "seguro". Las muertes que SI dependen del timing del clic ocurren en los
+    // primeros ticks (el video de referencia muestra Frame0: 8). 16 ticks = 4 frames @60fps.
+    // Short baseline lookahead: this is only a trigger for searching, NOT proof that
+    // a candidate is safe. Candidate validation runs until it clears the baseline hazard.
+    constexpr int kHorizon = 16;
+    constexpr int kMaxSimSteps = 96;    // hard cap per trajectory
+    constexpr int kMaxStepsPerInput = 512; // aggregate budget across all candidate trajectories
+    constexpr int kMaxClearanceEstimate = 48; // far targets fail closed rather than stall a frame
+    constexpr int kPostClearanceSteps = 2; // also sample collisions just after the target edge
+    constexpr float kHazardClearancePadding = 8.0f;
+    constexpr float kMinConservativeHalfWidth = 20.0f; // covers normal-size and rotating hitboxes
     constexpr bool kLogVerdicts = true; // veredicto por clic -> log de Geode (NO consola)
 
     int g_stage = 0; // empieza en STAGE 1
@@ -186,29 +146,19 @@ namespace ac {
         );
     }
 
-    // Linea "SAVED" de la consola (formato identico al del video de referencia).
-    std::string savedText(int ticks, bool down, int frame0, int delayed, int limit) {
-        return fmt::format(
-            "[InputBuffer] *** SAVED +{} TICKS ({:.2f} frames @ 60fps) {}! "
-            "(Frame0: {} -> Delayed: {}) [Limit: {}] ***",
-            ticks, ticks * 0.25, down ? "PRESS" : "RELEASE", frame0, delayed, limit
-        );
-    }
-
     void showBannerOnce() {
         static bool shown = false;
         if (shown || !ac_console::init()) return;
         shown = true;
 
         auto const& s = kStages[0];
-        const std::string bar(60, '=');
-        ac_console::line(bar);
-        ac_console::line(" [InputBuffer] v4.6 LOADED (Wave Spikes/Saws Trajectory Fix)");
+        ac_console::line("===================================================");
+        ac_console::line("[InputBuffer] v1.2.1 LOADED (fail-closed predictive core)");
         ac_console::line(fmt::format(
-            " [InputBuffer] Starting Mode: STAGE 1 ({} All / {} Wave)", s.all, s.wave
+            "[InputBuffer] Starting Mode: STAGE 1 ({} All / {} Wave)", s.all, s.wave
         ));
-        ac_console::line(" [InputBuffer] Press F6 in-level to cycle: 2/2 -> 4/4 -> 8/8 -> 16/8 -> OFF");
-        ac_console::line(bar);
+        ac_console::line("[InputBuffer] Press F6 in-level to cycle: 2/2 -> 4/4 -> 8/8 -> 16/8 -> OFF");
+        ac_console::line("===================================================");
     }
 
     int limitFor(PlayerObject* p) {
@@ -237,6 +187,7 @@ namespace ac {
     int g_skipOff = 0, g_skipEarly = 0, g_skipDead = 0, g_skipNoGhost = 0, g_skipOther = 0;
     int g_statKept = 0, g_statSaved = 0, g_statNoSolution = 0, g_statUnknown = 0;
     bool g_warnedX = false, g_warnedSeed = false, g_warnedWorld = false;
+    bool g_warnedFallbackX = false;
 
     bool g_loggedFirstUpdate = false;
 
@@ -255,7 +206,29 @@ namespace ac {
     struct SimOut {
         SimResult result;
         int steps;
+        float deathX = 0.0f;
+        float deathObjectRight = 0.0f;
+        bool knownPhysicalDeathObject = false;
+        GameObject* deathObject = nullptr;
+        float endX = 0.0f;
+        float endY = 0.0f;
+        float endYVelocity = 0.0f;
+        float endRotation = 0.0f;
+        bool endIsDart = false;
+        bool endIsShip = false;
+        bool endIsBall = false;
+        bool endIsBird = false;
+        bool endIsRobot = false;
+        bool endIsSpider = false;
+        bool endIsSwing = false;
+        bool endIsUpsideDown = false;
     };
+
+    // Populated only when the clone dies inside PlayLayer::destroyPlayer.
+    float g_cloneDeathX = 0.0f;
+    float g_cloneDeathObjectRight = 0.0f;
+    bool g_cloneDeathObjectKnown = false;
+    GameObject* g_cloneDeathObject = nullptr;
 
     // ---- Cola de entradas
     struct PendingInput {
@@ -283,6 +256,10 @@ namespace ac {
             g_simulating = true;
             g_cloneDied = false;
             g_unmodeled = false;
+            g_cloneDeathX = 0.0f;
+            g_cloneDeathObjectRight = 0.0f;
+            g_cloneDeathObjectKnown = false;
+            g_cloneDeathObject = nullptr;
         }
         ~SimulationScope() { g_simulating = prev; }
     };
@@ -316,6 +293,7 @@ namespace ac {
         g_loggedFirstUpdate = false;
         g_statKept = g_statSaved = g_statNoSolution = g_statUnknown = 0;
         g_warnedX = g_warnedSeed = g_warnedWorld = false;
+        g_warnedFallbackX = false;
     }
 
     // ========================================================================
@@ -354,6 +332,40 @@ namespace ac {
         }
     }
 
+    // La predicción de limpieza solo puede usar como objetivo una colisión física estable.
+    // Los peligros animados o los objetos físicos con acciones corriendo pueden moverse mientras
+    // el nivel real avanza; el clon NO actualiza el mundo, así que se rechazan conservadoramente.
+    bool isClearancePhysical(GameObject* o) {
+        if (!o) return false;
+        switch (o->m_objectType) {
+            case GameObjectType::Solid:
+            case GameObjectType::Hazard:
+            case GameObjectType::Slope:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    bool hasDynamicPhysicalMotion(GameObject* o) {
+        if (!o || !isPhysical(o)) return false;
+        if (o->m_objectType == GameObjectType::AnimatedHazard) return true;
+        return o->numberOfRunningActions() > 0;
+    }
+
+    bool hasDynamicPhysicalObjectInXRange(PlayLayer* layer, float minX, float maxX) {
+        if (!layer || !layer->m_objects || !std::isfinite(minX) || !std::isfinite(maxX)) {
+            return true; // unavailable inspection is not proof of a static world
+        }
+        for (auto* obj : CCArrayExt<GameObject*>(layer->m_objects)) {
+            if (!obj || !isPhysical(obj)) continue;
+            const auto rect = obj->getObjectRect();
+            if (rect.getMaxX() < minX || rect.getMinX() > maxX) continue;
+            if (hasDynamicPhysicalMotion(obj)) return true;
+        }
+        return false;
+    }
+
     // Igual que ShowTrajectory::handlePortal (gravedad omitida igual que en xdBot).
     void handlePortal(PlayerObject* player, int id) {
         switch (id) {
@@ -378,6 +390,15 @@ namespace ac {
     template <class P>
     void seedGhost(P* dst, P* src) {
         if (!dst || !src) return;
+
+        // Clear clone-only transient collision state before seeding it from the real player.
+        // The requires checks keep this source compatible with binding variations.
+        if constexpr (requires { dst->resetCollisionLog(true); }) {
+            dst->resetCollisionLog(true);
+        }
+        if constexpr (requires { dst->resetCollisionValues(); }) {
+            dst->resetCollisionValues();
+        }
 
         dst->setPosition(src->getPosition());
         dst->setRotation(src->getRotation());
@@ -457,12 +478,18 @@ namespace ac {
     // Igual que xdBot: dos PlayerObject::create y anadidos a m_objectLayer. Aqui solo uno.
     // Vive ligado a su PlayLayer; se libera en PlayLayer::onQuit (NO en onExit).
     bool ensureGhost(PlayLayer* layer) {
-        if (!layer) return false;
+        if (!layer || !layer->m_objectLayer) return false;
         if (g_ghost && g_ghostOwner == layer) return true;
 
-        // Fantasma de otra capa (posiblemente ya destruida): se suelta sin tocar.
-        g_ghost = nullptr;
-        g_ghostOwner = nullptr;
+        // The retained clone can outlive its old layer. Release our retain without
+        // dereferencing g_ghostOwner (which may already be stale).
+        if (g_ghost) {
+            auto* staleGhost = g_ghost;
+            g_ghost = nullptr;
+            g_ghostOwner = nullptr;
+            staleGhost->removeFromParentAndCleanup(true);
+            staleGhost->release();
+        }
 
         auto* ghost = PlayerObject::create(1, 1, layer, layer, true);
         if (!ghost) {
@@ -553,116 +580,246 @@ namespace ac {
     // ========================================================================
     // Simulacion (misma secuencia que ShowTrajectory::createTrajectory)
     // ========================================================================
-    struct SimEvent { int step; bool down; int button; };
+    struct SimEvent { int step; bool down; int button; bool candidate; };
 
     static SimOut unknown(const char* why) {
         g_unknownReason = why;
         return {SimResult::Unknown, 0};
     }
 
-    // extended = false: solo la ventana critica (decide si un retraso es seguro).
-    // extended = true : sigue hasta el lookahead para medir cuanto sobrevive (solo informativo).
-    SimOut simulate(PlayLayer* layer, PlayerObject* real, bool down, int button,
-                    int candidateDue, bool extended) {
+    template <class P>
+    void setCloneX(P* player, float x) {
+        player->setPositionX(x);
+        // GD maintains a separate position member in some bindings/builds.
+        if constexpr (requires { player->m_position.x = x; }) {
+            player->m_position.x = x;
+        }
+    }
+
+    bool nearFloat(float a, float b, float tolerance) {
+        return std::isfinite(a) && std::isfinite(b) && std::abs(a - b) <= tolerance;
+    }
+
+    bool sameBaselineDeath(SimOut const& a, SimOut const& b) {
+        return a.result == SimResult::Died && b.result == SimResult::Died &&
+            a.steps == b.steps && a.knownPhysicalDeathObject && b.knownPhysicalDeathObject &&
+            a.deathObject == b.deathObject &&
+            nearFloat(a.deathX, b.deathX, 0.05f) &&
+            nearFloat(a.deathObjectRight, b.deathObjectRight, 0.05f);
+    }
+
+    bool sameSafeClearance(SimOut const& a, SimOut const& b) {
+        return a.result == SimResult::Safe && b.result == SimResult::Safe &&
+            a.steps == b.steps &&
+            nearFloat(a.endX, b.endX, 0.05f) &&
+            nearFloat(a.endY, b.endY, 0.05f) &&
+            nearFloat(a.endYVelocity, b.endYVelocity, 0.1f) &&
+            nearFloat(a.endRotation, b.endRotation, 0.1f) &&
+            a.endIsDart == b.endIsDart && a.endIsShip == b.endIsShip &&
+            a.endIsBall == b.endIsBall && a.endIsBird == b.endIsBird &&
+            a.endIsRobot == b.endIsRobot && a.endIsSpider == b.endIsSpider &&
+            a.endIsSwing == b.endIsSwing && a.endIsUpsideDown == b.endIsUpsideDown;
+    }
+
+    SimOut simulate(
+        PlayLayer* layer,
+        PlayerObject* real,
+        bool down,
+        int button,
+        int candidateDue,
+        std::optional<float> clearTargetX = std::nullopt,
+        int stepBudget = kMaxSimSteps
+    ) {
         if (!layer || !real || !g_ghost) return unknown("no-ghost");
         if (g_dtStable < 2) return unknown("dt-unstable");
+        if (!std::isfinite(g_stepDt) || g_stepDt <= 0.0f) return unknown("invalid-dt");
+        if (stepBudget <= 0) return unknown("per-click-budget-exhausted");
+        if (!g_ghost->m_collisionLogTop || !g_ghost->m_collisionLogBottom ||
+            !g_ghost->m_collisionLogLeft || !g_ghost->m_collisionLogRight) {
+            return unknown("ghost-collision-log-null");
+        }
 
         const int base = g_tick + 1;
-
-        // Eventos: cola real pendiente + candidato.
         std::vector<SimEvent> events;
         events.reserve(g_queue.size() + 1);
         for (auto const& q : g_queue) {
-            events.push_back({std::max(0, q.tick - base), q.down, q.button});
+            events.push_back({std::max(0, q.tick - base), q.down, q.button, false});
         }
-        events.push_back({std::max(0, candidateDue - base), down, button});
+        events.push_back({std::max(0, candidateDue - base), down, button, true});
         std::stable_sort(events.begin(), events.end(),
             [](SimEvent const& a, SimEvent const& b) { return a.step < b.step; });
 
-        const int criticalEnd = events.back().step + kCritical;
-        if (criticalEnd > kMaxSimSteps) return unknown("too-many-steps");
+        const int latestEventStep = events.back().step;
+        if (latestEventStep >= kMaxSimSteps) return unknown("too-many-steps");
 
-        int totalSteps = criticalEnd;
-        if (extended) {
-            const int lookahead = real->m_isDart ? kLookaheadWave : kLookaheadOther;
-            totalSteps = std::min(kMaxSimSteps, std::max(criticalEnd, lookahead));
+        int plannedSteps = latestEventStep + kHorizon + 1;
+        if (clearTargetX) {
+            // A target whose distance cannot be estimated reliably is not a safe prediction.
+            float dxPerTick = std::abs(g_lastDx);
+            if (!std::isfinite(dxPerTick) || dxPerTick < 0.001f) {
+                dxPerTick = static_cast<float>(std::abs(real->getCurrentXVelocity() * g_stepDt));
+            }
+            if (!std::isfinite(dxPerTick) || dxPerTick < 0.001f) {
+                return unknown("clearance-speed-unknown");
+            }
+            const float distance = std::max(0.0f, *clearTargetX - real->getPositionX());
+            const int estimatedTicks = static_cast<int>(std::ceil(distance / dxPerTick));
+            if (estimatedTicks > kMaxClearanceEstimate) {
+                return unknown("clearance-target-too-far");
+            }
+            // Speed portals can slow the clone after the estimate. Use a generous multiplier,
+            // but keep a strict hard cap so one click cannot freeze the game for a long sweep.
+            const int modeLimit = std::max(0, limitFor(real));
+            plannedSteps = std::min(
+                kMaxSimSteps,
+                std::max(kHorizon + modeLimit + 8, estimatedTicks * 3 + modeLimit + 8)
+            );
         }
-
-        const float dt = g_stepDt > 0.0f ? g_stepDt : 0.25f;
-
+        const int totalSteps = std::min(plannedSteps, stepBudget);
+        const bool budgetTruncated = totalSteps < plannedSteps;
+        const float dt = g_stepDt;
         const float rx = real->getPositionX();
         const float ry = real->getPositionY();
         const double rv = real->m_yVelocity;
 
         SimOut out{SimResult::Safe, totalSteps};
+        bool candidateApplied = false;
+        bool clearedTarget = false;
+        int targetCrossStep = -1;
 
         {
             SimulationScope scope;
             seedGhost(g_ghost, real);
 
+            const bool seedOK =
+                nearFloat(g_ghost->getPositionX(), rx, 0.001f) &&
+                nearFloat(g_ghost->getPositionY(), ry, 0.001f) &&
+                nearFloat(static_cast<float>(g_ghost->m_yVelocity), static_cast<float>(rv), 0.001f) &&
+                nearFloat(g_ghost->getRotation(), real->getRotation(), 0.05f) &&
+                nearFloat(g_ghost->getScale(), real->getScale(), 0.001f) &&
+                nearFloat(g_ghost->m_playerSpeed, real->m_playerSpeed, 0.0001f) &&
+                nearFloat(g_ghost->m_speedMultiplier, real->m_speedMultiplier, 0.0001f) &&
+                g_ghost->m_isDart == real->m_isDart &&
+                g_ghost->m_isShip == real->m_isShip &&
+                g_ghost->m_isBall == real->m_isBall &&
+                g_ghost->m_isBird == real->m_isBird &&
+                g_ghost->m_isRobot == real->m_isRobot &&
+                g_ghost->m_isSpider == real->m_isSpider &&
+                g_ghost->m_isSwing == real->m_isSwing &&
+                g_ghost->m_isUpsideDown == real->m_isUpsideDown &&
+                g_ghost->m_isPlatformer == real->m_isPlatformer;
+
             if (!g_warnedSeed) {
                 g_warnedSeed = true;
-                const bool ok =
-                    std::abs(g_ghost->getPositionX() - rx) < 0.001f &&
-                    std::abs(g_ghost->getPositionY() - ry) < 0.001f &&
-                    std::abs(g_ghost->m_yVelocity - rv) < 0.001 &&
-                    g_ghost->m_isDart == real->m_isDart &&
-                    g_ghost->m_isShip == real->m_isShip &&
-                    g_ghost->m_isBall == real->m_isBall;
-                log::info("[IB] seed check: {}", ok ? "OK" : "MISMATCH");
+                log::info("[IB] first seed check: {}", seedOK ? "OK" : "MISMATCH");
             }
 
-            size_t next = 0;
-            for (int step = 0; step < totalSteps; ++step) {
-                // Entradas de este paso (xdBot: pushButton/releaseButton antes de update)
-                while (next < events.size() && events[next].step <= step) {
-                    auto pb = static_cast<PlayerButton>(events[next].button);
-                    if (events[next].down) g_ghost->pushButton(pb);
-                    else g_ghost->releaseButton(pb);
-                    ++next;
-                }
+            if (!seedOK) {
+                out = unknown("ghost-seed-mismatch");
+            } else {
+                size_t next = 0;
+                for (int step = 0; step < totalSteps; ++step) {
+                    // Same engine phase ordering as xdBot: collision sample, input, physics.
+                    g_ghost->m_collisionLogTop->removeAllObjects();
+                    g_ghost->m_collisionLogBottom->removeAllObjects();
+                    g_ghost->m_collisionLogLeft->removeAllObjects();
+                    g_ghost->m_collisionLogRight->removeAllObjects();
+                    layer->checkCollisions(g_ghost, dt, false);
 
-                const float bx = g_ghost->getPositionX();
-                g_ghost->update(dt);
-
-                if (step == 0 && std::abs(g_ghost->getPositionX() - bx) < 0.0001f &&
-                    std::abs(g_lastDx) > 0.0001f) {
-                    if (!g_warnedX) {
-                        g_warnedX = true;
-                        log::warn("[IB] ghost X does not advance while real player does");
+                    if (g_unmodeled) {
+                        out = unknown("unmodeled-object-or-trigger");
+                        out.steps = step + 1;
+                        break;
                     }
-                    out = unknown("ghost-x-static");
-                    break;
-                }
+                    if (g_cloneDied || g_ghost->m_isDead) {
+                        out = {SimResult::Died, step + 1};
+                        out.deathX = g_cloneDeathX;
+                        out.deathObjectRight = g_cloneDeathObjectRight;
+                        out.knownPhysicalDeathObject = g_cloneDeathObjectKnown;
+                        out.deathObject = g_cloneDeathObject;
+                        break;
+                    }
 
-                g_ghost->updateRotation(dt);
-                g_ghost->updatePlayerScale();
+                    if (clearTargetX && candidateApplied &&
+                        g_ghost->getPositionX() >= *clearTargetX) {
+                        if (targetCrossStep < 0) targetCrossStep = step;
+                        if (step - targetCrossStep >= kPostClearanceSteps) {
+                            out = {SimResult::Safe, step + 1};
+                            clearedTarget = true;
+                            break;
+                        }
+                    }
 
-                // Limpiar registros de colision (xdBot) y comprobar colisiones con el mismo dt.
-                g_ghost->m_collisionLogTop->removeAllObjects();
-                g_ghost->m_collisionLogBottom->removeAllObjects();
-                g_ghost->m_collisionLogLeft->removeAllObjects();
-                g_ghost->m_collisionLogRight->removeAllObjects();
+                    while (next < events.size() && events[next].step <= step) {
+                        auto const& event = events[next];
+                        auto pb = static_cast<PlayerButton>(event.button);
+                        if (event.down) g_ghost->pushButton(pb);
+                        else g_ghost->releaseButton(pb);
+                        if (event.candidate) candidateApplied = true;
+                        ++next;
+                    }
 
-                layer->checkCollisions(g_ghost, dt, false);
+                    if (step + 1 >= totalSteps) break;
 
-                const bool inCritical = step < criticalEnd;
+                    const float beforeX = g_ghost->getPositionX();
+                    g_ghost->update(dt);
+                    const float movedX = g_ghost->getPositionX() - beforeX;
 
-                if (g_unmodeled) {
-                    // Dentro de la ventana critica no sabemos el resultado -> Unknown.
-                    // Despues solo se corta la medicion informativa.
-                    out = inCritical ? unknown("unmodeled-object") : SimOut{SimResult::Safe, step};
-                    break;
-                }
-                if (g_cloneDied || g_ghost->m_isDead) {
-                    out = inCritical ? SimOut{SimResult::Died, step + 1}
-                                     : SimOut{SimResult::Safe, step};
-                    break;
+                    // Detached clones may update Y but not X. Fall back to the clone's current
+                    // portal-aware velocity, then to the measured live-player X delta.
+                    if (std::abs(movedX) < 0.0001f) {
+                        const double vx = g_ghost->getCurrentXVelocity();
+                        float fallbackDx = static_cast<float>(vx * dt);
+                        if (!std::isfinite(fallbackDx) || std::abs(fallbackDx) < 0.0001f) {
+                            fallbackDx = g_lastDx;
+                        }
+                        if (!std::isfinite(fallbackDx) || std::abs(fallbackDx) < 0.0001f) {
+                            if (!g_warnedX) {
+                                g_warnedX = true;
+                                log::warn("[IB] clone X cannot be advanced reliably; fail closed");
+                            }
+                            out = unknown("ghost-x-static");
+                            out.steps = step + 1;
+                            break;
+                        }
+                        setCloneX(g_ghost, beforeX + fallbackDx);
+                        if (std::abs(g_ghost->getPositionX() - beforeX) < 0.0001f) {
+                            out = unknown("ghost-x-set-failed");
+                            out.steps = step + 1;
+                            break;
+                        }
+                        if (!g_warnedFallbackX) {
+                            g_warnedFallbackX = true;
+                            log::info("[IB] clone X fallback active (vx={} dt={} dx={})", vx, dt, fallbackDx);
+                        }
+                    }
+
+                    g_ghost->updateRotation(dt);
+                    g_ghost->updatePlayerScale();
                 }
             }
         }
 
-        // El mundo real no debe haber cambiado.
+        if (g_ghost) {
+            out.endX = g_ghost->getPositionX();
+            out.endY = g_ghost->getPositionY();
+            out.endYVelocity = static_cast<float>(g_ghost->m_yVelocity);
+            out.endRotation = g_ghost->getRotation();
+            out.endIsDart = g_ghost->m_isDart;
+            out.endIsShip = g_ghost->m_isShip;
+            out.endIsBall = g_ghost->m_isBall;
+            out.endIsBird = g_ghost->m_isBird;
+            out.endIsRobot = g_ghost->m_isRobot;
+            out.endIsSpider = g_ghost->m_isSpider;
+            out.endIsSwing = g_ghost->m_isSwing;
+            out.endIsUpsideDown = g_ghost->m_isUpsideDown;
+        }
+
+        if (clearTargetX && !clearedTarget && out.result == SimResult::Safe) {
+            out = unknown(budgetTruncated ? "clearance-budget-exhausted" : "hazard-clearance-timeout");
+            out.steps = totalSteps;
+        }
+
         if (std::abs(real->getPositionX() - rx) > 0.0001f ||
             std::abs(real->getPositionY() - ry) > 0.0001f ||
             std::abs(real->m_yVelocity - rv) > 0.0001) {
@@ -682,81 +839,197 @@ namespace ac {
         if (limit <= 0)        { ++g_skipOff; return 0; }
         if (g_tick < 2)        { ++g_skipEarly; return 0; }
         if (player->m_isDead)  { ++g_skipDead; return 0; }
+        if (player->m_isPlatformer || button != 1) {
+            ++g_skipOther;
+            return 0; // directional/platformer input isn't modeled by this predictor
+        }
         if (!ensureGhost(layer)) { ++g_skipNoGhost; return 0; }
+
+        const int key = buttonKey(button, true);
+        auto keyIt = g_keys.find(key);
+        if (keyIt != g_keys.end() && keyIt->second.pending > 0) {
+            ++g_skipOther;
+            return 0; // never predict a second press/release while the matching key is pending
+        }
+
+        const int baselineTick = g_tick + 1;
+        const int immediateDue = effectiveDue(key, 0);
+        if (immediateDue - baselineTick > limit) {
+            ++g_skipOther;
+            log::debug("[IB] {} tick {} -> NO-SEARCH (queue already beyond cap: +{} > {})",
+                down ? "PRESS" : "RELEASE", g_tick, immediateDue - baselineTick, limit);
+            return 0;
+        }
 
         ++g_clicksPredicted;
         g_unknownReason = "";
 
-        const int key = buttonKey(button, true);
         ActivationGuard guard(layer);
+        int remainingSteps = kMaxStepsPerInput;
+        auto runSimulation = [&](int due, std::optional<float> clearTarget = std::nullopt) -> SimOut {
+            if (remainingSteps <= 0) return unknown("per-click-budget-exhausted");
+            const SimOut result = simulate(layer, player, down, button, due, clearTarget,
+                std::min(kMaxSimSteps, remainingSteps));
+            remainingSteps = std::max(0, remainingSteps - std::max(1, result.steps));
+            return result;
+        };
 
-        int prevDue = effectiveDue(key, 0);
-        const SimOut base = simulate(layer, player, down, button, prevDue, false);
+        const SimOut base = runSimulation(immediateDue);
         guard.restore();
 
         int chosen = 0;
+        int chosenDue = baselineTick;
 
         if (base.result == SimResult::Safe) {
             ++g_statKept;
             if constexpr (kLogVerdicts) {
-                log::debug("[IB] {} tick {} -> SAFE", down ? "PRESS" : "RELEASE", g_tick);
+                log::debug("[IB] {} tick {} -> NO-IMMEDIATE-DEATH (lookahead={} steps; {} budget steps left)",
+                    down ? "PRESS" : "RELEASE", g_tick, base.steps, remainingSteps);
             }
         }
         else if (base.result == SimResult::Unknown) {
             ++g_statUnknown;
             if constexpr (kLogVerdicts) {
-                log::debug("[IB] {} tick {} -> UNKNOWN ({})", down ? "PRESS" : "RELEASE", g_tick, g_unknownReason);
+                log::debug("[IB] {} tick {} -> UNKNOWN ({})",
+                    down ? "PRESS" : "RELEASE", g_tick, g_unknownReason);
             }
         }
         else {
+            // A delayed event is only justified when the baseline death is repeatable and
+            // tied to one stable physical object. Otherwise the target edge is untrustworthy.
+            if (!base.knownPhysicalDeathObject || !base.deathObject ||
+                !std::isfinite(base.deathObjectRight)) {
+                ++g_statUnknown;
+                g_unknownReason = "death-without-known-static-physical-object";
+                log::debug("[IB] {} tick {} -> UNKNOWN ({})",
+                    down ? "PRESS" : "RELEASE", g_tick, g_unknownReason);
+                return 0;
+            }
+
+            const SimOut baselineConfirm = runSimulation(immediateDue);
+            guard.restore();
+            if (!sameBaselineDeath(base, baselineConfirm)) {
+                ++g_statUnknown;
+                g_unknownReason = "nondeterministic-baseline-death";
+                log::warn("[IB] tick {} rejected: baseline death did not reproduce ({} vs {})",
+                    g_tick, base.steps, baselineConfirm.steps);
+                return 0;
+            }
+
+            const auto playerRect = player->GameObject::getObjectRect();
+            const float halfPlayerWidth = std::max(
+                kMinConservativeHalfWidth,
+                std::abs(playerRect.size.width) * 0.5f
+            );
+            const float clearTargetX = base.deathObjectRight + halfPlayerWidth + kHazardClearancePadding;
+            if (!std::isfinite(clearTargetX) ||
+                clearTargetX <= player->getPositionX() + 0.1f ||
+                clearTargetX <= base.deathX + 0.1f) {
+                ++g_statUnknown;
+                g_unknownReason = "invalid-hazard-clearance-target";
+                log::debug("[IB] tick {} -> UNKNOWN ({}) targetX={:.2f} deathX={:.2f}",
+                    g_tick, g_unknownReason, clearTargetX, base.deathX);
+                return 0;
+            }
+
+            // Geometry moved by actions/triggers is not advanced by checkCollisions(clone).
+            // If a physical moving/animated object exists in the predicted X corridor, do not
+            // use the static-world simulation to authorize a delayed click.
+            if (hasDynamicPhysicalObjectInXRange(
+                    layer, player->getPositionX() - 32.0f, clearTargetX + 120.0f)) {
+                ++g_statUnknown;
+                g_unknownReason = "dynamic-physical-object-in-corridor";
+                log::debug("[IB] tick {} -> UNKNOWN ({})", g_tick, g_unknownReason);
+                return 0;
+            }
+
             bool found = false;
-            int foundDue = 0;
+            bool unstable = false;
+            int unknownCands = 0;
             int bestSurvive = 0;
             int bestDelay = 0;
-            int unknownCands = 0;
+            int chosenClearSteps = 0;
 
+            int lastDueChecked = immediateDue;
             for (int d = 1; d <= limit; ++d) {
+                if (remainingSteps <= 0) {
+                    g_unknownReason = "per-click-budget-exhausted";
+                    unstable = true;
+                    break;
+                }
                 const int due = effectiveDue(key, d);
-                if (due == prevDue) continue;
-                prevDue = due;
+                const int effectiveDelay = due - baselineTick;
+                if (due == lastDueChecked) continue;
+                lastDueChecked = due;
+                if (effectiveDelay <= 0 || effectiveDelay > limit) continue;
 
-                const SimOut r = simulate(layer, player, down, button, due, false);
+                const SimOut r = runSimulation(due, clearTargetX);
                 guard.restore();
 
                 if (r.result == SimResult::Safe) {
+                    // A positive verdict is replayed from a freshly seeded clone. The same
+                    // clearance step and end-state must be reproduced before any click moves.
+                    const SimOut confirm = runSimulation(due, clearTargetX);
+                    guard.restore();
+                    if (!sameSafeClearance(r, confirm)) {
+                        ++unknownCands;
+                        g_unknownReason = "nondeterministic-safe-candidate";
+                        log::warn("[IB] tick {} delay {} rejected: clearance replay differs ({} vs {})",
+                            g_tick, effectiveDelay, r.steps, confirm.steps);
+                        unstable = true;
+                        break;
+                    }
                     chosen = d;
-                    foundDue = due;
+                    chosenDue = due;
+                    chosenClearSteps = confirm.steps;
                     found = true;
-                    break;
+                    break; // first stable clearance is the minimum delay
                 }
                 if (r.result == SimResult::Died && r.steps > bestSurvive) {
                     bestSurvive = r.steps;
                     bestDelay = d;
                 }
-                if (r.result == SimResult::Unknown) ++unknownCands;
+                if (r.result == SimResult::Unknown) {
+                    ++unknownCands;
+                    // Unknown state (unsupported effect, moving geometry, X mismatch or budget
+                    // exhaustion) invalidates this whole search; don't cherry-pick later trials.
+                    unstable = true;
+                    break;
+                }
             }
 
-            if (found) {
-                // Medicion informativa del "Delayed: N". Si por algo no es Safe, se usa la
-                // ventana critica (el retraso ya fue validado arriba).
-                int delayedSteps = base.steps;
-                {
-                    const SimOut ext = simulate(layer, player, down, button, foundDue, true);
-                    guard.restore();
-                    delayedSteps = (ext.result == SimResult::Safe) ? ext.steps
-                                 : (chosen + kCritical);
-                }
-
+            if (unstable) {
+                ++g_statUnknown;
+                if (g_unknownReason.empty()) g_unknownReason = "candidate-simulation-unknown";
+                log::debug("[IB] {} tick {} -> UNKNOWN ({}, testedStepsLeft={})",
+                    down ? "PRESS" : "RELEASE", g_tick, g_unknownReason, remainingSteps);
+            }
+            else if (found) {
                 ++g_statSaved;
-                ac_console::line(savedText(chosen, down, base.steps, delayedSteps, limit));
-            } else {
+                const int actualDelay = chosenDue - baselineTick;
+                const float nominalFrames = actualDelay * 0.25f;
+                ac_console::line(fmt::format(
+                    "[InputBuffer] *** SAVED +{} TICKS ({:.2f} nominal frames @ 60fps) {}! "
+                    "(base death step={} object-right={:.2f} -> validated through step={}) [Limit: {}] ***",
+                    actualDelay, nominalFrames, down ? "PRESS" : "RELEASE",
+                    base.steps, base.deathObjectRight, chosenClearSteps, limit
+                ));
+                log::info(
+                    "[IB] SAVED validated-twice event={} tick={} delay={} limit={} targetX={:.2f} "
+                    "validatedThroughStep={} remainingBudget={}",
+                    down ? "PRESS" : "RELEASE", g_tick, actualDelay, limit, clearTargetX,
+                    chosenClearSteps, remainingSteps
+                );
+            }
+            else {
                 ++g_statNoSolution;
                 if constexpr (kLogVerdicts) {
                     log::debug(
-                        "[IB] {} tick {} -> DEATH at step {}, no safe delay in {} "
-                        "(best +{} survives {} steps, unknownCandidates={}, wave={})",
-                        down ? "PRESS" : "RELEASE", g_tick, base.steps, limit,
-                        bestDelay, bestSurvive, unknownCands, player->m_isDart
+                        "[IB] {} tick {} -> NO SAFE CLEARANCE in {} ticks "
+                        "(baseDeathStep={}, objectRight={:.2f}, bestDelay={}, surviveSteps={}, "
+                        "unknownCandidates={}, remainingBudget={})",
+                        down ? "PRESS" : "RELEASE", g_tick, limit, base.steps,
+                        base.deathObjectRight, bestDelay, bestSurvive, unknownCands, remainingSteps
                     );
                 }
             }
@@ -822,12 +1095,14 @@ $on_mod(Loaded) {
 class $modify(IBKeyboard, CCKeyboardDispatcher) {
     bool dispatchKeyboardMSG(cocos2d::enumKeyCodes key, bool down, bool repeat, double timestamp) {
         if (down && !repeat) {
-            if (key == cocos2d::enumKeyCodes::KEY_F6) {
+            if (key == cocos2d::enumKeyCodes::KEY_F6 && PlayLayer::get()) {
                 ac::g_stage = (ac::g_stage + 1) % ac::kStageCount;
                 ac_console::line("[InputBuffer] F6 Cycle -> " + ac::stageText(ac::g_stage));
             }
-            else if (key == cocos2d::enumKeyCodes::KEY_F7) {
-                log::info("{}", ac::statusLine("STATUS"));
+            else if (key == cocos2d::enumKeyCodes::KEY_F7 && PlayLayer::get()) {
+                const auto status = ac::statusLine("STATUS");
+                ac_console::line(status);
+                log::info("{}", status);
             }
         }
 
@@ -844,9 +1119,7 @@ class $modify(IBPlayLayer, PlayLayer) {
         ac::clearState();
         ac::clearStats();
 
-        // Fantasma de un nivel anterior: su capa ya no existe, se suelta sin tocar.
-        ac::g_ghost = nullptr;
-        ac::g_ghostOwner = nullptr;
+        // ensureGhost cleans up the retained clone from any previous PlayLayer.
         ac::ensureGhost(this);
     }
 
@@ -858,6 +1131,7 @@ class $modify(IBPlayLayer, PlayLayer) {
         ac::clearState();
         PlayLayer::resetLevel();
         ac::clearState();
+        ac::clearStats(); // Keep ATTEMPT diagnostics scoped to one attempt.
     }
 
     // onExit tambien se dispara al pausar: no se destruye nada.
@@ -879,6 +1153,19 @@ class $modify(IBPlayLayer, PlayLayer) {
     void destroyPlayer(PlayerObject* player, GameObject* object) {
         if (ac::g_simulating && player == ac::g_ghost) {
             ac::g_cloneDied = true;
+            ac::g_cloneDeathX = player ? player->getPositionX() : 0.0f;
+            ac::g_cloneDeathObjectKnown = false;
+            ac::g_cloneDeathObjectRight = 0.0f;
+            ac::g_cloneDeathObject = nullptr;
+            if (object && ac::isClearancePhysical(object) && !ac::hasDynamicPhysicalMotion(object)) {
+                const auto rect = object->getObjectRect();
+                const float right = rect.getMaxX();
+                if (std::isfinite(right)) {
+                    ac::g_cloneDeathObjectRight = right;
+                    ac::g_cloneDeathObjectKnown = true;
+                    ac::g_cloneDeathObject = object;
+                }
+            }
             return;
         }
         PlayLayer::destroyPlayer(player, object);
@@ -905,13 +1192,6 @@ class $modify(IBBaseLayer, GJBaseGameLayer) {
             return;
         }
 
-        // Platformer (izquierda/derecha) y botones que no son salto: el fantasma no los modela.
-        const bool platformer = layer->m_levelSettings && layer->m_levelSettings->m_platformerMode;
-        if (platformer || button != ac::kJumpButton) {
-            GJBaseGameLayer::handleButton(down, button, isPlayer1);
-            return;
-        }
-
         ++ac::g_clicksSeen;
         if (ac::g_clicksSeen <= 3) {
             log::info(
@@ -921,19 +1201,10 @@ class $modify(IBBaseLayer, GJBaseGameLayer) {
             );
         }
 
-        // Fail-safe: cualquier fallo en la prediccion = el clic pasa con su timing original.
         int delay = 0;
         auto* player = layer->m_player1;
         if (player && ac::kStages[ac::g_stage].all > 0) {
-            try {
-                delay = ac::predictDelay(layer, player, down, button);
-            } catch (std::exception const& e) {
-                delay = 0;
-                log::error("[IB] prediction failed: {}", e.what());
-            } catch (...) {
-                delay = 0;
-                log::error("[IB] prediction failed: unknown exception");
-            }
+            delay = ac::predictDelay(layer, player, down, button);
         } else {
             ++ac::g_skipOff;
         }
@@ -951,20 +1222,26 @@ class $modify(IBBaseLayer, GJBaseGameLayer) {
 
         std::vector<GameObject*> disabled;
         const cocos2d::CCRect pr = p0->GameObject::getObjectRect();
-        constexpr float kMargin = 6.0f;
+        constexpr float kMargin = 8.0f;
         const cocos2d::CCRect probe(
             pr.origin.x - kMargin, pr.origin.y - kMargin,
             pr.size.width + kMargin * 2.0f, pr.size.height + kMargin * 2.0f
         );
 
         for (auto* obj : *objects) {
-            if (!obj || ac::isModeled(obj)) continue;
+            if (!obj) continue;
             if (obj->m_isDisabled || obj->m_isDisabled2) continue;
 
-            if (!ac::isHarmless(obj) && probe.intersectsRect(obj->getObjectRect())) {
+            const bool nearby = probe.intersectsRect(obj->getObjectRect());
+            const bool modeled = ac::isModeled(obj);
+            const bool harmless = ac::isHarmless(obj);
+
+            if (nearby && !harmless &&
+                (!modeled || ac::hasDynamicPhysicalMotion(obj))) {
                 ac::g_unmodeled = true;
             }
 
+            if (modeled) continue;
             disabled.push_back(obj);
             obj->m_isDisabled = true;
             obj->m_isDisabled2 = true;
@@ -973,27 +1250,40 @@ class $modify(IBBaseLayer, GJBaseGameLayer) {
         GJBaseGameLayer::collisionCheckObjects(p0, objects, p2, p3);
 
         for (auto* obj : disabled) {
+            // Objects were only added if both flags were false, so false is the exact prior state.
             obj->m_isDisabled = false;
             obj->m_isDisabled2 = false;
         }
     }
 
     bool canBeActivatedByPlayer(PlayerObject* p0, EffectGameObject* p1) {
-        if (ac::g_simulating && p0 == ac::g_ghost) {
-            if (p1) ac::handlePortal(p0, p1->m_objectID);
-            return false;
+        if (ac::g_simulating) {
+            if (p0 == ac::g_ghost && p1 && ac::kModeledPortals.contains(p1->m_objectID)) {
+                ac::handlePortal(p0, p1->m_objectID);
+            } else {
+                // Gravity/mode portals, pads and other effects are not modeled here.
+                ac::g_unmodeled = true;
+            }
+            return false; // never let the clone activate a real level object
         }
         return GJBaseGameLayer::canBeActivatedByPlayer(p0, p1);
     }
 
     void playerTouchedRing(PlayerObject* p0, RingObject* p1) {
-        if (ac::g_simulating) { ac::g_unmodeled = true; return; }
+        if (ac::g_simulating) {
+            if (p0 == ac::g_ghost) ac::g_unmodeled = true;
+            return;
+        }
         GJBaseGameLayer::playerTouchedRing(p0, p1);
     }
 
     void playerTouchedTrigger(PlayerObject* p0, EffectGameObject* p1) {
         if (ac::g_simulating) {
-            if (p1) ac::handlePortal(p0, p1->m_objectID);
+            if (p0 == ac::g_ghost && p1 && ac::kModeledPortals.contains(p1->m_objectID)) {
+                ac::handlePortal(p0, p1->m_objectID);
+            } else {
+                ac::g_unmodeled = true;
+            }
             return;
         }
         GJBaseGameLayer::playerTouchedTrigger(p0, p1);
@@ -1017,15 +1307,17 @@ class $modify(IBPlayerObject, PlayerObject) {
         auto* layer = PlayLayer::get();
         const bool real = layer && this == layer->m_player1 && !ac::g_simulating;
 
-        if (real) {
+        const bool advancingTick = real && std::isfinite(dt) && dt > 0.0f;
+        if (advancingTick) {
             ac::dispatchPending(layer, ac::g_tick + 1);
         }
 
         const float beforeX = getPositionX();
         PlayerObject::update(dt);
 
-        if (real && dt > 0.0f) {
-            if (std::abs(dt - ac::g_stepDt) < 0.00002f) ++ac::g_dtStable;
+        if (advancingTick) {
+            const float dtTolerance = std::max(0.0001f, std::abs(ac::g_stepDt) * 0.01f);
+            if (std::abs(dt - ac::g_stepDt) <= dtTolerance) ++ac::g_dtStable;
             else ac::g_dtStable = 0;
 
             ac::g_stepDt = dt;
