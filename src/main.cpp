@@ -1,9 +1,23 @@
-// Assisted Click - src/main.cpp -- v1.4.3 (long-edge history sentinel + collision evidence)
+// Assisted Click - src/main.cpp -- v1.5.0 (band-filtered trigger corridor + cosmetic whitelist)
 //
 // Que hace: al recibir un clic (PRESS/RELEASE) simula un jugador nativo clonado en pasos
 // medidos de PlayerObject::update, usando PlayLayer::checkCollisions del propio juego. Solo
 // busca retrasos tras una muerte de referencia repetible contra geometria fisica estatica.
 // No modela fase subtick de CBF/Click Between Steps; esas herramientas deben desactivarse.
+//
+// CAMBIOS v1.5.0 (arreglo del bloqueo masivo "unsupported-effect-object-in-corridor"):
+//  1. El veto de triggers en el corredor ya no rechaza TODO EffectGameObject en el rango X.
+//     Ahora: (a) los triggers detras del jugador no cuentan (X siempre crece en modo clasico),
+//     (b) los triggers puramente visuales/audio estan en whitelist (color/pulse/alpha/shake/
+//     animate/hide-show player, SFX/song) porque no pueden alterar la fisica ni via cadenas de
+//     spawn, y (c) solo cuentan los triggers dentro de la banda Y alcanzable por las
+//     trayectorias simuladas (banda exacta = union de los minY/maxY de todas las sims).
+//  2. Veto temprano con banda conservadora (baseline + excursion maxima de candidato y
+//     estres de release) para no gastar el presupuesto de busqueda cuando hay un trigger
+//     fisico evidente; veto exacto post-candidato antes de autorizar el SAVED.
+//  3. SimOut ahora registra minY/maxY de la trayectoria del clon.
+//  4. Diagnostico: se registra el objectID/tipo/posicion del objeto que veta (corredor,
+//     unmodeled) para saber exactamente que bloqueo cada veredicto.
 //
 // Tecnicas tomadas de xdBot (ZiLko/xdBot):
 //  - jugador falso creado con PlayerObject::create y anadido a m_objectLayer
@@ -125,6 +139,7 @@ namespace ac {
     constexpr int kPostClearanceSteps = 2; // collision samples after validation corridor
     constexpr float kPostClearanceDistance = 24.0f; // inspect nearby chained hazards without an excessive fixed tail
     constexpr float kHazardClearancePadding = 8.0f;
+    constexpr float kTriggerBandYPad = 8.0f; // margen de la banda Y del veto exacto de triggers
     constexpr auto kPredictionWallBudget = std::chrono::milliseconds(6);
     constexpr int kEdgeProfileSamples = 4;
     constexpr int kMinimumEdgeSamples = 2;
@@ -157,7 +172,7 @@ namespace ac {
 
         auto const& s = kStages[0];
         ac_console::line("===================================================");
-        ac_console::line("[InputBuffer] v1.4.3 LOADED (long holds map to no edge inside the prediction horizon)");
+        ac_console::line("[InputBuffer] v1.5.0 LOADED (band-filtered trigger corridor; cosmetic triggers whitelisted)");
         ac_console::line(fmt::format(
             "[InputBuffer] Starting Mode: STAGE 1 ({} All / {} Wave)", s.all, s.wave
         ));
@@ -193,6 +208,9 @@ namespace ac {
 
     // ---- Diagnostico (solo log de Geode)
     const char* g_unknownReason = "";
+    // Identidad del primer objeto que marco la simulacion como no modelada (diagnostico).
+    int g_unmodeledObjectID = -1;
+    int g_unmodeledObjectType = -1;
     int g_clicksSeen = 0, g_clicksPredicted = 0;
     int g_skipOff = 0, g_skipEarly = 0, g_skipDead = 0, g_skipNoGhost = 0, g_skipOther = 0;
     int g_statKept = 0, g_statSaved = 0, g_statNoSolution = 0, g_statUnknown = 0;
@@ -229,6 +247,9 @@ namespace ac {
         GameObject* deathObject = nullptr;
         float endX = 0.0f;
         float endY = 0.0f;
+        // Recorrido vertical del clon durante la simulacion (para la banda Y del corredor).
+        float minY = 0.0f;
+        float maxY = 0.0f;
         float endYVelocity = 0.0f;
         float endRotation = 0.0f;
         bool endIsDart = false;
@@ -369,6 +390,8 @@ namespace ac {
             g_simulating = true;
             g_cloneDied = false;
             g_unmodeled = false;
+            g_unmodeledObjectID = -1;
+            g_unmodeledObjectType = -1;
             g_cloneDeathX = 0.0f;
             g_cloneDeathObjectRight = 0.0f;
             g_cloneDeathObjectKnown = false;
@@ -555,20 +578,73 @@ namespace ac {
         return false;
     }
 
-    // Trigger objects can move geometry or change physics without ever overlapping the player's
-    // hitbox (their own rectangles are often placed at floor height). The ghost does not advance
-    // the level's trigger timeline, so collision-only checks are insufficient. Reject any
-    // unsupported EffectGameObject in the X corridor; only the portals handled below are exempt.
-    bool hasUnsupportedEffectObjectInXRange(PlayLayer* layer, float minX, float maxX) {
-        if (!layer || !layer->m_objects || !std::isfinite(minX) || !std::isfinite(maxX)) {
-            return true; // cannot establish that the simulated world is static
+    // ---- Politica de triggers en el corredor (v1.5.0) ----
+    // Triggers que solo afectan visuales o audio. No pueden cambiar la fisica del jugador ni
+    // la geometria con la que colisiona, ni siquiera a traves de cadenas de spawn: un color
+    // trigger solo puede propagar colores (copiar canales), un pulse solo colores temporales,
+    // un shake solo mueve la camara, un animate solo reproduce animaciones de sprites.
+    // IDs verificados contra el analisis de objetos de GDBrowser (GDColon) y documentacion
+    // de la comunidad. Cualquier ID fuera de esta lista sigue vetando (fail closed).
+    const std::unordered_set<int> kCosmeticTriggerIDs = {
+        29, 30,          // color (pre-2.0 / 2.0)
+        31,              // start pos (nunca se activa jugando)
+        899, 900, 915,   // color (2.1+)
+        1006,            // pulse (color temporal)
+        1007,            // alpha (opacidad)
+        1520,            // shake (pantalla)
+        1585,            // animate (monstruos / animaciones visuales)
+        1612, 1613       // hide player / show player (visual)
+    };
+
+    bool isAudioOnlyTrigger(GameObject* o) {
+        return typeinfo_cast<SFXTriggerGameObject*>(o) != nullptr ||
+               typeinfo_cast<SongTriggerGameObject*>(o) != nullptr;
+    }
+
+    // Un EffectGameObject de la whitelist de portales o cosmético nunca invalida la simulacion.
+    bool isExemptEffectObject(GameObject* o) {
+        if (!o) return true;
+        if (kModeledPortals.contains(o->m_objectID)) return true;      // velocidad/tamano modelados
+        if (kCosmeticTriggerIDs.contains(o->m_objectID)) return true;   // solo visuales
+        if (isAudioOnlyTrigger(o)) return true;                         // solo audio
+        return false;
+    }
+
+    struct EffectVetoInfo {
+        int objectID = -1;
+        int objectType = -1;
+        float x = 0.0f;
+        float y = 0.0f;
+    };
+
+    // Los triggers solo se activan cuando el hitbox del jugador REAL los cruza. El clon no
+    // avanza el timeline de triggers, asi que cualquier trigger no exento que el corredor
+    // pueda cruzar invalida la simulacion estatica. Filtros v1.5.0:
+    //  - X: solo [minX, maxX]. Un trigger completamente detras del jugador nunca vuelve a
+    //    dispararse en modo clasico (X siempre crece); el rango viejo [playerX-32, ...] vetaba
+    //    trigger lines enteras que el jugador ya habia pasado.
+    //  - Y: solo la banda vertical [yMin, yMax] alcanzable por las trayectorias simuladas.
+    //    Un trigger flotando fuera de esa banda es inalcanzable para el hitbox del jugador.
+    bool hasUnsupportedEffectObjectInBand(PlayLayer* layer, float minX, float maxX,
+                                          float yMin, float yMax,
+                                          EffectVetoInfo* veto = nullptr) {
+        if (!layer || !layer->m_objects || !std::isfinite(minX) || !std::isfinite(maxX) ||
+            !std::isfinite(yMin) || !std::isfinite(yMax)) {
+            return true; // sin inspeccion fiable no se puede certificar un mundo estatico
         }
         for (auto* obj : CCArrayExt<GameObject*>(layer->m_objects)) {
             if (!obj || obj->m_isDisabled || obj->m_isDisabled2) continue;
-            const auto rect = obj->getObjectRect();
-            if (rect.getMaxX() < minX || rect.getMinX() > maxX) continue;
             if (!typeinfo_cast<EffectGameObject*>(obj)) continue;
-            if (kModeledPortals.contains(obj->m_objectID)) continue;
+            if (isExemptEffectObject(obj)) continue;
+            const auto rect = obj->getObjectRect();
+            if (rect.getMaxX() < minX || rect.getMinX() > maxX) continue; // fuera del corredor X
+            if (rect.getMaxY() < yMin || rect.getMinY() > yMax) continue; // fuera de la banda Y
+            if (veto) {
+                veto->objectID = obj->m_objectID;
+                veto->objectType = static_cast<int>(obj->m_objectType);
+                veto->x = rect.getMidX();
+                veto->y = rect.getMidY();
+            }
             return true;
         }
         return false;
@@ -921,6 +997,8 @@ namespace ac {
         const double rv = real->m_yVelocity;
 
         SimOut out{SimResult::Safe, totalSteps};
+        float trajMinY = ry;
+        float trajMaxY = ry;
         bool candidateApplied = false;
         bool oppositeEdgeApplied = false;
         int oppositeEdgeStep = -1;
@@ -1020,6 +1098,8 @@ namespace ac {
                     if (g_unmodeled) {
                         out = unknown("unmodeled-object-or-trigger");
                         out.steps = step + 1;
+                        log::debug("[IB] sim step {} hit unmodeled object: id={} type={}",
+                            step, g_unmodeledObjectID, g_unmodeledObjectType);
                         break;
                     }
                     if (g_cloneDied || g_ghost->m_isDead) {
@@ -1054,6 +1134,9 @@ namespace ac {
                     const float beforeX = g_ghost->getPositionX();
                     g_ghost->update(dt);
                     const float movedX = g_ghost->getPositionX() - beforeX;
+                    const float afterY = g_ghost->getPositionY();
+                    if (afterY < trajMinY) trajMinY = afterY;
+                    if (afterY > trajMaxY) trajMaxY = afterY;
 
                     // Do not synthesize horizontal movement. The clone must advance through
                     // PlayerObject::update like xdBot's native trajectory. If this state does not
@@ -1077,6 +1160,8 @@ namespace ac {
         if (g_ghost) {
             out.endX = g_ghost->getPositionX();
             out.endY = g_ghost->getPositionY();
+            out.minY = trajMinY;
+            out.maxY = trajMaxY;
             out.endYVelocity = static_cast<float>(g_ghost->m_yVelocity);
             out.endRotation = g_ghost->getRotation();
             out.endIsDart = g_ghost->m_isDart;
@@ -1171,6 +1256,12 @@ namespace ac {
 
         ActivationGuard guard(layer);
         int remainingSteps = kMaxStepsPerInput;
+        // Banda Y exacta alcanzada por TODAS las simulaciones de este clic (baseline,
+        // candidatos, centro, envolventes y ramas de estres). El veto final de triggers
+        // usa esta banda: si un trigger no exento es alcanzable por alguna trayectoria
+        // simulada, el mundo no es estatico para el clon y no se autoriza el retraso.
+        float bandMinY = player->getPositionY();
+        float bandMaxY = player->getPositionY();
         auto runSimulation = [&](int due, std::optional<float> clearTarget = std::nullopt,
                                  bool directInput = false,
                                  SimPerturbation perturbation = {},
@@ -1181,6 +1272,10 @@ namespace ac {
                 std::min(kMaxSimSteps, remainingSteps), directInput, perturbation,
                 oppositeEdgeAfterTicks, deadline);
             remainingSteps = std::max(0, remainingSteps - std::max(1, result.steps));
+            if (result.result != SimResult::Unknown) {
+                bandMinY = std::min(bandMinY, result.minY);
+                bandMaxY = std::max(bandMaxY, result.maxY);
+            }
             if (SteadyClock::now() >= deadline) return unknown("prediction-wall-budget-exhausted");
             return result;
         };
@@ -1257,17 +1352,6 @@ namespace ac {
                 return safeFallbackDelay;
             }
 
-            // A moving trigger need not touch the ghost's hitbox to affect the path. The world
-            // does not advance inside simulate(), so never certify a static clone trajectory if
-            // an unsupported effect object can fire anywhere before the clearance target.
-            if (hasUnsupportedEffectObjectInXRange(
-                    layer, player->getPositionX() - 32.0f, validationTargetX + 24.0f)) {
-                ++g_statUnknown;
-                g_unknownReason = "unsupported-effect-object-in-corridor";
-                log::debug("[IB] tick {} -> UNKNOWN ({})", g_tick, g_unknownReason);
-                return safeFallbackDelay;
-            }
-
             const auto calibratedEdgeOffsets = futureEdgeOffsets(key, down, limit);
             if (calibratedEdgeOffsets.empty()) {
                 ++g_statUnknown;
@@ -1278,6 +1362,41 @@ namespace ac {
                 log::debug("[IB] {} tick {} -> UNKNOWN (edge history {}/{}; serialTick={}, profile={} samples)",
                     down ? "PRESS" : "RELEASE", g_tick, available, kMinimumEdgeSamples,
                     g_physicsSerialTick, down ? "hold" : "gap");
+                return safeFallbackDelay;
+            }
+
+            // ---- Veto temprano de triggers (v1.5.0) ----
+            // Un trigger no exento (mover/toggle/spawn/count/portal de gravedad...) solo
+            // invalida la prediccion si el jugador puede cruzarlo dentro del corredor. La
+            // version vieja rechazaba CUALQUIER EffectGameObject en [playerX-32, valX+24],
+            // sin importar Y ni tipo: con una trigger line normal al inicio del nivel (colores,
+            // bg, shake...) el 100% de las predicciones acababa en UNKNOWN y el input buffer
+            // nunca salvaba nada. Ahora:
+            //  - X: desde el borde del hitbox del jugador (lo que queda detras ya no puede
+            //    volver a dispararse en modo clasico) hasta el final del corredor de validacion.
+            //  - Y: banda conservadora que cubre la baseline + toda excursion posible de los
+            //    candidatos y del estres de release aprendido.
+            //  - whitelist: triggers puramente visuales/audio nunca vetan.
+            int maxEdgeOffset = 0;
+            for (int n : calibratedEdgeOffsets) maxEdgeOffset = std::max(maxEdgeOffset, n);
+            // Cota de |dy| por subpaso: la onda es diagonal (|dy| = |dx|); el resto de modos
+            // puede caer mas rapido que su dx, asi que se usa un suelo conservador.
+            const float dyPerTickGuess = std::max(std::abs(g_lastDx), 3.5f);
+            const float coarseExcursion = std::max(96.0f,
+                (static_cast<float>(maxEdgeOffset) + static_cast<float>(kHorizon) +
+                 static_cast<float>(limit) + 8.0f) * dyPerTickGuess);
+            const float coarseMinY = std::min(base.minY, player->getPositionY()) - coarseExcursion;
+            const float coarseMaxY = std::max(base.maxY, player->getPositionY()) + coarseExcursion;
+            EffectVetoInfo corridorVeto;
+            if (hasUnsupportedEffectObjectInBand(
+                    layer, playerRect.getMinX(), validationTargetX + 24.0f,
+                    coarseMinY, coarseMaxY, &corridorVeto)) {
+                ++g_statUnknown;
+                g_unknownReason = "unsupported-effect-object-in-corridor";
+                log::debug("[IB] {} tick {} -> UNKNOWN ({}) vetoedObjectID={} type={} x={:.2f} y={:.2f}",
+                    down ? "PRESS" : "RELEASE", g_tick, g_unknownReason,
+                    corridorVeto.objectID, corridorVeto.objectType,
+                    corridorVeto.x, corridorVeto.y);
                 return safeFallbackDelay;
             }
 
@@ -1462,6 +1581,24 @@ namespace ac {
                     }
                     if (unstable) break;
                     if (!inputEdgeProfileRobust) continue;
+
+                    // ---- Veto exacto de triggers (v1.5.0) ----
+                    // Banda Y = union de TODAS las trayectorias simuladas para este clic.
+                    // Si un trigger no exento puede cruzarse dentro del corredor X, la
+                    // simulacion estatica no describe el mundo real: fail closed.
+                    EffectVetoInfo exactVeto;
+                    if (hasUnsupportedEffectObjectInBand(
+                            layer, playerRect.getMinX(), validationTargetX + 24.0f,
+                            bandMinY - kTriggerBandYPad, bandMaxY + kTriggerBandYPad,
+                            &exactVeto)) {
+                        ++unknownCands;
+                        g_unknownReason = "unsupported-effect-object-in-candidate-band";
+                        log::debug("[IB] {} tick {} delay {} -> UNKNOWN ({}) vetoedObjectID={} type={} x={:.2f} y={:.2f}",
+                            down ? "PRESS" : "RELEASE", g_tick, effectiveDelay, g_unknownReason,
+                            exactVeto.objectID, exactVeto.objectType, exactVeto.x, exactVeto.y);
+                        unstable = true;
+                        break;
+                    }
 
                     chosen = centerDelay;
                     chosenDue = centerDue;
@@ -1823,9 +1960,18 @@ class $modify(IBBaseLayer, GJBaseGameLayer) {
             const bool nearby = probe.intersectsRect(obj->getObjectRect());
             const bool modeled = ac::isModeled(obj);
             const bool harmless = ac::isHarmless(obj);
+            // v1.5.0: un trigger puramente visual/audio que el clon cruza no puede cambiar la
+            // fisica, asi que ya no marca la simulacion como Unknown. Sigue desactivandose
+            // durante la pasada de colision para impedir cualquier activacion real.
+            const bool exemptEffect =
+                typeinfo_cast<EffectGameObject*>(obj) != nullptr && ac::isExemptEffectObject(obj);
 
-            if (nearby && !harmless &&
+            if (nearby && !harmless && !exemptEffect &&
                 (!modeled || ac::hasDynamicPhysicalMotion(obj))) {
+                if (ac::g_unmodeledObjectID < 0) {
+                    ac::g_unmodeledObjectID = obj->m_objectID;
+                    ac::g_unmodeledObjectType = static_cast<int>(obj->m_objectType);
+                }
                 ac::g_unmodeled = true;
             }
 
@@ -1849,7 +1995,10 @@ class $modify(IBBaseLayer, GJBaseGameLayer) {
             if (p0 == ac::g_ghost && p1 && ac::kModeledPortals.contains(p1->m_objectID)) {
                 ac::handlePortal(p0, p1->m_objectID);
             } else {
-                // Gravity/mode portals, pads and other effects are not modeled here.
+                if (ac::g_unmodeledObjectID < 0 && p1) {
+                    ac::g_unmodeledObjectID = p1->m_objectID;
+                    ac::g_unmodeledObjectType = static_cast<int>(p1->m_objectType);
+                }
                 ac::g_unmodeled = true;
             }
             return false; // never let the clone activate a real level object
@@ -1859,7 +2008,13 @@ class $modify(IBBaseLayer, GJBaseGameLayer) {
 
     void playerTouchedRing(PlayerObject* p0, RingObject* p1) {
         if (ac::g_simulating) {
-            if (p0 == ac::g_ghost) ac::g_unmodeled = true;
+            if (p0 == ac::g_ghost) {
+                if (ac::g_unmodeledObjectID < 0 && p1) {
+                    ac::g_unmodeledObjectID = p1->m_objectID;
+                    ac::g_unmodeledObjectType = static_cast<int>(p1->m_objectType);
+                }
+                ac::g_unmodeled = true;
+            }
             return;
         }
         GJBaseGameLayer::playerTouchedRing(p0, p1);
@@ -1870,6 +2025,10 @@ class $modify(IBBaseLayer, GJBaseGameLayer) {
             if (p0 == ac::g_ghost && p1 && ac::kModeledPortals.contains(p1->m_objectID)) {
                 ac::handlePortal(p0, p1->m_objectID);
             } else {
+                if (ac::g_unmodeledObjectID < 0 && p1) {
+                    ac::g_unmodeledObjectID = p1->m_objectID;
+                    ac::g_unmodeledObjectType = static_cast<int>(p1->m_objectType);
+                }
                 ac::g_unmodeled = true;
             }
             return;
@@ -1947,6 +2106,10 @@ class $modify(IBGameObject, GameObject) {
 class $modify(IBEffectObject, EffectGameObject) {
     void triggerObject(GJBaseGameLayer* layer, int id, gd::vector<int> const* groups) {
         if (ac::g_simulating) {
+            if (ac::g_unmodeledObjectID < 0) {
+                ac::g_unmodeledObjectID = this->m_objectID;
+                ac::g_unmodeledObjectType = static_cast<int>(this->m_objectType);
+            }
             ac::g_unmodeled = true; // un trigger cambiaria el nivel: no se modela
             return;
         }
