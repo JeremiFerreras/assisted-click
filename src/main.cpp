@@ -64,12 +64,13 @@ static bool init() {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_ready) return true;
 
-    FreeConsole();
-    if (!AllocConsole()) return false;
+    // Never detach/free a console owned by the host or another mod.
+    // Create one only when the process is not already attached to a console.
+    if (GetConsoleWindow() == nullptr && !AllocConsole()) return false;
 
     g_output = GetStdHandle(STD_OUTPUT_HANDLE);
     if (g_output == nullptr || g_output == INVALID_HANDLE_VALUE) {
-        FreeConsole();
+        g_output = INVALID_HANDLE_VALUE;
         return false;
     }
 
@@ -143,7 +144,7 @@ namespace ac {
 
         auto const& s = kStages[0];
         ac_console::line("===================================================");
-        ac_console::line("[InputBuffer] v6.0 LOADED (xdBot Trajectory Core)");
+        ac_console::line("[InputBuffer] v6.1.0 LOADED (xdBot Trajectory Core)");
         ac_console::line(fmt::format(
             "[InputBuffer] Starting Mode: STAGE 1 ({} All / {} Wave)", s.all, s.wave
         ));
@@ -319,6 +320,15 @@ namespace ac {
     void seedGhost(P* dst, P* src) {
         if (!dst || !src) return;
 
+        // Clear clone-only transient collision state before seeding it from the real player.
+        // The requires checks keep this source compatible with binding variations.
+        if constexpr (requires { dst->resetCollisionLog(true); }) {
+            dst->resetCollisionLog(true);
+        }
+        if constexpr (requires { dst->resetCollisionValues(); }) {
+            dst->resetCollisionValues();
+        }
+
         dst->setPosition(src->getPosition());
         dst->setRotation(src->getRotation());
         dst->setScale(src->getScale());
@@ -397,12 +407,18 @@ namespace ac {
     // Igual que xdBot: dos PlayerObject::create y anadidos a m_objectLayer. Aqui solo uno.
     // Vive ligado a su PlayLayer; se libera en PlayLayer::onQuit (NO en onExit).
     bool ensureGhost(PlayLayer* layer) {
-        if (!layer) return false;
+        if (!layer || !layer->m_objectLayer) return false;
         if (g_ghost && g_ghostOwner == layer) return true;
 
-        // Fantasma de otra capa (posiblemente ya destruida): se suelta sin tocar.
-        g_ghost = nullptr;
-        g_ghostOwner = nullptr;
+        // The retained clone can outlive its old layer. Release our retain without
+        // dereferencing g_ghostOwner (which may already be stale).
+        if (g_ghost) {
+            auto* staleGhost = g_ghost;
+            g_ghost = nullptr;
+            g_ghostOwner = nullptr;
+            staleGhost->removeFromParentAndCleanup(true);
+            staleGhost->release();
+        }
 
         auto* ghost = PlayerObject::create(1, 1, layer, layer, true);
         if (!ghost) {
@@ -516,7 +532,7 @@ namespace ac {
         std::stable_sort(events.begin(), events.end(),
             [](SimEvent const& a, SimEvent const& b) { return a.step < b.step; });
 
-        const int totalSteps = events.back().step + kHorizon;
+        const int totalSteps = events.back().step + kHorizon + 1;
         if (totalSteps > kMaxSimSteps) return unknown("too-many-steps");
 
         const float dt = g_stepDt > 0.0f ? g_stepDt : 0.25f;
@@ -545,13 +561,35 @@ namespace ac {
 
             size_t next = 0;
             for (int step = 0; step < totalSteps; ++step) {
-                // Entradas de este paso (xdBot: pushButton/releaseButton antes de update)
+                // Mirror xdBot's trajectory tick: collide at the current position first,
+                // then apply this tick's input and advance physics. Reversing this order
+                // shifts collision decisions by one physics step.
+                g_ghost->m_collisionLogTop->removeAllObjects();
+                g_ghost->m_collisionLogBottom->removeAllObjects();
+                g_ghost->m_collisionLogLeft->removeAllObjects();
+                g_ghost->m_collisionLogRight->removeAllObjects();
+                layer->checkCollisions(g_ghost, dt, false);
+
+                if (g_unmodeled) {
+                    out = unknown("unmodeled-object");
+                    break;
+                }
+                if (g_cloneDied || g_ghost->m_isDead) {
+                    out = {SimResult::Died, step + 1};
+                    break;
+                }
+
+                // Inputs are applied after collision processing and before this physics update.
                 while (next < events.size() && events[next].step <= step) {
                     auto pb = static_cast<PlayerButton>(events[next].button);
                     if (events[next].down) g_ghost->pushButton(pb);
                     else g_ghost->releaseButton(pb);
                     ++next;
                 }
+
+                // The last iteration only observes the final collision sample; do not
+                // advance one extra, unobserved physics step after the horizon ends.
+                if (step + 1 >= totalSteps) break;
 
                 const float bx = g_ghost->getPositionX();
                 g_ghost->update(dt);
@@ -568,23 +606,6 @@ namespace ac {
 
                 g_ghost->updateRotation(dt);
                 g_ghost->updatePlayerScale();
-
-                // Limpiar registros de colision (xdBot) y comprobar colisiones con el mismo dt.
-                g_ghost->m_collisionLogTop->removeAllObjects();
-                g_ghost->m_collisionLogBottom->removeAllObjects();
-                g_ghost->m_collisionLogLeft->removeAllObjects();
-                g_ghost->m_collisionLogRight->removeAllObjects();
-
-                layer->checkCollisions(g_ghost, dt, false);
-
-                if (g_unmodeled) {
-                    out = unknown("unmodeled-object");
-                    break;
-                }
-                if (g_cloneDied || g_ghost->m_isDead) {
-                    out = {SimResult::Died, step + 1};
-                    break;
-                }
             }
         }
 
@@ -621,6 +642,7 @@ namespace ac {
         guard.restore();
 
         int chosen = 0;
+        int chosenDue = g_tick + 1;
 
         if (base.result == SimResult::Safe) {
             ++g_statKept;
@@ -651,6 +673,7 @@ namespace ac {
 
                 if (r.result == SimResult::Safe) {
                     chosen = d;
+                    chosenDue = due;
                     best = r;
                     found = true;
                     break;
@@ -667,8 +690,9 @@ namespace ac {
                 ac_console::line(fmt::format(
                     "[InputBuffer] *** SAVED +{} TICKS ({:.2f} frames @ 60fps) {}! "
                     "(Frame0: {} -> Delayed: {}) [Limit: {}] ***",
-                    chosen, chosen * 0.25, down ? "PRESS" : "RELEASE",
-                    base.steps, best.steps, limit
+                    std::max(0, chosenDue - (g_tick + 1)),
+                    std::max(0, chosenDue - (g_tick + 1)) * 0.25,
+                    down ? "PRESS" : "RELEASE", base.steps, best.steps, limit
                 ));
             } else {
                 ++g_statNoSolution;
@@ -743,12 +767,14 @@ $on_mod(Loaded) {
 class $modify(IBKeyboard, CCKeyboardDispatcher) {
     bool dispatchKeyboardMSG(cocos2d::enumKeyCodes key, bool down, bool repeat, double timestamp) {
         if (down && !repeat) {
-            if (key == cocos2d::enumKeyCodes::KEY_F6) {
+            if (key == cocos2d::enumKeyCodes::KEY_F6 && PlayLayer::get()) {
                 ac::g_stage = (ac::g_stage + 1) % ac::kStageCount;
                 ac_console::line("[InputBuffer] F6 Cycle -> " + ac::stageText(ac::g_stage));
             }
-            else if (key == cocos2d::enumKeyCodes::KEY_F7) {
-                log::info("{}", ac::statusLine("STATUS"));
+            else if (key == cocos2d::enumKeyCodes::KEY_F7 && PlayLayer::get()) {
+                const auto status = ac::statusLine("STATUS");
+                ac_console::line(status);
+                log::info("{}", status);
             }
         }
 
@@ -765,9 +791,7 @@ class $modify(IBPlayLayer, PlayLayer) {
         ac::clearState();
         ac::clearStats();
 
-        // Fantasma de un nivel anterior: su capa ya no existe, se suelta sin tocar.
-        ac::g_ghost = nullptr;
-        ac::g_ghostOwner = nullptr;
+        // ensureGhost cleans up the retained clone from any previous PlayLayer.
         ac::ensureGhost(this);
     }
 
@@ -779,6 +803,7 @@ class $modify(IBPlayLayer, PlayLayer) {
         ac::clearState();
         PlayLayer::resetLevel();
         ac::clearState();
+        ac::clearStats(); // Keep ATTEMPT diagnostics scoped to one attempt.
     }
 
     // onExit tambien se dispara al pausar: no se destruye nada.
