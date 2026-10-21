@@ -1,4 +1,4 @@
-// Assisted Click - src/main.cpp -- v1.4.2 (persistent input timing + collision evidence)
+// Assisted Click - src/main.cpp -- v1.4.3 (long-edge history sentinel + collision evidence)
 //
 // Que hace: al recibir un clic (PRESS/RELEASE) simula un jugador nativo clonado en pasos
 // medidos de PlayerObject::update, usando PlayLayer::checkCollisions del propio juego. Solo
@@ -121,7 +121,7 @@ namespace ac {
     constexpr int kMaxSimSteps = 144;   // allows a slow-speed wave to reach a nearby validation corridor
     constexpr int kMaxStepsPerInput = 2048; // aggregate simulated ticks
     constexpr int kMaxClearanceEstimate = 128; // max estimated physics updates to the validation corridor
-    constexpr int kMaxEdgeProfileTicks = 512; // observe across retries; long intervals are represented as no edge inside the modeled horizon
+    constexpr int kMaxEdgeProfileTicks = 512; // exact interval storage cap; longer intervals use a sentinel meaning no opposite edge in the modeled horizon
     constexpr int kPostClearanceSteps = 2; // collision samples after validation corridor
     constexpr float kPostClearanceDistance = 24.0f; // inspect nearby chained hazards without an excessive fixed tail
     constexpr float kHazardClearancePadding = 8.0f;
@@ -157,7 +157,7 @@ namespace ac {
 
         auto const& s = kStages[0];
         ac_console::line("===================================================");
-        ac_console::line("[InputBuffer] v1.4.2 LOADED (input timing survives retries; collision evidence diagnostics)");
+        ac_console::line("[InputBuffer] v1.4.3 LOADED (long holds map to no edge inside the prediction horizon)");
         ac_console::line(fmt::format(
             "[InputBuffer] Starting Mode: STAGE 1 ({} All / {} Wave)", s.all, s.wave
         ));
@@ -288,9 +288,17 @@ namespace ac {
         return button + (isPlayer1 ? 0 : 10000);
     }
 
-    void pushBounded(std::deque<int>& values, int value) {
-        if (value <= 0 || value > kMaxEdgeProfileTicks) return;
-        values.push_back(value);
+    // Keep long intervals as evidence instead of discarding them. A hold/gap longer than
+    // kMaxEdgeProfileTicks cannot be represented as an exact future edge in our short native
+    // simulation window, but it is useful evidence that no opposite edge occurred inside that
+    // window. Store a saturating sentinel (513) so it counts toward calibration and maps to 0
+    // in futureEdgeOffsets().
+    void pushBounded(std::deque<int>& values, std::int64_t value) {
+        if (value <= 0) return;
+        const int stored = value > kMaxEdgeProfileTicks
+            ? kMaxEdgeProfileTicks + 1
+            : static_cast<int>(value);
+        values.push_back(stored);
         while (values.size() > kEdgeProfileSamples) values.pop_front();
     }
 
@@ -307,14 +315,14 @@ namespace ac {
         if (down) {
             if (profile.releaseTick >= 0) {
                 const auto gap = g_physicsSerialTick - profile.releaseTick;
-                if (gap <= std::numeric_limits<int>::max()) pushBounded(profile.releaseGapTicks, static_cast<int>(gap));
+                pushBounded(profile.releaseGapTicks, gap);
             }
             profile.pressStartTick = g_physicsSerialTick;
             profile.lastDown = true;
         } else {
             if (profile.pressStartTick >= 0) {
                 const auto hold = g_physicsSerialTick - profile.pressStartTick;
-                if (hold <= std::numeric_limits<int>::max()) pushBounded(profile.holdTicks, static_cast<int>(hold));
+                pushBounded(profile.holdTicks, hold);
             }
             profile.releaseTick = g_physicsSerialTick;
             profile.lastDown = false;
@@ -345,9 +353,12 @@ namespace ac {
         const int maxRepresentableOffset = std::max(1,
             kMaxSimSteps - kHorizon - std::max(0, maxCandidateDelay) - 1);
         for (int n : samples) {
+            if (n <= 0) continue;
+            // 0 means the observed opposite edge was later than the trajectory can model, so
+            // no synthetic opposite edge is inserted before the clearance horizon. This is not
+            // an invented duration: it is a bucket for an observed interval outside the window.
             const int modeled = (n > maxRepresentableOffset) ? 0 : n;
-            if (n > 0 && n <= kMaxEdgeProfileTicks &&
-                std::find(offsets.begin(), offsets.end(), modeled) == offsets.end()) offsets.push_back(modeled);
+            if (std::find(offsets.begin(), offsets.end(), modeled) == offsets.end()) offsets.push_back(modeled);
         }
         return offsets;
     }
