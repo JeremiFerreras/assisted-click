@@ -1,4 +1,4 @@
-// Assisted Click - src/main.cpp -- v1.7.1 (fisica nativa auditada contra el decompile; sub-fase exacta de inputs)
+// Assisted Click - src/main.cpp -- v1.7.2 (fix wave MINI: seed del clon pisa el tamaño real)
 //
 // Que hace: al recibir un clic (PRESS/RELEASE) simula un jugador nativo clonado en pasos
 // medidos de PlayerObject::update, usando PlayLayer::checkCollisions del propio juego. Solo
@@ -237,6 +237,30 @@
 //     que la llamada updateRotation(dt) del loop; m_didReset del clon permanece false
 //     durante la simulacion (checkCollisions corre como en el juego).
 //
+// CAMBIOS v1.7.2 (validado por el log 15.36.03 con v1.7.1 en ejecucion):
+//  EL FIX DEL ORDEN FUNCIONA. Fase 1 (nivel de prueba, spawn (0,105) pico id=8):
+//  CLONE-DEATH ghost=(1.30,106.30) — el clon ya NO muere en la siembra: muere tras 1
+//  update exactamente donde el jugador real; "real death matches the predicted one
+//  (deathX=1.30 vs 1.30, objectID=8): baseline matched reality"; 11-12 matches, 0
+//  phantom deaths, 0 divergencias; spawn guard confirmo la muerte real y se desactivo
+//  para ese nivel. Los skips "other=1" de esa fase son re-sincronizaciones de boton
+//  tras cada retry (por diseño, no bugs).
+//  PERO la fase 2 (wave MINI) destapo este bug:
+//  1. first seed check MISMATCH con ghostRect=(-5,100,5,110) (10x10, full) contra
+//     realRect=(-3,102,3,108) (6x6, mini x0.6). El fail-closed funciono (UNKNOWN
+//     ghost-seed-mismatch, ningun delay reenviado) pero en secciones mini no hay
+//     asistencia. Causa: updatePlayerScale() recalcula el tamaño del clon desde su
+//     propio estado; si m_vehicleSize no llega copiado (AC_COPY requires-guardado:
+//     se salta en silencio si el binding no expone el campo) o el recalculo pisa los
+//     m_width/m_height copiados con el default full, el clon vuelve a 10x10.
+//  2. FIX: tras updatePlayerScale() se IMPONE el tamaño del jugador real:
+//     re-copia de m_vehicleSize (guardada), re-copia de m_width/m_height (guardada)
+//     y setScale(src->getScale()) para la escala del nodo. El estado impuesto es
+//     exactamente el que el seed check compara, asi que el siguiente log confirma
+//     o refuta el fix con evidencia.
+//  3. El log del seed check ahora incluye "scale ghost=... real=..." para
+//     diagnosticar de un vistazo si el tamaño vuelve a divergir.
+//
 // Tecnicas tomadas de xdBot (ZiLko/xdBot):
 //  - jugador falso creado con PlayerObject::create y anadido a m_objectLayer
 //  - copia amplia del estado de PlayerObject mediante seedGhost/AC_COPY; no se asume completa
@@ -399,7 +423,7 @@ namespace ac {
 
         auto const& s = kStages[g_stage];
         ac_console::line("===================================================");
-        ac_console::line("[InputBuffer] v1.7.1 LOADED (native step order audited vs decompile; exact input sub-phase split)");
+        ac_console::line("[InputBuffer] v1.7.2 LOADED (order fix validated by log; mini-wave seed size fix)");
         ac_console::line(fmt::format(
             "[InputBuffer] Starting Mode: STAGE {} ({} All / {} Wave)", g_stage + 1, s.all, s.wave
         ));
@@ -1161,6 +1185,23 @@ namespace ac {
         // en el spawn.
         dst->updatePlayerScale();
 
+        // v1.7.2: fix MINI (log 15.36.03 fase 2: first seed check MISMATCH con
+        // ghostRect 10x10 vs realRect 6x6 en wave mini). updatePlayerScale() recalcula
+        // el tamaño del clon desde SU PROPIO estado; si m_vehicleSize no llego (el
+        // AC_COPY es requires-guardado y se salta en silencio si el binding no expone
+        // el campo) o el recalculo pisa m_width/m_height con el default full, el clon
+        // vuelve a tamaño grande. Orden correcto: recalcular con los flags de modo y
+        // DESPUES imponer el tamaño del jugador real — m_vehicleSize, dims de hitbox y
+        // escala del nodo — que es exactamente el estado que el seed check compara.
+        if constexpr (requires { dst->m_vehicleSize = src->m_vehicleSize; }) {
+            dst->m_vehicleSize = src->m_vehicleSize;
+        }
+        if constexpr (requires { dst->m_width = src->m_width; }) {
+            dst->m_width = src->m_width;
+            dst->m_height = src->m_height;
+        }
+        dst->setScale(src->getScale());
+
         dst->m_isDead = false;
         dst->m_playEffects = false;
     }
@@ -1470,10 +1511,11 @@ namespace ac {
                 g_warnedSeed = true;
                 const auto gr = g_ghost->GameObject::getObjectRect();
                 const auto rr = real->GameObject::getObjectRect();
-                log::info("[IB] first seed check: {} | ghostRect=({:.2f},{:.2f},{:.2f},{:.2f}) realRect=({:.2f},{:.2f},{:.2f},{:.2f})",
+                log::info("[IB] first seed check: {} | ghostRect=({:.2f},{:.2f},{:.2f},{:.2f}) realRect=({:.2f},{:.2f},{:.2f},{:.2f}) | scale ghost={:.3f} real={:.3f}",
                     seedOK ? "OK" : "MISMATCH",
                     gr.getMinX(), gr.getMinY(), gr.getMaxX(), gr.getMaxY(),
-                    rr.getMinX(), rr.getMinY(), rr.getMaxX(), rr.getMaxY());
+                    rr.getMinX(), rr.getMinY(), rr.getMaxX(), rr.getMaxY(),
+                    g_ghost->getScale(), real->getScale());
             }
 
             if (!seedOK) {
