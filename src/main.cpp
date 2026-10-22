@@ -1,9 +1,17 @@
-// Assisted Click - src/main.cpp -- v1.7.6 (pads nativos modelados + fallback de perfil de edges; investigacion de causa comun de 0 SAVEDs)
+// Assisted Click - src/main.cpp -- v1.8.1 (buffer reactivo de respaldo + predictor original)
 //
-// Que hace: al recibir un clic (PRESS/RELEASE) simula un jugador nativo clonado en pasos
-// medidos de PlayerObject::update, usando PlayLayer::checkCollisions del propio juego. Solo
-// busca retrasos tras una muerte de referencia repetible contra geometria fisica estatica.
-// No modela fase subtick de CBF/Click Between Steps; esas herramientas deben desactivarse.
+// CAMBIOS v1.8.1 (integracion selectiva del buffer funcional de referencia):
+//  1. Cubo/bola/robot/spider: los presses tempranos quedan pendientes hasta suelo/orbe;
+//     si hubo release antes del contacto, se emite un tap corto al llegar.
+//  2. Ship/UFO/swing: los releases demasiado rapidos esperan el minimo de ticks.
+//  3. Wave: usa una rejilla determinista por ticks tras 16 ticks de spawn grace; evita
+//     depender del simulador de trayectorias en el modo mas sensible al timing.
+//  4. El predictor nativo anterior se conserva para el resto de eventos no cubiertos.
+//
+// Que hace: conserva el simulador clonado de PlayerObject::update y las colisiones nativas,
+// pero usa buffering reactivo en los casos principales cubiertos por el mod de referencia.
+// El simulador sigue buscando retrasos solo contra geometria fisica estatica repetible; no
+// modela la fase subtick de CBF/Click Between Steps, que debe desactivarse durante las pruebas.
 //
 // CAMBIOS v1.5.0 (arreglo del bloqueo masivo "unsupported-effect-object-in-corridor"):
 //  1. El veto de triggers en el corredor ya no rechaza TODO EffectGameObject en el rango X.
@@ -290,6 +298,22 @@
 //  D. La compuerta save-authorization se abre sola con 2 muertes confirmadas (visto en
 //     el log: matches=1 -> 2 y la busqueda arranco); no se cambia.
 //
+// CAMBIOS v1.8.0 (version LIMPIA: solo la idea original, a peticion del usuario):
+//  A. ELIMINADO el overlay de trayectoria del futuro (v1.7.4): funciones, constantes
+//     kTraj*, globals, tecla F8 y el refresco desde el hook de update. La sim funciona
+//     igual: el overlay solo era visual.
+//  B. ELIMINADO el diagnostico NO-SOLUTION / IMPOSSIBLE SPAWN (v1.7.3): cuando la
+//     busqueda no encuentra retraso seguro, simplemente pasa el input crudo (fail
+//     open) como en la idea original, sin console ni log.
+//  C. LOG SILENCIADO: TODO el log::debug/info/warn pasa por ac_dbg() (no-op). El log
+//     de geode solo registra los SAVED (log::info). Adiós al spam de veredictos,
+//     seed checks, vetos y CLONE-DEATH por clic.
+//  D. CONSOLA = LO IMPORTANTE: banner de carga, F6 (stage), F7 (status) y los
+//     *** SAVED *** (que siguen con su detalle de ticks/frames).
+//  E. Se CONSERVAN todas las correcciones de fondo de v1.7.5/v1.7.6 (fix hitbox mini
+//     con toggle nativo antes de las copias, pads nativos modelados, fallback de
+//     perfil de edges) porque son parte del motor, no diagnostico.
+//
 // CAMBIOS v1.7.6 (investigacion profunda "factor comun de 0 SAVEDs" — reconstruccion
 //                  verificada contra decompile y mapeos de objetos de la comunidad):
 //  A. PADS NATIVOS MODELADOS (decompile GJBaseGameLayer::collisionCheckObjects): los
@@ -465,6 +489,15 @@ static void line(std::string const&) {}
 } // namespace ac_console
 
 // ============================================================================
+// v1.8.0: LOG SILENCIADO. Todo el diagnostico que antes iba al log de geode pasa
+// por ac_dbg(), un no-op que se traga cualquier lista de argumentos. El log solo
+// conserva los SAVED (log::info) y la consola solo anuncia lo importante: banner,
+// F6/F7 y *** SAVED ***.
+// ============================================================================
+template <class... A>
+inline void ac_dbg(A&&...) {}
+
+// ============================================================================
 // Nucleo
 // ============================================================================
 namespace ac {
@@ -473,6 +506,8 @@ namespace ac {
     struct Stage { int all; int wave; };
     constexpr Stage kStages[] = { {2, 2}, {4, 4}, {8, 8}, {16, 8}, {0, 0} };
     constexpr int kStageCount = 5;
+    // BufferMod parity: let spawn/retry inputs pass through before applying wave grid.
+    constexpr int kSpawnGraceTicks = 16;
 
     // Ventana CRITICA: ticks que se simulan tras aplicar la entrada. La simulacion mantiene
     // Lookahead breve para decidir si tiene sentido buscar: no es el veredicto de seguridad.
@@ -488,11 +523,6 @@ namespace ac {
     constexpr float kPostClearanceDistance = 24.0f; // inspect nearby chained hazards without an excessive fixed tail
     constexpr float kHazardClearancePadding = 8.0f;
     constexpr float kTriggerBandYPad = 8.0f; // margen de la banda Y del veto exacto de triggers
-    // v1.7.4: overlay de trayectoria. Refresco cada 4 ticks (coste ~2 sims cortas) y
-    // horizonte de 96 pasos (~1.5 pantallas en 1x). Puntos cada 8 pasos = regla visual.
-    constexpr int kTrajRefreshEvery = 4;
-    constexpr int kTrajHorizon = 96;
-    constexpr int kTrajDotEvery = 8;
     constexpr auto kPredictionWallBudget = std::chrono::milliseconds(6);
     constexpr int kEdgeProfileSamples = 4;
     // v1.6.0: antes 2. Con clics que mueren manteniendo el boton, el edge opuesto real llega
@@ -501,7 +531,7 @@ namespace ac {
     // rama observada cubre el edge opuesto en el instante medido: espacio completo cubierto.
     constexpr int kMinimumEdgeSamples = 1;
     constexpr float kMinConservativeHalfWidth = 20.0f; // covers normal-size and rotating hitboxes
-    constexpr bool kLogVerdicts = true; // veredicto por clic -> log de Geode (NO consola)
+    constexpr bool kLogVerdicts = true; // v1.8.0: los veredictos van a ac_dbg (no-op): el log de Geode queda limpio
 
     // v1.6.2: empieza en STAGE 3 (8/8). STAGE 1 (limite 2) casi nunca deja una ventana
     // de 3 clears consecutivos en wave, asi que todo clic daba NO SAFE CLEARANCE por
@@ -532,12 +562,11 @@ namespace ac {
 
         auto const& s = kStages[g_stage];
         ac_console::line("===================================================");
-        ac_console::line("[InputBuffer] v1.7.6 LOADED (native pads modeled; edge-profile fallback; mini hitbox fixed; impossible-spawn warning)");
+        ac_console::line("[InputBuffer] v1.8.1 LOADED (buffer reactivo + predictor original; consola = SAVED)");
         ac_console::line(fmt::format(
             "[InputBuffer] Starting Mode: STAGE {} ({} All / {} Wave)", g_stage + 1, s.all, s.wave
         ));
-        ac_console::line("[InputBuffer] F6: 2/2 -> 4/4 -> 8/8 -> 16/8 -> OFF | F7: status | F8: future overlay");
-        ac_console::line("[InputBuffer] Overlay: magenta=cambia el input, verde=mantener, rojo=muerte prevista");
+        ac_console::line("[InputBuffer] F6: 2/2 -> 4/4 -> 8/8 -> 16/8 -> OFF | F7: status");
         ac_console::line("[InputBuffer] Tick-based only; disable CBF / Click Between Steps / Click Between Ticks");
         ac_console::line("===================================================");
     }
@@ -545,6 +574,22 @@ namespace ac {
     int limitFor(PlayerObject* p) {
         auto const& s = kStages[g_stage];
         return (p && p->m_isDart) ? s.wave : s.all;
+    }
+
+    // The reference buffer uses reactive input timing in these modes instead of
+    // trying to certify every click through a clone simulation.
+    bool isFlightBufferMode(PlayerObject* p) {
+        return p && (p->m_isShip || p->m_isBird || p->m_isSwing);
+    }
+
+    bool isGroundBufferMode(PlayerObject* p) {
+        return p && !p->m_isShip && !p->m_isBird && !p->m_isDart && !p->m_isSwing;
+    }
+
+    int touchingRingCount(PlayerObject* p) {
+        return p && p->m_touchingRings
+            ? static_cast<int>(p->m_touchingRings->count())
+            : 0;
     }
 
     // ---- Estado de la partida
@@ -561,18 +606,6 @@ namespace ac {
     PlayLayer* g_layer = nullptr;
     PlayerObject* g_ghost = nullptr;
     PlayLayer* g_ghostOwner = nullptr;
-
-    // ---- v1.7.4: overlay de trayectoria del futuro (dibuja el clon por delante y
-    // aconseja el input optimo). El nodo y la etiqueta viven en m_objectLayer (coordenadas
-    // de mundo, se desplazan con la camara igual que el clon). F8 los activa/desactiva.
-    bool g_trajOverlay = true;
-    cocos2d::CCDrawNode* g_trajNode = nullptr;
-    cocos2d::CCLabelBMFont* g_trajLabel = nullptr;
-    PlayLayer* g_trajOwner = nullptr;
-    // Estado logico crudo del boton 1 del jugador 1 (solo edges REALES: los del clon y
-    // los re-sends no lo tocan). El overlay lo usa para saber si el futuro compara
-    // "mantener vs soltar" o "no-pulsar vs pulsar".
-    bool g_button1Down = false;
 
     bool g_simulating = false;
     bool g_cloneDied = false;
@@ -675,12 +708,12 @@ namespace ac {
             ++g_trajectoryMatches;
             if (g_predictionsPaused) {
                 g_predictionsPaused = false;
-                log::warn("[IB] PHANTOM-GUARD released at tick {} (edge match, step {}): "
+                ac_dbg("[IB] PHANTOM-GUARD released at tick {} (edge match, step {}): "
                           "real=({:.2f},{:.2f}) expect=({:.2f},{:.2f})",
                     g_tick, idx, player->getPositionX(), player->getPositionY(), expX, expY);
             }
             else {
-                log::debug("[IB] reality trajectory match at step {} (real=({:.2f},{:.2f}) "
+                ac_dbg("[IB] reality trajectory match at step {} (real=({:.2f},{:.2f}) "
                            "expect=({:.2f},{:.2f}); matches={})",
                     idx, player->getPositionX(), player->getPositionY(), expX, expY, g_trajectoryMatches);
             }
@@ -690,7 +723,7 @@ namespace ac {
             g_lastDivergenceSerial = g_physicsSerialTick;
             ++g_modelDivergences;
             g_predictionsPaused = true;
-            log::warn("[IB] MODEL-DIVERGENCE at edge (step {}): real=({:.2f},{:.2f}) dead={} "
+            ac_dbg("[IB] MODEL-DIVERGENCE at edge (step {}): real=({:.2f},{:.2f}) dead={} "
                       "but model expected ({:.2f},{:.2f}); matches reset, predictions paused",
                 idx, player->getPositionX(), player->getPositionY(),
                 player->m_isDead ? 1 : 0, expX, expY);
@@ -775,6 +808,29 @@ namespace ac {
 
     std::deque<PendingInput> g_queue;
     std::unordered_map<int, KeyState> g_keys;
+
+    // Reactive fallback copied in spirit from the working GMD-Buffer-Mod:
+    // - ground modes: remember an early tap until ground/orb contact;
+    // - ship/UFO/swing: enforce a minimum hold length;
+    // - wave: schedule press/release edges on a tick grid.
+    // The existing clone predictor remains available outside these cases.
+    struct LandingBufferState {
+        bool pending = false;
+        bool releasedBeforeLanding = false;
+        int startTick = 0;
+    };
+    struct FlightBufferState {
+        bool pressed = false;
+        int pressTick = -1;
+        bool delayedRelease = false;
+        int releaseAt = 0;
+    };
+    LandingBufferState g_landingBuffer;
+    FlightBufferState g_flightBuffer;
+    std::unordered_set<int> g_landingManagedKeys;
+    int g_waveLastTarget = -1;
+    bool g_waveLastDown = false;
+
     // Delay selected for the active press of each button. A release inherits this offset,
     // so a delayed press/release pair does not collapse to a one-tick hold.
     std::unordered_map<int, int> g_activePressDelay;
@@ -923,6 +979,11 @@ namespace ac {
         g_queue.clear();
         g_keys.clear();
         g_activePressDelay.clear();
+        g_landingBuffer = {};
+        g_flightBuffer = {};
+        g_landingManagedKeys.clear();
+        g_waveLastTarget = -1;
+        g_waveLastDown = false;
     }
 
     // Calibrate against the full recent window; reject clock drift rather than substituting
@@ -1421,7 +1482,7 @@ namespace ac {
 
         g_ghost = ghost;
         g_ghostOwner = layer;
-        log::info("[IB] ghost created");
+        ac_dbg("[IB] ghost created");
         return true;
     }
 
@@ -1707,7 +1768,7 @@ namespace ac {
                 g_warnedSeed = true;
                 const auto gr = g_ghost->GameObject::getObjectRect();
                 const auto rr = real->GameObject::getObjectRect();
-                log::info("[IB] first seed check: {} | ghostRect=({:.2f},{:.2f},{:.2f},{:.2f}) realRect=({:.2f},{:.2f},{:.2f},{:.2f}) | scale ghost={:.3f} real={:.3f}",
+                ac_dbg("[IB] first seed check: {} | ghostRect=({:.2f},{:.2f},{:.2f},{:.2f}) realRect=({:.2f},{:.2f},{:.2f},{:.2f}) | scale ghost={:.3f} real={:.3f}",
                     seedOK ? "OK" : "MISMATCH",
                     gr.getMinX(), gr.getMinY(), gr.getMaxX(), gr.getMaxY(),
                     rr.getMinX(), rr.getMinY(), rr.getMaxX(), rr.getMaxY(),
@@ -1819,7 +1880,7 @@ namespace ac {
                     if (std::abs(movedX) < 0.0001f) {
                         if (!g_warnedX) {
                             g_warnedX = true;
-                            log::warn("[IB] native clone X did not advance; refusing prediction");
+                            ac_dbg("[IB] native clone X did not advance; refusing prediction");
                         }
                         out = unknown("ghost-x-did-not-advance-natively");
                         out.steps = step + 1;
@@ -1831,7 +1892,7 @@ namespace ac {
                     if (g_unmodeled) {
                         out = unknown("unmodeled-object-or-trigger");
                         out.steps = step + 1;
-                        log::debug("[IB] sim step {} hit unmodeled object: id={} type={}",
+                        ac_dbg("[IB] sim step {} hit unmodeled object: id={} type={}",
                             step, g_unmodeledObjectID, g_unmodeledObjectType);
                         break;
                     }
@@ -1902,7 +1963,7 @@ namespace ac {
             std::abs(real->m_yVelocity - rv) > 0.0001) {
             if (!g_warnedWorld) {
                 g_warnedWorld = true;
-                log::warn("[IB] simulation modified the real player state");
+                ac_dbg("[IB] simulation modified the real player state");
             }
             return unknown("real-state-changed");
         }
@@ -1962,7 +2023,7 @@ namespace ac {
         const int baselineDelay = std::max(0, immediateDue - baselineTick);
         if (baselineDelay > limit) {
             ++g_skipOther;
-            log::debug("[IB] {} tick {} -> PRESERVE-DELAY +{} (stage cap {})",
+            ac_dbg("[IB] {} tick {} -> PRESERVE-DELAY +{} (stage cap {})",
                 down ? "PRESS" : "RELEASE", g_tick, baselineDelay, limit);
             return baselineDelay; // preserve the paired press/release offset even outside search cap
         }
@@ -2033,14 +2094,14 @@ namespace ac {
             g_realityCheck.traj = base.traj;
             ++g_statKept;
             if constexpr (kLogVerdicts) {
-                log::debug("[IB] {} tick {} -> NO-IMMEDIATE-DEATH (lookahead={} steps; {} budget steps left)",
+                ac_dbg("[IB] {} tick {} -> NO-IMMEDIATE-DEATH (lookahead={} steps; {} budget steps left)",
                     down ? "PRESS" : "RELEASE", g_tick, base.steps, remainingSteps);
             }
         }
         else if (base.result == SimResult::Unknown) {
             ++g_statUnknown;
             if constexpr (kLogVerdicts) {
-                log::debug("[IB] {} tick {} -> UNKNOWN ({}){}",
+                ac_dbg("[IB] {} tick {} -> UNKNOWN ({}){}",
                     down ? "PRESS" : "RELEASE", g_tick, g_unknownReason, unmodeledSuffix());
             }
         }
@@ -2051,7 +2112,7 @@ namespace ac {
                 !std::isfinite(base.deathObjectRight)) {
                 ++g_statUnknown;
                 g_unknownReason = "death-without-known-static-physical-object";
-                log::debug("[IB] {} tick {} -> UNKNOWN ({})",
+                ac_dbg("[IB] {} tick {} -> UNKNOWN ({})",
                     down ? "PRESS" : "RELEASE", g_tick, g_unknownReason);
                 return safeFallbackDelay;
             }
@@ -2061,7 +2122,7 @@ namespace ac {
             if (!sameBaselineDeath(base, baselineConfirm)) {
                 ++g_statUnknown;
                 g_unknownReason = "nondeterministic-baseline-death";
-                log::warn("[IB] tick {} rejected: baseline death did not reproduce ({} vs {})",
+                ac_dbg("[IB] tick {} rejected: baseline death did not reproduce ({} vs {})",
                     g_tick, base.steps, baselineConfirm.steps);
                 return safeFallbackDelay;
             }
@@ -2100,7 +2161,7 @@ namespace ac {
                 g_predictionsPaused = true;
                 ++g_statUnknown;
                 g_unknownReason = "baseline-death-at-spawn-state";
-                log::debug("[IB] {} tick {} -> UNKNOWN ({}; cloneDiedStep={} objectRight={:.2f} deathX={:.2f} dart={} y={:.2f})",
+                ac_dbg("[IB] {} tick {} -> UNKNOWN ({}; cloneDiedStep={} objectRight={:.2f} deathX={:.2f} dart={} y={:.2f})",
                     down ? "PRESS" : "RELEASE", g_tick, g_unknownReason, base.steps,
                     base.deathObjectRight, base.deathX,
                     player->m_isDart, player->getPositionY());
@@ -2116,7 +2177,7 @@ namespace ac {
             if (g_predictionsPaused && g_tick <= 3) {
                 ++g_statUnknown;
                 g_unknownReason = "phantom-guard-paused";
-                log::debug("[IB] {} tick {} -> UNKNOWN ({}; phantomDeaths={})",
+                ac_dbg("[IB] {} tick {} -> UNKNOWN ({}; phantomDeaths={})",
                     down ? "PRESS" : "RELEASE", g_tick, g_unknownReason, g_phantomDeaths);
                 return safeFallbackDelay;
             }
@@ -2131,7 +2192,7 @@ namespace ac {
             if (!saveAuthorizationValidated()) {
                 ++g_statUnknown;
                 g_unknownReason = "save-authorization-unvalidated-model";
-                log::debug("[IB] {} tick {} -> UNKNOWN ({}; matches={} lastDivergenceSerial={} now={})",
+                ac_dbg("[IB] {} tick {} -> UNKNOWN ({}; matches={} lastDivergenceSerial={} now={})",
                     down ? "PRESS" : "RELEASE", g_tick, g_unknownReason, g_trajectoryMatches,
                     g_lastDivergenceSerial, g_physicsSerialTick);
                 return safeFallbackDelay;
@@ -2151,7 +2212,7 @@ namespace ac {
                 hazardClearTargetX <= base.deathX + 0.1f || validationTargetX <= hazardClearTargetX) {
                 ++g_statUnknown;
                 g_unknownReason = "invalid-hazard-validation-target";
-                log::debug("[IB] tick {} -> UNKNOWN ({}) hazardX={:.2f} validationX={:.2f} deathX={:.2f}",
+                ac_dbg("[IB] tick {} -> UNKNOWN ({}) hazardX={:.2f} validationX={:.2f} deathX={:.2f}",
                     g_tick, g_unknownReason, hazardClearTargetX, validationTargetX, base.deathX);
                 return safeFallbackDelay;
             }
@@ -2163,7 +2224,7 @@ namespace ac {
                     layer, player->getPositionX() - 32.0f, validationTargetX + 24.0f)) {
                 ++g_statUnknown;
                 g_unknownReason = "dynamic-physical-object-in-corridor";
-                log::debug("[IB] tick {} -> UNKNOWN ({})", g_tick, g_unknownReason);
+                ac_dbg("[IB] tick {} -> UNKNOWN ({})", g_tick, g_unknownReason);
                 return safeFallbackDelay;
             }
 
@@ -2174,7 +2235,7 @@ namespace ac {
                 auto profileIt = g_edgeProfiles.find(key);
                 const size_t available = profileIt == g_edgeProfiles.end() ? 0 :
                     (down ? profileIt->second.holdTicks.size() : profileIt->second.releaseGapTicks.size());
-                log::debug("[IB] {} tick {} -> UNKNOWN (edge history {}/{}; serialTick={}, profile={} samples)",
+                ac_dbg("[IB] {} tick {} -> UNKNOWN (edge history {}/{}; serialTick={}, profile={} samples)",
                     down ? "PRESS" : "RELEASE", g_tick, available, kMinimumEdgeSamples,
                     g_physicsSerialTick, down ? "hold" : "gap");
                 return safeFallbackDelay;
@@ -2219,7 +2280,7 @@ namespace ac {
                     coarseMinY, coarseMaxY, &corridorVeto)) {
                 ++g_statUnknown;
                 g_unknownReason = "unsupported-effect-object-in-corridor";
-                log::debug("[IB] {} tick {} -> UNKNOWN ({}) vetoedObjectID={} type={} x={:.2f} y={:.2f}",
+                ac_dbg("[IB] {} tick {} -> UNKNOWN ({}) vetoedObjectID={} type={} x={:.2f} y={:.2f}",
                     down ? "PRESS" : "RELEASE", g_tick, g_unknownReason,
                     corridorVeto.objectID, corridorVeto.objectType,
                     corridorVeto.x, corridorVeto.y);
@@ -2262,7 +2323,7 @@ namespace ac {
                     if (!sameSafeClearance(r, confirm)) {
                         ++unknownCands;
                         g_unknownReason = "nondeterministic-safe-candidate";
-                        log::warn("[IB] tick {} delay {} rejected: clearance replay differs ({} vs {})",
+                        ac_dbg("[IB] tick {} delay {} rejected: clearance replay differs ({} vs {})",
                             g_tick, effectiveDelay, r.steps, confirm.steps);
                         unstable = true;
                         break;
@@ -2422,7 +2483,7 @@ namespace ac {
                             &exactVeto)) {
                         ++unknownCands;
                         g_unknownReason = "unsupported-effect-object-in-candidate-band";
-                        log::debug("[IB] {} tick {} delay {} -> UNKNOWN ({}) vetoedObjectID={} type={} x={:.2f} y={:.2f}",
+                        ac_dbg("[IB] {} tick {} delay {} -> UNKNOWN ({}) vetoedObjectID={} type={} x={:.2f} y={:.2f}",
                             down ? "PRESS" : "RELEASE", g_tick, effectiveDelay, g_unknownReason,
                             exactVeto.objectID, exactVeto.objectType, exactVeto.x, exactVeto.y);
                         unstable = true;
@@ -2460,7 +2521,7 @@ namespace ac {
             if (unstable) {
                 ++g_statUnknown;
                 if (!g_unknownReason || g_unknownReason[0] == '\0') g_unknownReason = "candidate-simulation-unknown";
-                log::debug("[IB] {} tick {} -> UNKNOWN ({}, testedStepsLeft={}){}",
+                ac_dbg("[IB] {} tick {} -> UNKNOWN ({}, testedStepsLeft={}){}",
                     down ? "PRESS" : "RELEASE", g_tick, g_unknownReason, remainingSteps, unmodeledSuffix());
             }
             else if (found) {
@@ -2505,188 +2566,15 @@ namespace ac {
                 );
             }
             else {
+                // v1.8.0: sin diagnostico de spawn imposible ni log — el veredicto es
+                // simplemente "ningun retraso seguro encontrado": el input pasa crudo.
                 ++g_statNoSolution;
-                // v1.7.3: diagnostico IMPOSSIBLE-SPAWN. Si TODOS los candidatos mueren al
-                // mismo paso (o antes) que el baseline en la ventana de spawn Y el nucleo
-                // del jugador ya solapa la hitbox del objeto mortal EN LA SIEMBRA, ningun
-                // retraso puede salvar: el jugador nace dentro del area mortal y no puede
-                // salir de su franja Y antes de que X despeje (log 15.56.39: spawn (0,105)
-                // DENTRO del pico id=8 (-3,99,3,111); delays 1..8 todos mueren al paso 1,
-                // y el jugador real confirmo muriendo igual presionando y soltando). No es
-                // un bug del mod: el escenario no tiene solucion y el veredicto correcto
-                // es NO SAFE CLEARANCE. Se declara en consola para que no se confunda con
-                // una busqueda fallida.
-                bool impossibleSpawn = false;
-                if (base.steps <= 2 && g_tick <= 3 && bestSurvive <= base.steps && base.deathObject) {
-                    const float coreW = std::abs(playerRect.size.width) * 0.3f;
-                    const float coreH = std::abs(playerRect.size.height) * 0.3f;
-                    const cocos2d::CCRect core(
-                        player->getPositionX() - coreW * 0.5f,
-                        player->getPositionY() - coreH * 0.5f,
-                        coreW, coreH
-                    );
-                    const cocos2d::CCRect hazardRect = base.deathObject->getObjectRect();
-                    impossibleSpawn = hazardRect.intersectsRect(core);
-                    if (impossibleSpawn) {
-                        ac_console::line(fmt::format(
-                            "[InputBuffer] *** NO-SOLUTION (IMPOSSIBLE SPAWN): hazard id={} "
-                            "rect=({:.1f},{:.1f},{:.1f},{:.1f}) CONTAINS the spawn core — no click "
-                            "timing can avoid this death. Move the spawn outside the hazard hitbox "
-                            "to test delays. ***",
-                            base.deathObject->m_objectID,
-                            hazardRect.getMinX(), hazardRect.getMinY(),
-                            hazardRect.getMaxX(), hazardRect.getMaxY()
-                        ));
-                        log::debug(
-                            "[IB] {} tick {} -> IMPOSSIBLE SPAWN: player core at ({:.1f},{:.1f}) "
-                            "overlaps death object id={} rect=({:.1f},{:.1f},{:.1f},{:.1f}); all "
-                            "delays die at step {} — this click cannot be saved by delaying",
-                            down ? "PRESS" : "RELEASE", g_tick,
-                            player->getPositionX(), player->getPositionY(),
-                            base.deathObject->m_objectID,
-                            hazardRect.getMinX(), hazardRect.getMinY(),
-                            hazardRect.getMaxX(), hazardRect.getMaxY(),
-                            base.steps
-                        );
-                    }
-                }
-                if constexpr (kLogVerdicts) {
-                    log::debug(
-                        "[IB] {} tick {} -> NO SAFE CLEARANCE beyond baseline +{} (limit {}) "
-                        "(baseDeathStep={}, objectRight={:.2f}, bestDelay={}, surviveSteps={}, "
-                        "unknownCandidates={}, fragileCandidates={}, remainingBudget={})",
-                        down ? "PRESS" : "RELEASE", g_tick, baselineDelay, limit, base.steps,
-                        base.deathObjectRight, bestDelay, bestSurvive, unknownCands,
-                        fragileCandidates, remainingSteps
-                    );
-                }
             }
         }
 
         return chosen;
     }
 
-    // ========================================================================
-    // v1.7.4: Overlay de trayectoria del futuro
-    // ========================================================================
-    void destroyTrajectoryOverlay() {
-        auto* node = g_trajNode;
-        auto* label = g_trajLabel;
-        g_trajNode = nullptr;
-        g_trajLabel = nullptr;
-        g_trajOwner = nullptr;
-        if (node) node->removeFromParentAndCleanup(true);
-        if (label) label->removeFromParentAndCleanup(true);
-    }
-
-    bool ensureTrajectoryOverlay(PlayLayer* layer) {
-        if (!layer || !layer->m_objectLayer) return false;
-        if (g_trajNode && g_trajOwner == layer) return true;
-        destroyTrajectoryOverlay();
-        auto* node = cocos2d::CCDrawNode::create();
-        auto* label = cocos2d::CCLabelBMFont::create("FUTURO", "bigFont.fnt");
-        if (!node || !label) return false;
-        node->setZOrder(999);
-        label->setZOrder(1000);
-        label->setAnchorPoint({0.5f, 0.5f});
-        label->setScale(0.32f);
-        layer->m_objectLayer->addChild(node);
-        layer->m_objectLayer->addChild(label);
-        g_trajNode = node;
-        g_trajLabel = label;
-        g_trajOwner = layer;
-        return true;
-    }
-
-    void drawTrajectoryPoly(std::vector<std::pair<float, float>> const& traj,
-                            cocos2d::ccColor4F const& color) {
-        if (!g_trajNode || traj.size() < 2) return;
-        for (size_t i = 1; i < traj.size(); ++i) {
-            const cocos2d::CCPoint from{traj[i - 1].first, traj[i - 1].second};
-            const cocos2d::CCPoint to{traj[i].first, traj[i].second};
-            g_trajNode->drawSegment(from, to, 1.0f, color);
-        }
-        // Regla de ticks: un punto cada kTrajDotEvery pasos.
-        const cocos2d::ccColor4F dot{1.0f, 1.0f, 1.0f, 0.85f};
-        for (size_t i = 0; i < traj.size(); i += static_cast<size_t>(kTrajDotEvery)) {
-            g_trajNode->drawDot({traj[i].first, traj[i].second}, 1.4f, dot);
-        }
-    }
-
-    void drawDeathMark(float x, float y) {
-        if (!g_trajNode) return;
-        const cocos2d::ccColor4F red{1.0f, 0.15f, 0.15f, 1.0f};
-        g_trajNode->drawSegment({x - 3.0f, y - 3.0f}, {x + 3.0f, y + 3.0f}, 1.2f, red);
-        g_trajNode->drawSegment({x - 3.0f, y + 3.0f}, {x + 3.0f, y - 3.0f}, 1.2f, red);
-    }
-
-    // Se llama desde el hook de PlayerObject::update del jugador real cada
-    // kTrajRefreshEvery ticks. Siembra el clon, simula el futuro con el input tal cual
-    // (A) y con el input invertido ahora (B), dibuja el mejor y aconseja.
-    void updateTrajectoryOverlay(PlayLayer* layer, PlayerObject* player) {
-        if (!layer || !player || player->m_isDead) return;
-        if (!ensureTrajectoryOverlay(layer) || !g_trajNode || !g_trajLabel) return;
-        g_trajNode->clear();
-
-        const bool holding = g_button1Down;
-        const int baseTick = g_tick + 1;
-        ActivationGuard guard(layer);
-
-        // Futuro A: input tal cual, sin nuevo edge (los encolados ya vienen en g_queue).
-        SimOut a = simulate(layer, player, holding, 1, baseTick, std::nullopt,
-            kTrajHorizon, true, {}, 0, SteadyClock::time_point::max(), false, kTrajHorizon);
-        guard.restore();
-        if (a.result == SimResult::Unknown) {
-            // Seed check fallido o mundo no confiable (p.ej. mini antes del fix, pads,
-            // triggers): no dibujar nada en vez de mostrar un futuro falso.
-            g_trajLabel->setString("");
-            return;
-        }
-        // Futuro B: invertir el input AHORA (edge inmediato sintetico).
-        SimOut b = simulate(layer, player, !holding, 1, baseTick, std::nullopt,
-            kTrajHorizon, true, {}, 0, SteadyClock::time_point::max(), true, kTrajHorizon);
-        guard.restore();
-
-        const bool aSafe = a.result == SimResult::Safe;
-        const bool bSafe = b.result == SimResult::Safe;
-        const cocos2d::ccColor4F magenta{1.0f, 0.0f, 1.0f, 0.9f};
-        const cocos2d::ccColor4F neon{0.0f, 1.0f, 0.7f, 0.9f};
-        const cocos2d::ccColor4F red{1.0f, 0.25f, 0.25f, 0.95f};
-
-        std::string advice;
-        if (aSafe && bSafe) {
-            // Ambos futuros sobreviven el horizonte: quedarse como esta es lo optimo
-            // (menor numero de acciones). El toggle solo importaria mas adelante.
-            drawTrajectoryPoly(a.traj, neon);
-            advice = holding ? "MANTENER" : "NO PULSAR";
-        } else if (!aSafe && bSafe) {
-            // Invertir el input AHORA salva: dibuja el futuro alternativo en magenta.
-            drawTrajectoryPoly(b.traj, magenta);
-            advice = holding ? "SUELTA AHORA" : "PULSA AHORA";
-        } else if (aSafe && !bSafe) {
-            drawTrajectoryPoly(a.traj, neon);
-            advice = holding ? "MANTENER" : "NO PULSAR";
-        } else {
-            // Ambos mueren: dibuja el futuro actual en rojo con X en la muerte; el
-            // ajuste fino (retrasar N ticks) lo sigue decidiendo la busqueda por clic.
-            drawTrajectoryPoly(a.traj, red);
-            if (!a.traj.empty()) {
-                drawDeathMark(a.traj.back().first, a.traj.back().second);
-            }
-            advice = fmt::format("MUERTE EN ~{}T", a.steps);
-            // v1.7.5: muerte inmediata en la ventana de spawn = el nucleo del jugador
-            // esta DENTRO de la hitbox de un objeto mortal (IMPOSSIBLE SPAWN, ver la
-            // busqueda por clic): ningun retraso puede salvar ahi y el veredicto
-            // correcto es no tocar el input. Se avisa EN PANTALLA para que no se
-            // confunda con una busqueda fallida (log 16.46.19: 26/26 clics asi, 0 SAVED).
-            if (a.steps <= 2 && g_tick <= 3) {
-                advice = "SPAWN MORTAL: IMPOSIBLE SALVAR AQUI";
-            }
-        }
-
-        g_trajLabel->setString(advice.c_str());
-        g_trajLabel->setPosition({player->getPositionX(), player->getPositionY() + 26.0f});
-    }
 
     // ========================================================================
     // Cola
@@ -2724,12 +2612,80 @@ namespace ac {
         if (!down) g_activePressDelay.erase(key);
     }
 
+    // Queue at an absolute physics-update tick even when the delay is zero. This is
+    // needed for the wave grid: a grid edge due on the next update must not be applied
+    // synchronously between updates just because its relative delay is 0.
+    void queueInputAtTick(PlayLayer* layer, bool down, int button, bool isPlayer1, int due) {
+        if (!layer) return;
+        const int key = buttonKey(button, isPlayer1);
+        due = std::max(due, g_tick + 1);
+
+        const int baseTick = g_tick + 1;
+        if (down) g_activePressDelay[key] = std::max(0, due - baseTick);
+
+        auto pos = std::upper_bound(
+            g_queue.begin(), g_queue.end(), due,
+            [](int v, PendingInput const& item) { return v < item.tick; });
+        g_queue.insert(pos, PendingInput{due, down, button, isPlayer1});
+
+        auto& ks = g_keys[key];
+        ks.lastDue = std::max(ks.lastDue, due);
+        ++ks.pending;
+        if (!down) g_activePressDelay.erase(key);
+    }
+
+    // Resolve the reactive buffer before the next native PlayerObject update, so the
+    // input is delivered in the same phase as the original mod's buffered commands.
+    void serviceReactiveBuffers(PlayLayer* layer, int nextTick) {
+        if (!layer || !layer->m_player1 || layer->m_player1->m_isDead) return;
+        auto* player = layer->m_player1;
+        constexpr int kJumpButton = 1;
+        const int key = buttonKey(kJumpButton, true);
+
+        if (g_landingBuffer.pending) {
+            const int limit = limitFor(player);
+            const int waited = nextTick - g_landingBuffer.startTick;
+            if (limit <= 0 || waited > limit || !isGroundBufferMode(player)) {
+                g_landingBuffer = {};
+            }
+            else if (player->m_isOnGround || touchingRingCount(player) > 0) {
+                const bool released = g_landingBuffer.releasedBeforeLanding;
+                const bool onRing = touchingRingCount(player) > 0;
+                const int bufferedTicks = waited;
+                g_landingBuffer = {};
+                queueInputAtTick(layer, true, kJumpButton, true, nextTick);
+                if (released) {
+                    // A tap released before landing still produces one short jump input.
+                    queueInputAtTick(layer, false, kJumpButton, true, nextTick + 1);
+                }
+                else {
+                    // Its eventual real release should not be re-predicted independently.
+                    g_landingManagedKeys.insert(key);
+                }
+                ac_console::line(fmt::format(
+                    "[InputBuffer] *** SAVED +{} UPDATE-TICKS (landing buffer; {}) PRESS! [Limit: {}] ***",
+                    bufferedTicks, onRing ? "ORB" : "GROUND", limit));
+                ac_dbg("[IB] landing-buffer fired at tick {} (releasedEarly={})",
+                    nextTick, released ? 1 : 0);
+            }
+        }
+
+        if (g_flightBuffer.delayedRelease &&
+            (!isFlightBufferMode(player) || nextTick >= g_flightBuffer.releaseAt)) {
+            g_flightBuffer.delayedRelease = false;
+            g_flightBuffer.pressed = false;
+            g_flightBuffer.pressTick = -1;
+            queueInputAtTick(layer, false, kJumpButton, true, nextTick);
+            ac_dbg("[IB] minimum-hold release fired at tick {}", nextTick);
+        }
+    }
+
     void dispatchPending(PlayLayer* layer, int nextTick) {
         if (!layer) return;
         if (!layer->m_player1 || layer->m_player1->m_isDead) {
             if (!g_queue.empty() && !g_warnedDeathQueue) {
                 g_warnedDeathQueue = true;
-                log::warn("[IB] pending inputs discarded because the real player is dead");
+                ac_dbg("[IB] pending inputs discarded because the real player is dead");
             }
             clearInputs();
             return;
@@ -2783,14 +2739,7 @@ class $modify(IBKeyboard, CCKeyboardDispatcher) {
             else if (key == cocos2d::enumKeyCodes::KEY_F7 && PlayLayer::get()) {
                 const auto status = ac::statusLine("STATUS");
                 ac_console::line(status);
-                log::info("{}", status);
-            }
-            else if (key == cocos2d::enumKeyCodes::KEY_F8 && PlayLayer::get()) {
-                ac::g_trajOverlay = !ac::g_trajOverlay;
-                if (!ac::g_trajOverlay) ac::destroyTrajectoryOverlay();
-                ac_console::line(ac::g_trajOverlay
-                    ? "[InputBuffer] F8: overlay de trayectoria ON (magenta=cambiar input, verde=mantener, rojo=muerte)"
-                    : "[InputBuffer] F8: overlay de trayectoria OFF");
+                ac_dbg("{}", status);
             }
         }
 
@@ -2814,7 +2763,7 @@ class $modify(IBPlayLayer, PlayLayer) {
     void resetLevel() {
         // Resumen automatico en cada reinicio/muerte (no hace falta pulsar F7).
         if (ac::g_clicksSeen > 0 || ac::g_tick > 0) {
-            log::info("{}", ac::statusLine("ATTEMPT"));
+            ac_dbg("{}", ac::statusLine("ATTEMPT"));
         }
         ac::clearState(true, true);
         PlayLayer::resetLevel();
@@ -2830,7 +2779,7 @@ class $modify(IBPlayLayer, PlayLayer) {
 
     void onQuit() {
         if (ac::g_clicksSeen > 0 || ac::g_tick > 0) {
-            log::info("{}", ac::statusLine("QUIT"));
+            ac_dbg("{}", ac::statusLine("QUIT"));
         }
         ac::clearState(false, false);
         // v1.6.1: al salir del nivel el estado de spawn cambia por completo; la pausa
@@ -2843,8 +2792,6 @@ class $modify(IBPlayLayer, PlayLayer) {
         // de spawn y la fisica del siguiente nivel no heredan evidencia.
         ac::g_trajectoryMatches = 0;
         ac::g_lastDivergenceSerial = -1000000;
-        ac::destroyTrajectoryOverlay();
-        ac::g_button1Down = false;
         ac::destroyGhost();
         ac::g_layer = nullptr;
         PlayLayer::onQuit();
@@ -2864,7 +2811,7 @@ class $modify(IBPlayLayer, PlayLayer) {
                 auto* realPlayer = this->m_player1;
                 if (realPlayer) {
                     const auto rr = realPlayer->GameObject::getObjectRect();
-                    log::debug("[IB] CLONE-DEATH ghost=({:.2f},{:.2f}) rect=({:.2f},{:.2f},{:.2f},{:.2f}) | "
+                    ac_dbg("[IB] CLONE-DEATH ghost=({:.2f},{:.2f}) rect=({:.2f},{:.2f},{:.2f},{:.2f}) | "
                                "real=({:.2f},{:.2f}) rect=({:.2f},{:.2f},{:.2f},{:.2f}) | "
                                "obj id={} type={} rect=({:.2f},{:.2f},{:.2f},{:.2f})",
                         player->getPositionX(), player->getPositionY(),
@@ -2878,7 +2825,7 @@ class $modify(IBPlayLayer, PlayLayer) {
                         object ? object->getObjectRect().getMaxX() : 0.0f,
                         object ? object->getObjectRect().getMaxY() : 0.0f);
                 } else {
-                    log::debug("[IB] CLONE-DEATH ghost=({:.2f},{:.2f}) rect=({:.2f},{:.2f},{:.2f},{:.2f}) | "
+                    ac_dbg("[IB] CLONE-DEATH ghost=({:.2f},{:.2f}) rect=({:.2f},{:.2f},{:.2f},{:.2f}) | "
                                "real=NULL | obj id={} type={} rect=({:.2f},{:.2f},{:.2f},{:.2f})",
                         player->getPositionX(), player->getPositionY(),
                         gr.getMinX(), gr.getMinY(), gr.getMaxX(), gr.getMaxY(),
@@ -2918,13 +2865,13 @@ class $modify(IBPlayLayer, PlayLayer) {
                     ac::g_cloneDeathObjectKnown = true;
                     ac::g_cloneDeathObject = evidence;
                     if (evidence != object) {
-                        log::debug("[IB] clone death collider recovered from {}: objectID={} type={} right={:.2f}",
+                        ac_dbg("[IB] clone death collider recovered from {}: objectID={} type={} right={:.2f}",
                             evidenceSource, evidence->m_objectID, static_cast<int>(evidence->m_objectType), right);
                     }
                 }
             }
             if (!ac::g_cloneDeathObjectKnown) {
-                log::debug("[IB] clone death target unresolved: arg={} id={} type={} dynamic={} x={:.2f} y={:.2f}; fail closed",
+                ac_dbg("[IB] clone death target unresolved: arg={} id={} type={} dynamic={} x={:.2f} y={:.2f}; fail closed",
                     static_cast<void*>(object), object ? object->m_objectID : -1,
                     object ? static_cast<int>(object->m_objectType) : -1,
                     object ? ac::hasDynamicPhysicalMotion(object) : false,
@@ -2955,18 +2902,18 @@ class $modify(IBPlayLayer, PlayLayer) {
                             ++ac::g_trajectoryMatches;
                             if (ac::g_realityCheck.steps <= 2 && !ac::g_spawnDeathsReal) {
                                 ac::g_spawnDeathsReal = true;
-                                log::debug("[IB] real spawn death confirmed (steps={} <= 2, objectID={}): "
+                                ac_dbg("[IB] real spawn death confirmed (steps={} <= 2, objectID={}): "
                                            "spawn guard disabled for this level",
                                     ac::g_realityCheck.steps, ac::g_realityCheck.expectDeathObjectID);
                             }
-                            log::debug("[IB] real death matches the predicted one (serialTick={} <= {}, "
+                            ac_dbg("[IB] real death matches the predicted one (serialTick={} <= {}, "
                                        "objectID={}, deathX={:.2f} vs {:.2f}): baseline matched reality",
                                 ac::g_physicsSerialTick, ac::g_realityCheck.deadlineSerialTick,
                                 ac::g_realityCheck.expectDeathObjectID,
                                 player->getPositionX(), ac::g_realityCheck.expectDeathX);
                         }
                         else {
-                            log::debug("[IB] real death within the predicted window but NOT the predicted "
+                            ac_dbg("[IB] real death within the predicted window but NOT the predicted "
                                        "death (objectID={} vs {}, deathX={:.2f} vs {:.2f}): no validation, "
                                        "no spawn escape",
                                 object ? object->m_objectID : -1, ac::g_realityCheck.expectDeathObjectID,
@@ -2981,7 +2928,7 @@ class $modify(IBPlayLayer, PlayLayer) {
                         ac::g_predictionsPaused = true;
                         ac::g_trajectoryMatches = 0;
                         ac::g_lastDivergenceSerial = ac::g_physicsSerialTick;
-                        log::warn("[IB] MODEL-DIVERGENCE: el modelo preveia trayectoria segura "
+                        ac_dbg("[IB] MODEL-DIVERGENCE: el modelo preveia trayectoria segura "
                                   "(expect=({:.2f},{:.2f}) steps={} button={} down={}) pero el jugador real "
                                   "murio en serialTick {}; predicciones en pausa",
                             ac::g_realityCheck.expectX, ac::g_realityCheck.expectY,
@@ -2995,7 +2942,7 @@ class $modify(IBPlayLayer, PlayLayer) {
                 ac::g_realityCheck.active = false;
                 const auto discarded = ac::g_queue.size();
                 ac::clearInputs();
-                if (discarded > 0) log::warn("[IB] cancelled {} pending edge(s) on player death", discarded);
+                if (discarded > 0) ac_dbg("[IB] cancelled {} pending edge(s) on player death", discarded);
             }
         }
         PlayLayer::destroyPlayer(player, object);
@@ -3025,7 +2972,7 @@ class $modify(IBBaseLayer, GJBaseGameLayer) {
         if (layer->m_gameState.m_isDualMode) {
             if (!ac::g_warnedDualMode) {
                 ac::g_warnedDualMode = true;
-                log::warn("[IB] dual mode detected: prediction disabled; passing raw input");
+                ac_dbg("[IB] dual mode detected: prediction disabled; passing raw input");
             }
             ac::flushPendingNow(layer);
             GJBaseGameLayer::handleButton(down, button, isPlayer1);
@@ -3034,18 +2981,14 @@ class $modify(IBBaseLayer, GJBaseGameLayer) {
 
         ++ac::g_clicksSeen;
         if (ac::g_clicksSeen <= 3) {
-            log::info(
+            ac_dbg(
                 "[IB] handleButton #{} down={} button={} stage={} tick={} dtStable={} ghost={} dart={}",
                 ac::g_clicksSeen, down, button, ac::g_stage + 1, ac::g_tick, ac::g_dtStable,
                 ac::g_ghost ? "ok" : "NULL", layer->m_player1 ? layer->m_player1->m_isDart : false
             );
         }
 
-        // v1.7.4: estado logico del boton 1 para el overlay (todo edge que llega aqui es
-        // del jugador 1 real: los del clon vuelven antes, por g_simulating).
-        if (button == 1) {
-            ac::g_button1Down = down;
-        }
+        ac_dbg("[IB] raw button edge: down={} button={}", down, button);
 
         int delay = 0;
         auto* player = layer->m_player1;
@@ -3056,6 +2999,109 @@ class $modify(IBBaseLayer, GJBaseGameLayer) {
         auto activeIt = ac::g_activePressDelay.find(key);
         const bool hasActivePress = activeIt != ac::g_activePressDelay.end();
         const int inheritedDelay = hasActivePress ? activeIt->second : 0;
+
+        // A pending early ground-mode click owns its matching release too. If the user
+        // lets go before contact, remember that fact instead of sending a naked release.
+        if (player && button == 1 && isPlayer1 && ac::g_landingBuffer.pending) {
+            if (down) {
+                if (rawEdgeChanged) {
+                    ac::g_landingBuffer.startTick = ac::g_tick;
+                    ac::g_landingBuffer.releasedBeforeLanding = false;
+                }
+                return;
+            }
+            ac::g_landingBuffer.releasedBeforeLanding = true;
+            return;
+        }
+
+        // Once a buffered landing press has fired, pass its release through normally
+        // instead of running a second physics prediction for the paired edge.
+        if (!down && ac::g_landingManagedKeys.erase(key) > 0) {
+            ac::queueInput(layer, false, button, isPlayer1, inheritedDelay);
+            return;
+        }
+
+        // Swallow duplicate release edges while a minimum-hold release is waiting.
+        if (!down && ac::g_flightBuffer.delayedRelease && button == 1 && isPlayer1) {
+            return;
+        }
+
+        const bool assistEnabled = player && ac::kStages[ac::g_stage].all > 0 &&
+            button == 1 && isPlayer1 && !player->m_isPlatformer;
+        const bool keyFree = !keyPending && ac::g_queue.empty();
+
+        if (assistEnabled && keyFree && ac::isFlightBufferMode(player) && rawEdgeChanged) {
+            if (down) {
+                // Match the known-good mod: flush a withheld release before starting a new hold.
+                if (ac::g_flightBuffer.delayedRelease) {
+                    ac::g_flightBuffer.delayedRelease = false;
+                    ac::g_flightBuffer.pressed = false;
+                    ac::g_flightBuffer.pressTick = -1;
+                    ac::QueuedInputScope scope;
+                    layer->handleButton(false, button, isPlayer1);
+                }
+                ac::g_flightBuffer.pressed = true;
+                ac::g_flightBuffer.pressTick = ac::g_tick;
+                ac::queueInput(layer, true, button, isPlayer1, 0);
+                return;
+            }
+            if (ac::g_flightBuffer.pressed) {
+                const int heldFor = ac::g_tick - ac::g_flightBuffer.pressTick;
+                const int minHold = ac::limitFor(player);
+                if (minHold > 0 && heldFor < minHold) {
+                    ac::g_flightBuffer.delayedRelease = true;
+                    ac::g_flightBuffer.releaseAt = ac::g_flightBuffer.pressTick + minHold;
+                    return;
+                }
+                ac::g_flightBuffer.pressed = false;
+                ac::g_flightBuffer.pressTick = -1;
+                ac::queueInput(layer, false, button, isPlayer1, 0);
+                return;
+            }
+        }
+
+        // Wave input uses the reference mod's deterministic Grid behavior. Spawn-grace
+        // clicks pass through; afterward press/release edges are aligned to update ticks.
+        if (assistEnabled && player->m_isDart && ac::limitFor(player) > 0 && rawEdgeChanged) {
+            if (ac::g_tick < ac::kSpawnGraceTicks) {
+                ac::queueInput(layer, down, button, isPlayer1, inheritedDelay);
+                return;
+            }
+            const int grid = ac::limitFor(player);
+            int target = ((ac::g_tick + grid - 1) / grid) * grid;
+            if (ac::g_waveLastTarget >= 0) {
+                target = std::max(target, ac::g_waveLastTarget);
+                // A quick tap must occupy at least one full grid cell.
+                if (!down && ac::g_waveLastDown) {
+                    target = std::max(target, ac::g_waveLastTarget + grid);
+                }
+            }
+            for (auto it = ac::g_queue.rbegin(); it != ac::g_queue.rend(); ++it) {
+                if (it->button == button && it->isPlayer1 == isPlayer1) {
+                    target = std::max(target, it->tick);
+                    if (!down && it->down) target = std::max(target, it->tick + grid);
+                    break;
+                }
+            }
+            ac::g_waveLastTarget = target;
+            ac::g_waveLastDown = down;
+            ac::queueInputAtTick(layer, down, button, isPlayer1,
+                std::max(target, ac::g_tick + 1));
+            return;
+        }
+
+        // Main reactive fallback: an early press in cube/ball/robot/spider is held until
+        // ground or orb contact, like the working reference. The physics predictor remains
+        // active for other events and when the contact buffer is not applicable.
+        if (assistEnabled && keyFree && down && rawEdgeChanged &&
+            ac::isGroundBufferMode(player) && !player->m_isOnGround &&
+            ac::touchingRingCount(player) == 0 && !hasActivePress) {
+            ac::g_landingBuffer.pending = true;
+            ac::g_landingBuffer.releasedBeforeLanding = false;
+            ac::g_landingBuffer.startTick = ac::g_tick;
+            ac_dbg("[IB] landing-buffer armed at tick {}", ac::g_tick);
+            return;
+        }
 
         if (player && ac::kStages[ac::g_stage].all > 0) {
             if (keyPending) {
@@ -3215,6 +3261,7 @@ class $modify(IBPlayerObject, PlayerObject) {
 
         const bool advancingTick = real && std::isfinite(dt) && dt > 0.0f;
         if (advancingTick) {
+            ac::serviceReactiveBuffers(layer, ac::g_tick + 1);
             ac::dispatchPending(layer, ac::g_tick + 1);
         }
 
@@ -3232,17 +3279,7 @@ class $modify(IBPlayerObject, PlayerObject) {
 
             if (!ac::g_loggedFirstUpdate) {
                 ac::g_loggedFirstUpdate = true;
-                log::info("[IB] first real update dt={} dx={}", dt, ac::g_lastDx);
-            }
-
-            // ---- v1.7.4: overlay de trayectoria del futuro ----
-            // Refresco cada kTrajRefreshEvery ticks: dibuja el futuro del clon y el
-            // consejo de input optimo. Corre DESPUES del update real, asique el futuro
-            // arranca del estado ya avanzado de este tick (fase despreciable para una
-            // visual). Los sims usan el mismo camino nativo y fallan en silencio.
-            if (ac::g_trajOverlay && !this->m_isDead &&
-                (ac::g_tick % ac::kTrajRefreshEvery) == 0) {
-                ac::updateTrajectoryOverlay(layer, this);
+                ac_dbg("[IB] first real update dt={} dx={}", dt, ac::g_lastDx);
             }
 
             // ---- v1.6.2: resolucion del chequeo de realidad ----
@@ -3274,7 +3311,7 @@ class $modify(IBPlayerObject, PlayerObject) {
                             ac::g_trajectoryMatches = 0;
                             ac::g_lastDivergenceSerial = ac::g_physicsSerialTick;
                         }
-                        log::warn("[IB] PHANTOM-DEATH: el baseline predijo muerte del clon en {} pasos "
+                        ac_dbg("[IB] PHANTOM-DEATH: el baseline predijo muerte del clon en {} pasos "
                                   "(button={} down={} spawnArmed={}) pero el jugador real sigue vivo en el "
                                   "serialTick {}; predicciones en pausa hasta que el modelo vuelva a coincidir "
                                   "con la realidad",
@@ -3291,7 +3328,7 @@ class $modify(IBPlayerObject, PlayerObject) {
                         ++ac::g_trajectoryMatches;
                         if (ac::g_predictionsPaused) {
                             ac::g_predictionsPaused = false;
-                            log::warn("[IB] PHANTOM-GUARD released at tick {}: trajectory matches reality "
+                            ac_dbg("[IB] PHANTOM-GUARD released at tick {}: trajectory matches reality "
                                       "(real=({:.2f},{:.2f}) expect=({:.2f},{:.2f}); matches={})",
                                 ac::g_tick, getPositionX(), getPositionY(),
                                 ac::g_realityCheck.expectX, ac::g_realityCheck.expectY, ac::g_trajectoryMatches);
@@ -3302,7 +3339,7 @@ class $modify(IBPlayerObject, PlayerObject) {
                         ac::g_predictionsPaused = true;
                         ac::g_trajectoryMatches = 0;
                         ac::g_lastDivergenceSerial = ac::g_physicsSerialTick;
-                        log::warn("[IB] MODEL-DIVERGENCE: tras {} pasos el jugador real quedo en ({:.2f},{:.2f}) "
+                        ac_dbg("[IB] MODEL-DIVERGENCE: tras {} pasos el jugador real quedo en ({:.2f},{:.2f}) "
                                   "pero el modelo preveia ({:.2f},{:.2f}) (button={} down={} dead={}); "
                                   "predicciones en pausa hasta que el modelo vuelva a coincidir con la realidad",
                             ac::g_realityCheck.steps, getPositionX(), getPositionY(),
