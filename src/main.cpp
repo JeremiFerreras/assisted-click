@@ -1,4 +1,4 @@
-// Assisted Click - src/main.cpp -- v1.6.4 (anti-envenamiento del gate; trayectoria de SAVED arreglada; tolerancia estricta)
+// Assisted Click - src/main.cpp -- v1.6.5 (CAUSA RAIZ ENCONTRADA: hitbox del clon; fix de siembra)
 //
 // Que hace: al recibir un clic (PRESS/RELEASE) simula un jugador nativo clonado en pasos
 // medidos de PlayerObject::update, usando PlayLayer::checkCollisions del propio juego. Solo
@@ -140,6 +140,31 @@
 //     picos cualquiera "coincidian"). Ahora se compara el puntero del GameObject y
 //     se guarda en RealityCheck.
 //  6. BINDING: getCurrentXVelocity() (el que ya usa simulate()) en vez de m_xVelocity.
+// CAMBIOS v1.6.5 (CAUSA RAIZ de la muerte fantasma en spawn, confirmada por el log
+// 21.26.35 con el dump CLONE-DEATH):
+//    CLONE-DEATH ghost=(0,105) rect=(-15,90,15,120) | real=(0,105) rect=(-5,100,5,110)
+//    | obj id=8 type=2 rect=(-3,99,3,111)
+//  El clon muere en el paso 1 porque su rect de GameObject ES 30x30 (hitbox de cubo
+//  por defecto de PlayerObject::create) mientras el jugador real ES 10x10 (hitbox
+//  de wave). Es la hipotesis (a) del v1.6.1: HITBOX DISTINTA DEL CLON. La siembra
+//  copiaba los flags de modo (m_isDart etc.) pero NO el estado de tamaño del rect,
+//  que PlayerObject::create deja en cubo 30x30 y solo lo actualiza el juego nativo
+//  al cambiar de modo. Como el rect equivocado solapa al pico del spawn, el clon
+//  muere en el paso 0 ANTES de que cualquier retraso de input aplique: bestDelay=1,
+//  surviveSteps=1 para TODOS los candidatos (por eso ningun SAVED era posible).
+//  El resto del log valida el diseno v1.6.3: escape spawnReal=1 tras la primera
+//  muerte real confirmada, matches 1..5 acumulando, gate abierto, 0 phantom-deaths,
+//  y las muertes reales coincidiendo con las previstas (deathX=1.30 vs 0.00).
+//  FIX:
+//  1. seedGhost ahora copia el estado de tamaño (m_width/m_height, con guarda de
+//     binding) y llama a updatePlayerScale() para que el juego nativo recalcule el
+//     rect del clon desde los flags de modo copiados (la misma funcion que usan los
+//     portales).
+//  2. El seed check verifica el RECT del clon contra el del jugador real (antes
+//     solo comparaba pose/velocidad/flags y pasaba "OK" con el hitbox roto). Si el
+//     rect difiere, la prediccion falla cerrado (ghost-seed-mismatch) y el primer
+//     log muestra ambos rects.
+//  3. El dump CLONE-DEATH queda como diagnostico (la causa ya esta identificada).
 //  4. ESCAPE DE SPAWN VERIFICADO: g_spawnDeathsReal se podia activar por casualidad
 //     (morir de verdad en los ~4 ticks siguientes por cualquier causa desactivaba el
 //     guard para TODO el nivel). Ahora la muerte real debe coincidir con la prevista:
@@ -310,7 +335,7 @@ namespace ac {
 
         auto const& s = kStages[g_stage];
         ac_console::line("===================================================");
-        ac_console::line("[InputBuffer] v1.6.4 LOADED (spawn-safe validation; strict trajectory tolerance)");
+        ac_console::line("[InputBuffer] v1.6.5 LOADED (clone hitbox seed fix; seed rect check)");
         ac_console::line(fmt::format(
             "[InputBuffer] Starting Mode: STAGE {} ({} All / {} Wave)", g_stage + 1, s.all, s.wave
         ));
@@ -1057,8 +1082,20 @@ namespace ac {
         AC_COPY(m_playerSpeedAC) AC_COPY(m_fixRobotJump) AC_COPY(m_inputsLocked) AC_COPY(m_unk958)
         AC_COPY(m_unkUnused) AC_COPY(m_isOutOfBounds) AC_COPY(m_fallStartY) AC_COPY(m_disablePlayerSqueeze)
         AC_COPY(m_robotHasRun3) AC_COPY(m_robotHasRun2) AC_COPY(m_ignoreDamage) AC_COPY(m_enable22Changes)
+        // v1.6.5: causa raiz de la muerte fantasma en spawn (log 21.26.35): el rect del
+        // clon quedaba en cubo 30x30 (default de PlayerObject::create) mientras el real
+        // usaba la hitbox de wave 10x10. Copiar el estado de tamaño del GameObject.
+        AC_COPY(m_width) AC_COPY(m_height)
 
         #undef AC_COPY
+
+        // v1.6.5: recalcular el rect desde los flags de modo copiados. Esta es la misma
+        // funcion que el juego nativo ejecuta al cruzar un portal de forma (y que el
+        // handler de portales del mod ya usa): aplica m_isDart/m_isShip/m_vehicleSize al
+        // tamaño/hitbox del PlayerObject. Sin esto el rect del clon seguia siendo el de
+        // cubo hasta el primer update, y la pasada de colision del paso 0 mataba al clon
+        // en el spawn.
+        dst->updatePlayerScale();
 
         dst->m_isDead = false;
         dst->m_playEffects = false;
@@ -1349,11 +1386,27 @@ namespace ac {
                 nearFloat(g_ghost->m_fallSpeed, real->m_fallSpeed, 0.001f) &&
                 nearFloat(g_ghost->m_yStart, real->m_yStart, 0.001f) &&
                 nearFloat(g_ghost->m_slopeVelocity, real->m_slopeVelocity, 0.001f) &&
-                nearFloat(g_ghost->m_currentSlopeYVelocity, real->m_currentSlopeYVelocity, 0.001f);
+                nearFloat(g_ghost->m_currentSlopeYVelocity, real->m_currentSlopeYVelocity, 0.001f) &&
+                // v1.6.5: el rect de GameObject ES la hitbox que usa checkCollisions.
+                // El log 21.26.35 mostro un clon 30x30 (cubo) contra un real 10x10
+                // (wave) en el spawn: el seed check anterior solo comparaba pose y
+                // flags, y daba "OK" con el hitbox roto. Sin esto, cualquier muerte
+                // del clon es contra una hitbox que el jugador real no tiene.
+                [&]() {
+                    const auto gr = g_ghost->GameObject::getObjectRect();
+                    const auto rr = real->GameObject::getObjectRect();
+                    return nearFloat(gr.size.width, rr.size.width, 0.5f) &&
+                           nearFloat(gr.size.height, rr.size.height, 0.5f);
+                }();
 
             if (!g_warnedSeed) {
                 g_warnedSeed = true;
-                log::info("[IB] first seed check: {}", seedOK ? "OK" : "MISMATCH");
+                const auto gr = g_ghost->GameObject::getObjectRect();
+                const auto rr = real->GameObject::getObjectRect();
+                log::info("[IB] first seed check: {} | ghostRect=({:.2f},{:.2f},{:.2f},{:.2f}) realRect=({:.2f},{:.2f},{:.2f},{:.2f})",
+                    seedOK ? "OK" : "MISMATCH",
+                    gr.getMinX(), gr.getMinY(), gr.getMaxX(), gr.getMaxY(),
+                    rr.getMinX(), rr.getMinY(), rr.getMaxX(), rr.getMaxY());
             }
 
             if (!seedOK) {
@@ -2275,14 +2328,12 @@ class $modify(IBPlayLayer, PlayLayer) {
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
         if (ac::g_simulating && player == ac::g_ghost) {
-            // v1.6.1: diagnostico de la muerte fantasma en estado de spawn. El log
-            // 20.22.21 registra 36 muertes del clon en el paso 1 contra un objeto con
-            // objectRight=3.00 siempre en tick 0, mientras el jugador real vive ~160
-            // ticks. Rects y posiciones del clon vs jugador real + rect/id/tipo del
-            // objeto revelan la causa exacta: (a) rect del clon != real -> hitbox del
-            // clon distinta; (b) rects iguales y el objeto solapa a ambos -> objeto
-            // que el juego real no cuenta como muerte; (c) posiciones distintas ->
-            // estado de spawn sin asentar en el clon.
+            // v1.6.1/v1.6.5: dump de la muerte del clon en la ventana de spawn. ESTE dump
+            // identifico la causa raiz (log 21.26.35): el rect del clon era 30x30 (cubo,
+            // default de PlayerObject::create sin recalcular) contra el 10x10 real de
+            // wave -> el clon solapaba al pico del spawn y moria en el paso 0. v1.6.5
+            // corrige la siembra (updatePlayerScale + copia de tamaño + seed check del
+            // rect); el dump queda para verificar el fix y diagnosticar otras causas.
             // v1.6.2: gate ampliado a g_tick<=3 (v1.6.1 solo cubria tick 0/1).
             if (ac::g_tick <= 3) {
                 const auto gr = player->GameObject::getObjectRect();
