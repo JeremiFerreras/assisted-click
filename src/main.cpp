@@ -1,4 +1,4 @@
-// Assisted Click - src/main.cpp -- v1.5.0 (band-filtered trigger corridor + cosmetic whitelist)
+// Assisted Click - src/main.cpp -- v1.6.0 (form portals modeled + 1-sample edge calibration)
 //
 // Que hace: al recibir un clic (PRESS/RELEASE) simula un jugador nativo clonado en pasos
 // medidos de PlayerObject::update, usando PlayLayer::checkCollisions del propio juego. Solo
@@ -18,6 +18,28 @@
 //  3. SimOut ahora registra minY/maxY de la trayectoria del clon.
 //  4. Diagnostico: se registra el objectID/tipo/posicion del objeto que veta (corredor,
 //     unmodeled) para saber exactamente que bloqueo cada veredicto.
+//
+// CAMBIOS v1.6.0 (arreglo del log 19.00.13: 0 SAVED en 69 clics):
+//  1. PORTALES DE FORMA modelados en el clon: cube 12, ship 13, ball 47, ufo 111, wave 660,
+//     robot 745, spider 1331, swing 1933. Antes el portal de wave (660) vetaba el corredor y
+//     marcaba la sim como unmodeled: cualquier startpos ANTES de un portal de wave bloqueaba
+//     el 100% de las predicciones (vetoedObjectID=660 en el log). Ahora handlePortal cambia
+//     los flags m_isShip/m_isBird/m_isBall/m_isDart/m_isRobot/m_isSpider/m_isSwing del clon
+//     (la fisica del modo la ejecuta el PlayerObject nativo en update), el seedGhost ya copia
+//     y restaura esos flags en cada prediccion, y el portal queda exento del veto de triggers.
+//     Los portales de GRAVEDAD (10/11/2926) siguen vetando: no se modela el flip.
+//  2. Calibracion de edges con 1 muestra (antes 2). El log mostro intentos que mueren
+//     manteniendo el click: sus releases reales casi nunca llegan mientras el jugador esta
+//     vivo, asi que el perfil tardaba ~10 intentos en calibrar (48/86 UNKNOWN eran
+//     "future-edge-history-not-calibrated"). Con 1 muestra la prediccion arranca un ciclo
+//     completo antes. No hace falta una rama extra de robustez: el sim del candidato ya corre
+//     sin edge opuesto sintetico (hold/gap mantenido hasta el horizonte) y las ramas
+//     observadas cubren el edge opuesto en el instante medido; entre ambos cubren el
+//     espacio completo de futuros del edge opuesto.
+//  3. Los edges duplicados que GD re-envia al inicio de cada intento (re-sync del estado del
+//     boton) ya no gastan predictDelay ni spamean UNKNOWN: heredan el delay activo y se
+//     encolan tal cual. La deteccion es la misma del perfil de edges (observeRawInputEdge):
+//     si el estado crudo del boton no cambia, no es un edge real.
 //
 // Tecnicas tomadas de xdBot (ZiLko/xdBot):
 //  - jugador falso creado con PlayerObject::create y anadido a m_objectLayer
@@ -142,7 +164,11 @@ namespace ac {
     constexpr float kTriggerBandYPad = 8.0f; // margen de la banda Y del veto exacto de triggers
     constexpr auto kPredictionWallBudget = std::chrono::milliseconds(6);
     constexpr int kEdgeProfileSamples = 4;
-    constexpr int kMinimumEdgeSamples = 2;
+    // v1.6.0: antes 2. Con clics que mueren manteniendo el boton, el edge opuesto real llega
+    // ~1 vez por intento; exigir 2 muestras dejaba el mod en UNKNOWN durante ~10 intentos.
+    // Con 1 muestra: el sim del candidato corre sin edge opuesto (hold/gap mantenido) y la
+    // rama observada cubre el edge opuesto en el instante medido: espacio completo cubierto.
+    constexpr int kMinimumEdgeSamples = 1;
     constexpr float kMinConservativeHalfWidth = 20.0f; // covers normal-size and rotating hitboxes
     constexpr bool kLogVerdicts = true; // veredicto por clic -> log de Geode (NO consola)
 
@@ -172,7 +198,7 @@ namespace ac {
 
         auto const& s = kStages[0];
         ac_console::line("===================================================");
-        ac_console::line("[InputBuffer] v1.5.0 LOADED (band-filtered trigger corridor; cosmetic triggers whitelisted)");
+        ac_console::line("[InputBuffer] v1.6.0 LOADED (form portals modeled; 1-sample edge calibration)");
         ac_console::line(fmt::format(
             "[InputBuffer] Starting Mode: STAGE 1 ({} All / {} Wave)", s.all, s.wave
         ));
@@ -323,16 +349,19 @@ namespace ac {
         while (values.size() > kEdgeProfileSamples) values.pop_front();
     }
 
-    void observeRawInputEdge(int key, bool down) {
+    // Devuelve true si este edge cambia el estado crudo del boton (edge real para el perfil)
+    // y false si es un duplicado: GD re-envia el estado del boton al inicio de cada intento
+    // (re-sync tras muerte/retry), y ese edge duplicado no es una muestra de timing real.
+    bool observeRawInputEdge(int key, bool down) {
         auto& profile = g_edgeProfiles[key];
         if (!profile.initialized) {
             profile.initialized = true;
             profile.lastDown = down;
             profile.pressStartTick = down ? g_physicsSerialTick : -1;
             profile.releaseTick = down ? -1 : g_physicsSerialTick;
-            return;
+            return true;
         }
-        if (profile.lastDown == down) return; // duplicate edge, not a timing sample
+        if (profile.lastDown == down) return false; // duplicate edge, not a timing sample
         if (down) {
             if (profile.releaseTick >= 0) {
                 const auto gap = g_physicsSerialTick - profile.releaseTick;
@@ -348,6 +377,7 @@ namespace ac {
             profile.releaseTick = g_physicsSerialTick;
             profile.lastDown = false;
         }
+        return true;
     }
 
     void resetEdgeProfileClocks(bool discardSamples) {
@@ -381,6 +411,10 @@ namespace ac {
             const int modeled = (n > maxRepresentableOffset) ? 0 : n;
             if (std::find(offsets.begin(), offsets.end(), modeled) == offsets.end()) offsets.push_back(modeled);
         }
+        // v1.6.0 (nota de diseño): con 1 sola muestra no hace falta anadir una rama extra
+        // "sin edge opuesto": el sim del candidato YA corre sin edge sintetico (hold/gap
+        // mantenido hasta el horizonte), y las ramas observadas cubren el edge opuesto en el
+        // instante medido. Entre ambos cubren el espacio completo de futures del edge opuesto.
         return offsets;
     }
 
@@ -481,8 +515,15 @@ namespace ac {
     // ========================================================================
     // Objetos modelados / no modelados (misma idea que xdBot: objectTypes + portalIDs)
     // ========================================================================
-    // Portales que SI se modelan (tamano y velocidad), igual que ShowTrajectory::handlePortal.
-    const std::unordered_set<int> kModeledPortals = { 101, 99, 200, 201, 202, 203, 1334 };
+    // Portales que SI se modelan (tamano, velocidad y FORMA v1.6.0), igual que
+    // ShowTrajectory::handlePortal. La forma se aplica al clon cambiando los flags m_is*
+    // en handlePortal(); la fisica del modo la calcula el PlayerObject nativo en update().
+    // El portal de gravedad (10/11/2926) NO esta: el flip no se modela (fail closed).
+    const std::unordered_set<int> kModeledPortals = {
+        12, 13, 47, 111, 660, 745, 1331, 1933, // forma: cube, ship, ball, ufo, wave, robot, spider, swing
+        101, 99,                                // mini / big
+        200, 201, 202, 203, 1334                // velocidad
+    };
 
     // Fisicos: bloques, picos, picos animados, pendientes.
     bool isPhysical(GameObject* o) {
@@ -604,7 +645,7 @@ namespace ac {
     // Un EffectGameObject de la whitelist de portales o cosmético nunca invalida la simulacion.
     bool isExemptEffectObject(GameObject* o) {
         if (!o) return true;
-        if (kModeledPortals.contains(o->m_objectID)) return true;      // velocidad/tamano modelados
+        if (kModeledPortals.contains(o->m_objectID)) return true;      // forma/velocidad/tamano modelados
         if (kCosmeticTriggerIDs.contains(o->m_objectID)) return true;   // solo visuales
         if (isAudioOnlyTrigger(o)) return true;                         // solo audio
         return false;
@@ -651,8 +692,32 @@ namespace ac {
     }
 
     // Igual que ShowTrajectory::handlePortal (gravedad omitida igual que en xdBot).
+    // v1.6.0: portales de FORMA. Solo se cambian los flags de modo del clon; la fisica de
+    // cada modo la ejecuta PlayerObject::update nativo. El seedGhost de cada prediccion
+    // restaura los flags desde el jugador real, asi que un portal aplicado en una
+    // prediccion no contamina la siguiente.
+    void setFormFlags(PlayerObject* player,
+                      bool ship, bool bird, bool ball, bool dart,
+                      bool robot, bool spider, bool swing) {
+        player->m_isShip = ship;
+        player->m_isBird = bird;
+        player->m_isBall = ball;
+        player->m_isDart = dart;
+        player->m_isRobot = robot;
+        player->m_isSpider = spider;
+        player->m_isSwing = swing;
+    }
+
     void handlePortal(PlayerObject* player, int id) {
         switch (id) {
+            case 12:  setFormFlags(player, false, false, false, false, false, false, false); break; // cube
+            case 13:  setFormFlags(player, true,  false, false, false, false, false, false); break; // ship
+            case 47:  setFormFlags(player, false, false, true,  false, false, false, false); break; // ball
+            case 111: setFormFlags(player, false, true,  false, false, false, false, false); break; // ufo
+            case 660: setFormFlags(player, false, false, false, true,  false, false, false); break; // wave
+            case 745: setFormFlags(player, false, false, false, false, true,  false, false); break; // robot
+            case 1331: setFormFlags(player, false, false, false, false, false, true,  false); break; // spider
+            case 1933: setFormFlags(player, false, false, false, false, false, false, true);  break; // swing
             case 101: player->togglePlayerScale(true, true);  player->updatePlayerScale(); break;
             case 99:  player->togglePlayerScale(false, true); player->updatePlayerScale(); break;
             case 200: player->m_playerSpeed = 0.7f; break;
@@ -1907,7 +1972,7 @@ class $modify(IBBaseLayer, GJBaseGameLayer) {
         int delay = 0;
         auto* player = layer->m_player1;
         const int key = ac::buttonKey(button, isPlayer1);
-        ac::observeRawInputEdge(key, down);
+        const bool rawEdgeChanged = ac::observeRawInputEdge(key, down);
         auto keyIt = ac::g_keys.find(key);
         const bool keyPending = keyIt != ac::g_keys.end() && keyIt->second.pending > 0;
         auto activeIt = ac::g_activePressDelay.find(key);
@@ -1922,6 +1987,14 @@ class $modify(IBBaseLayer, GJBaseGameLayer) {
                 ++ac::g_skipOther;
             } else if (down && hasActivePress) {
                 // Duplicate down edge while this hold is active: do not independently retime it.
+                delay = inheritedDelay;
+                ++ac::g_skipOther;
+            } else if (!rawEdgeChanged) {
+                // v1.6.0: GD re-delivers the button state at the start of every attempt
+                // (re-sync after death/retry). The raw button state did not change, so this is
+                // not a real input edge: it carries no new timing evidence and must not spend
+                // the prediction budget. Pass it through with the inherited shift, like any
+                // other duplicate.
                 delay = inheritedDelay;
                 ++ac::g_skipOther;
             } else {
