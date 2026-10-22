@@ -45,7 +45,8 @@
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PauseLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
-#include <Geode/ui/Notifications.hpp>
+#include <Geode/loader/SettingV3.hpp>
+#include <Geode/ui/Notification.hpp>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -561,11 +562,13 @@ class $modify(BufferLayer, GJBaseGameLayer) {
                     ticksSaved, ticksSaved / 4.0f, tag, modeName(p), what,
                     s.pendingStart, step, limit));
                 // v2.0.0: ademas de consola y log, notificacion en pantalla —
-                // ver el SAVED sin abrir el log de Geode.
-                NotificationBuilder()
-                    .title("Assisted Click")
-                    .text(fmt::format("SAVED +{:.1f} ticks ({} {})", ticksSaved, modeName(p), what))
-                    .show();
+                // ver el SAVED sin abrir el log de Geode. (API de Geode 5.x:
+                // Notification::create, NotificationBuilder ya no existe.)
+                Notification::create(
+                    fmt::format("Assisted Click: SAVED +{:.1f} ticks ({} {})",
+                                ticksSaved, modeName(p), what),
+                    NotificationIcon::Success
+                )->show();
             }
         }
     }
