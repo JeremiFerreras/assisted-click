@@ -1,450 +1,74 @@
-// Assisted Click - src/main.cpp -- v1.8.1 (buffer reactivo de respaldo + predictor original)
+// Assisted Click - src/main.cpp -- v2.0.0 (REESCRITURA COMPLETA al sistema de buffer probado:
+//                                       buffering de clic ciego, sin clon ni simulacion)
 //
-// CAMBIOS v1.8.1 (integracion selectiva del buffer funcional de referencia):
-//  1. Cubo/bola/robot/spider: los presses tempranos quedan pendientes hasta suelo/orbe;
-//     si hubo release antes del contacto, se emite un tap corto al llegar.
-//  2. Ship/UFO/swing: los releases demasiado rapidos esperan el minimo de ticks.
-//  3. Wave: usa una rejilla determinista por ticks tras 16 ticks de spawn grace; evita
-//     depender del simulador de trayectorias en el modo mas sensible al timing.
-//  4. El predictor nativo anterior se conserva para el resto de eventos no cubiertos.
+// QUE HACE (el sistema nuevo, verificado funcionando):
+//  - MODOS DE SUELO (cubo, bola, robot, arana): si pulsas en el aire sin tocar un orbe, el
+//    clic queda PENDIENTE hasta que tocas suelo o un orbe; ahi se aplica (y se suelta en
+//    el mismo paso). Ese es el "SAVED": el clic que llego antes de tiempo se aplica en el
+//    momento correcto. Ventana: `stage` (2/4/8/16 ticks u Off).
+//  - MODOS DE VUELO: un release demasiado temprano se retrasa hasta el hold minimo del
+//    modo (MIN-HOLD), evitando toques que no mueven nada.
+//  - WAVE: tres modos — Grid (cuantiza press/release a una rejilla de N steps: cada
+//    celda tiene un unico input), Min Gap (minimo N steps entre release y press) y
+//    Min Hold (desactivado). Tras un spawn hay GRACE de 16 ticks sin cuantizar.
+//  - DUAL: el clic de P1 se reenvia a P2 solo si P2 esta en modo de suelo (un rescate
+//    de cubo no debe hacer tap en un wave).
+//  - Todo cuenta en STEPS de fisica (240Hz): la ventana en ticks se escala por TPS
+//    (60..1000), para convivir con Click Between Frames.
+//  - Estado completo que se limpia en muerte/restart/checkpoint (resetEpoch) y
+//    botones atascados liberados al reiniciar.
 //
-// Que hace: conserva el simulador clonado de PlayerObject::update y las colisiones nativas,
-// pero usa buffering reactivo en los casos principales cubiertos por el mod de referencia.
-// El simulador sigue buscando retrasos solo contra geometria fisica estatica repetible; no
-// modela la fase subtick de CBF/Click Between Steps, que debe desactivarse durante las pruebas.
+// POR QUE SE REESCRIBIO: las versiones 1.x usaban un clon + simulacion nativa para
+// PREDECIR si retrasar un clic salvaba (corredor de validacion, vetos de triggers,
+// reality checks). Ese motor nunca produjo un SAVED real y su complejidad no aporta:
+// el buffer ciego logra el mismo objetivo (que el clic llegue en el momento util)
+// sin predecir nada. Todo el maquinario 1.x de PREDICCION (clon, seedGhost, simulate,
+// vetos, reality checks, compuerta de autorizacion) se ELIMINO por diseño. Lo que NO
+// era del predictor SE CONSERVA: la consola en vivo de Windows (ac_console, heredada
+// del 1.x tal cual: AllocConsole + WriteConsoleA), el banner de carga, los mensajes
+// de hotkeys y el STATUS con contador de saves.
 //
-// CAMBIOS v1.5.0 (arreglo del bloqueo masivo "unsupported-effect-object-in-corridor"):
-//  1. El veto de triggers en el corredor ya no rechaza TODO EffectGameObject en el rango X.
-//     Ahora: (a) los triggers detras del jugador no cuentan (X siempre crece en modo clasico),
-//     (b) los triggers puramente visuales/audio estan en whitelist (color/pulse/alpha/shake/
-//     animate/hide-show player, SFX/song) porque no pueden alterar la fisica ni via cadenas de
-//     spawn, y (c) solo cuentan los triggers dentro de la banda Y alcanzable por las
-//     trayectorias simuladas (banda exacta = union de los minY/maxY de todas las sims).
-//  2. Veto temprano con banda conservadora (baseline + excursion maxima de candidato y
-//     estres de release) para no gastar el presupuesto de busqueda cuando hay un trigger
-//     fisico evidente; veto exacto post-candidato antes de autorizar el SAVED.
-//  3. SimOut ahora registra minY/maxY de la trayectoria del clon.
-//  4. Diagnostico: se registra el objectID/tipo/posicion del objeto que veta (corredor,
-//     unmodeled) para saber exactamente que bloqueo cada veredicto.
+// REQUISITOS EN mod.json (settings que lee este archivo):
+//   stage ("2 ticks"/"4 ticks"/"8 ticks"/"16 ticks"/"Off", default "4 ticks"),
+//   tps ("60".."1000", default "240"), wave-mode ("Min Hold"/"Min Gap"/"Grid",
+//   default "Grid"), cube/ball/robot/spider/ship/ufo/swing/wave-ticks (int, -1 = como
+//   stage), key-stage/key-tps-up/key-tps-down/key-debug/key-wave ("F1".."F12",
+//   "Insert", "Delete", "Home", "End", "Page Up", "Page Down", "None"), debug (bool).
 //
-// CAMBIOS v1.6.0 (arreglo del log 19.00.13: 0 SAVED en 69 clics):
-//  1. PORTALES DE FORMA modelados en el clon: cube 12, ship 13, ball 47, ufo 111, wave 660,
-//     robot 745, spider 1331, swing 1933. Antes el portal de wave (660) vetaba el corredor y
-//     marcaba la sim como unmodeled: cualquier startpos ANTES de un portal de wave bloqueaba
-//     el 100% de las predicciones (vetoedObjectID=660 en el log). Ahora handlePortal cambia
-//     los flags m_isShip/m_isBird/m_isBall/m_isDart/m_isRobot/m_isSpider/m_isSwing del clon
-//     (la fisica del modo la ejecuta el PlayerObject nativo en update), el seedGhost ya copia
-//     y restaura esos flags en cada prediccion, y el portal queda exento del veto de triggers.
-//     Los portales de GRAVEDAD (10/11/2926) siguen vetando: no se modela el flip.
-//  2. Calibracion de edges con 1 muestra (antes 2). El log mostro intentos que mueren
-//     manteniendo el click: sus releases reales casi nunca llegan mientras el jugador esta
-//     vivo, asi que el perfil tardaba ~10 intentos en calibrar (48/86 UNKNOWN eran
-//     "future-edge-history-not-calibrated"). Con 1 muestra la prediccion arranca un ciclo
-//     completo antes. No hace falta una rama extra de robustez: el sim del candidato ya corre
-//     sin edge opuesto sintetico (hold/gap mantenido hasta el horizonte) y las ramas
-//     observadas cubren el edge opuesto en el instante medido; entre ambos cubren el
-//     espacio completo de futuros del edge opuesto.
-//  3. Los edges duplicados que GD re-envia al inicio de cada intento (re-sync del estado del
-//     boton) ya no gastan predictDelay ni spamean UNKNOWN: heredan el delay activo y se
-//     encolan tal cual. La deteccion es la misma del perfil de edges (observeRawInputEdge):
-//     si el estado crudo del boton no cambia, no es un edge real.
-//
-// CAMBIOS v1.6.1 (arreglo del log 20.22.21: 36 muertes fantasma del clon en el spawn):
-//  El log muestra 36 baselines que mueren en el PASO 1 contra un objeto con
-//  objectRight=3.00, siempre en tick 0 (primer clic tras reaparecer), con todos los
-//  retrasos candidatos muriendo tambien en el paso 1 (bestDelay=1, surviveSteps=1),
-//  mientras el jugador real vive ~160 ticks. La simulacion a mitad de nivel funciona
-//  (tick 30/52 -> NO-IMMEDIATE-DEATH), asi que el problema esta en el estado de
-//  arranque del clon, no en el buscador. Mientras no se identifique el objeto exacto,
-//  el mod deja de gastar presupuesto buscando retrasos contra una muerte que no
-//  existe en la realidad:
-//  1. DIAGNOSTICO: en cada muerte del clon con el intento recien arrancado (g_tick<=1)
-//     se registra el rect del clon, el rect del jugador real y el rect/id/tipo del
-//     objeto que mata. Con un log se identifica si es (a) hitbox distinta del clon,
-//     (b) estado de spawn sin asentar, o (c) objeto que el juego real no mata.
-//  2. GUARD DE MUERTE FANTASMA: tras un baseline que muere, se programa
-//     g_physicsSerialTick + pasos + 3; si ese serialTick llega con el jugador real
-//     vivo y sin edges nuevos de input, el baseline era falso: se registra
-//     PHANTOM-DEATH y las predicciones quedan en pausa (fail open, input crudo) hasta
-//     que un baseline vuelva a coincidir con la realidad (NO-IMMEDIATE-DEATH) o el
-//     jugador muera de verdad dentro de la ventana prevista.
-//  3. GUARD DE SPAWN: si el baseline muere en <=2 pasos con g_tick<=1, se devuelve
-//     UNKNOWN("baseline-death-at-spawn-state") sin buscar: el estado de spawn del
-//     clon no es de confianza. Esto elimina los 36 falsos NO-SOLUTION.
-//  4. El veredicto UNKNOWN por objeto unmodeled ahora pega el ID/tipo del objeto en
-//     la misma linea (antes habia que buscar la linea "sim step" anterior).
-//  Siguen fail-closed a proposito: pads (35/67/140/1332), orbes y teletransporte
-//  (747): son interacciones fisicas que la simulacion estatica no puede certificar.
-//
-// CAMBIOS v1.6.2 (el guard de v1.6.1 tapaba la causa; ahora valida el modelo contra la realidad):
-//  v1.6.1 detectaba la muerte fantasma y se negaba a actuar, pero (1) bloqueaba tambien
-//  muertes REALES en spawn (startpos pegada a un pico), (2) la pausa era global y pegajosa
-//  (bloqueaba saves reales a mitad de intento), (3) un SAVED sobre un baseline falso nunca
-//  se verificaba, (4) los gates g_tick<=1 eran demasiado estrechos y (5) STAGE 1 (limite 2)
-//  hace casi imposible un SAVED en wave. v1.6.2 reemplaza el guard de muerte fantasma por
-//  un CHEQUEO DE REALIDAD que valida TODO el modelo, no solo las muertes:
-//  1. TRAYECTORIA: cada baseline Safe (KEPT) y cada SAVED arma un chequeo con la posicion
-//     final del clon (endX/endY/steps); cuando el serialTick llega, la posicion del jugador
-//     real debe coincidir (+-kRealityPositionTolerance). Si difiere (o muere), el modelo
-//     diverge: MODEL-DIVERGENCE, pausa y log con posiciones esperadas vs reales. Esto
-//     detecta fantasmas en tick 2/3, SAVED falsos y falsos NO-IMMEDIATE-DEATH.
-//  2. MUERTE PREVISTA: los baselines que mueren siguen programando su muerte esperada;
-//     si el jugador real muere dentro de la ventana, el baseline acerto (se libera la
-//     pausa y, si steps<=2, g_spawnDeathsReal=true DESACTIVA el guard de spawn: una
-//     startpos pegada a un pico deja de dar UNKNOWN en cada intento). Si el jugador
-//     sigue vivo: PHANTOM-DEATH confirmada, pausa.
-//  3. PAUSA ACOTADA: la pausa solo bloquea clics con g_tick<=3 (ventana de spawn). Los
-//     clics a mitad de intento buscan normalmente aunque el modelo este pausado, y si
-//     su trayectoria coincide con la realidad, la pausa se libera.
-//  4. GATES AMPLIADOS: el dump CLONE-DEATH y el guard de spawn cubren g_tick<=3, no solo
-//     tick 0/1.
-//  5. STAGE INICIAL 3 (8/8): el limite 2 de STAGE 1 casi nunca deja ventana de 3 clears
-//     en wave. F6 sigue ciclando 2/2 -> 4/4 -> 8/8 -> 16/8 -> OFF.
-//  6. BANDA Y DEL VETO TEMPRANO: en wave la excursion vertical por tick es |dx| (~1.3),
-//     no el suelo 3.5 de los otros modos; con el suelo se inflaba la banda y vetaba
-//     triggers inalcanzables. Floor 96 -> 48 (el veto exacto post-candidato sigue de
-//     respaldo fail-closed).
-//
-// CAMBIOS v1.6.3 (revision del chequeo de realidad: el v1.6.2 era solo observacional):
-//  1. OFF-BY-ONE DEL DEADLINE: el clon hace steps-1 updates reales (el ultimo paso
-//     solo chequea colision y sale antes del update), pero el deadline sumaba steps
-//     completos: el jugador real se comparaba con un update de ventaja. En wave el
-//     desfase (~1.3) cabia en la tolerancia, pero en cubo/ball cayendo supera 3 y daba
-//     MODEL-DIVERGENCE falsos. Ahora el deadline es serial + max(1, steps - 1).
-//  2. TRAYECTORIA POR PASO: casi ningun chequeo llegaba a resolverse en wave (cualquier
-//     edge nuevo lo cancelaba, y en wave los edges llegan cada pocos ticks). Ahora
-//     simulate() guarda la posicion del clon en CADA paso y, cuando llega el siguiente
-//     edge real, se compara la posicion del jugador real contra el paso correspondiente:
-//     el chequeo se resuelve (match o divergencia) aunque el edge llegue mucho antes
-//     del deadline. La pausa tambien se libera con un match en el edge.
-//  3. GATE DE SAVED: la validacion v1.6.2 era solo observacional: si el modelo divergia
-//     a mitad de intento, el mod seguia autorizando retrasos. Ahora un SAVED exige
-//     kMinTrajectoryMatchesForSave coincidencias de trayectoria consecutivas y que no
-//     haya una divergencia en los ultimos kDivergenceSaveCooldownTicks serial ticks.
-//     Mientras el modelo no este validado, los clics con baseline mortal devuelven
-//     UNKNOWN("save-authorization-unvalidated-model") y pasan crudos (fail open).
-//     Un baseline Safe (KEPT) sigue funcionando y acumula las coincidencias que
-//     desbloquean los SAVED.
-// CAMBIOS v1.6.4 (cuatro bugs del v1.6.3 que iban a seguir fallando):
-//  1. ANTIVENENO DEL GATE: cada PHANTOM-DEATH al reaparecer (una por clic de spawn en
-//     el escenario del log 20.22.21) ponia g_trajectoryMatches=0 y arrancaba el
-//     cooldown de 120 ticks: con intentos de ~160 ticks el gate casi nunca se abria.
-//     Ahora el chequeo recuerda si se armo dentro de la ventana de spawn
-//     (armedInSpawnWindow, g_tick<=3) y un PHANTOM-DEATH de spawn NO envenena la
-//     validacion acumulada: las muertes fantasma del estado de spawn son un problema
-//     ya conocido y aislado, no evidencia contra el modelo a mitad de nivel.
-//  2. DEADLOCK DEL ESCAPE DE SPAWN: una muerte real que coincide con la prevista no
-//     sumaba evidencia. Con una startpos pegada a un pico el primer clic ya es el
-//     mortal, nunca hay KEPT previo y el gate no se abria jamas. Ahora la muerte
-//     confirmada (++g_trajectoryMatches) tambien valida el modelo.
-//  3. TRAYECTORIA DEL SAVED VACIA: "out = {SimResult::Safe, step+1}" reasignaba TODO
-//     el SimOut y borra out.traj: chosenTraj llegaba vacio y la validacion por edge
-//     de los SAVED se descartaba sin evidencia. Ahora se asignan solo result/steps.
-//  4. TOLERANCIA ESTRICTA: el clon ejecuta el mismo PlayerObject::update desde el
-//     mismo estado, asi que la coincidencia deberia ser casi exacta; con 3.0 un error
-//     de fase de un update entero en wave (~1.3) pasaba por match. Bajada a 0.5:
-//     si el log muestra divergencias falsas, subir gradualmente.
-//  5. IDENTIDAD DEL OBJETO DE MUERTE: m_objectID es el TIPO, no la instancia (dos
-//     picos cualquiera "coincidian"). Ahora se compara el puntero del GameObject y
-//     se guarda en RealityCheck.
-//  6. BINDING: getCurrentXVelocity() (el que ya usa simulate()) en vez de m_xVelocity.
-// CAMBIOS v1.6.5 (CAUSA RAIZ de la muerte fantasma en spawn, confirmada por el log
-// 21.26.35 con el dump CLONE-DEATH):
-//    CLONE-DEATH ghost=(0,105) rect=(-15,90,15,120) | real=(0,105) rect=(-5,100,5,110)
-//    | obj id=8 type=2 rect=(-3,99,3,111)
-//  El clon muere en el paso 1 porque su rect de GameObject ES 30x30 (hitbox de cubo
-//  por defecto de PlayerObject::create) mientras el jugador real ES 10x10 (hitbox
-//  de wave). Es la hipotesis (a) del v1.6.1: HITBOX DISTINTA DEL CLON. La siembra
-//  copiaba los flags de modo (m_isDart etc.) pero NO el estado de tamaño del rect,
-//  que PlayerObject::create deja en cubo 30x30 y solo lo actualiza el juego nativo
-//  al cambiar de modo. Como el rect equivocado solapa al pico del spawn, el clon
-//  muere en el paso 0 ANTES de que cualquier retraso de input aplique: bestDelay=1,
-//  surviveSteps=1 para TODOS los candidatos (por eso ningun SAVED era posible).
-//  El resto del log valida el diseno v1.6.3: escape spawnReal=1 tras la primera
-//  muerte real confirmada, matches 1..5 acumulando, gate abierto, 0 phantom-deaths,
-//  y las muertes reales coincidiendo con las previstas (deathX=1.30 vs 0.00).
-//  FIX:
-//  1. seedGhost ahora copia el estado de tamaño (m_width/m_height, con guarda de
-//     binding) y llama a updatePlayerScale() para que el juego nativo recalcule el
-//     rect del clon desde los flags de modo copiados (la misma funcion que usan los
-//     portales).
-//  2. El seed check verifica el RECT del clon contra el del jugador real (antes
-//     solo comparaba pose/velocidad/flags y pasaba "OK" con el hitbox roto). Si el
-//     rect difiere, la prediccion falla cerrado (ghost-seed-mismatch) y el primer
-//     log muestra ambos rects.
-//  3. El dump CLONE-DEATH queda como diagnostico (la causa ya esta identificada).
-//  4. ESCAPE DE SPAWN VERIFICADO: g_spawnDeathsReal se podia activar por casualidad
-//     (morir de verdad en los ~4 ticks siguientes por cualquier causa desactivaba el
-//     guard para TODO el nivel). Ahora la muerte real debe coincidir con la prevista:
-//     mismo objectID y deathX dentro de kRealityDeathXTolerance; si no, no hay escape.
-//  5. BANDA Y TRAS RESET: g_lastDx es 0 justo despues de un reset y el floor 0.5 de
-//     wave subestimaba la excursion. Fallback: |m_xVelocity| * g_stepDt (velocidad
-//     nativa medida del jugador real).
-//  6. Los UNKNOWN por pads/orbes/teletransporte (35/67/140/1332/747) siguen ahi A
-//     PROPOSITO: fisica que la simulacion estatica no puede certificar (fail closed).
-//
-// CAMBIOS v1.7.0 (CAUSA RAIZ #2, confirmada por el log 21.44.12 con v1.6.5):
-//    first seed check: OK | ghostRect=(-5,100,5,110) realRect=(-5,100,5,110)
-//    CLONE-DEATH ghost=(0.00,105.00) ... obj id=8 rect=(-3,99,3,111)
-//  El fix de hitbox del v1.6.5 FUNCIONO (clon 10x10 = real 10x10) y el clon SIGUIO
-//  muriendo en (0,105) al paso 0/1... mientras el jugador real muere en x=1.30 (tras
-//  UN update) o sobrevive. El clon moria en la POSICION DE SIEMBRA sin haberse
-//  movido jamas. El loop de simulacion ejecutaba checkCollisions ANTES del update de
-//  cada paso; el juego real hace lo contrario (GJBaseGameLayer::update decompilado,
-//  camila314/gdp): por cada paso de fisica el orden es resetCollisionLog ->
-//  updateInternalActions -> PlayerObject::update -> checkCollisions -> updateSpecial
-//  -> updateRotation. El jugador real NUNCA es chequeado en la posicion del spawn:
-//  siempre se mueve primero. El clon, con el orden invertido, era chequeado contra
-//  el pico del spawn con el rect 10x10 solapandolo y moria al paso 0 — por eso TODA
-//  simulacion en ese nivel daba baseDeathStep=1 / NO SAFE CLEARANCE.
-//  FIX:
-//  1. Orden nativo por paso: aplicar inputs vencidos -> reset de logs ->
-//     updateInternalActions(dt/60) -> update(dt) -> checkCollisions -> cruce ->
-//     updateSpecial(dt/60) -> updateRotation(dt). El clon hace exactamente `steps`
-//     updates hasta morir/cruzar, igual que el jugador real.
-//  2. dt del juego verificado en el decompile: update recibe physicsSecond (0.25,
-//     lo que ya midamos); updateInternalActions/updateSpecial reciben physicsDelta
-//     (= dt/60); updateRotation recibe dt. Todo requiere-guardado por si el binding
-//     no expone la funcion.
-//  3. Inputs: se aplican dentro del paso de su tick (antes del update). NOTA v1.7.1:
-//     la sub-fase exacta SI importa; el split beforeCollision se restaura en v1.7.1
-//     (inmediatos antes de updateInternalActions, encolados entre
-//     updateInternalActions y update, como dispatchPending en el juego real).
-//  4. DEADLINES SIN OFF-BY-ONE: con el orden nativo el clon ejecuta `steps` updates
-//     (antes steps-1); los deadlines del chequeo de realidad pasan a serial+steps
-//     sin compensaciones.
-//  5. traj[k] = posicion tras `k` updates incluyendo el paso final (muerte/cruce):
-//     el chequeo por edge compara el paso exacto y el ultimo punto ya no falta.
-//  6. Se elimina updatePlayerScale() por paso (el juego no lo llama por paso; los
-//     portales ya lo hacen via handlePortal).
-//
-// CAMBIOS v1.7.1 (auditoria contra el decompile camila314/gdp rama 2.2):
-//  GJBaseGameLayer::update, por jugador y por paso de fisica: resetTouchedRings ->
-//  resetCollisionLog -> updateInternalActions(physicsDelta) -> update(physicsSecond)
-//  -> checkCollisions(p, physicsSecond, ...) -> updateSpecial(physicsDelta) ->
-//  updateRotation(physicsDelta*60). Hallazgos y correcciones:
-//  1. ORDEN DE RESETS: el juego llama resetTouchedRings ANTES de resetCollisionLog
-//     (v1.7.0 lo hacia al reves). Corregido al orden nativo.
-//  2. SPLIT DE INPUTS RESTAURADO (el punto 3 del v1.7.0 era impreciso): el input
-//     inmediato (handleButton sincrono, entre pasos) ocurre ANTES de los resets y de
-//     updateInternalActions; los encolados los inyecta dispatchPending desde el hook
-//     de PlayerObject::update, o sea DESPUES de updateInternalActions y ANTES del
-//     cuerpo nativo de update. El loop aplica los eventos beforeCollision antes de
-//     updateInternalActions y el resto justo antes de update. Los flags de SimEvent
-//     ya llevaban esta informacion (los encolados nacen con beforeCollision=false).
-//  3. VERIFICADO en PlayerObject_collidedWithObjectInternal: la hitbox mortal de
-//     hazards es getObjectRect(0.3, 0.3) (nucleo del jugador escalado a 30%). Como el
-//     mod delega en checkCollisions nativo, esa semantica es exacta sin re-implementar
-//     nada; con el orden nativo del paso el clon es chequeado donde el real lo seria
-//     (el wave real con nucleo 3x3 pasa raspando el pico id=8 y sobrevive).
-//  4. VERIFICADO: la muerte del clon llega via
-//     GameManager->m_playLayer->destroyPlayer(this, nullptr) desde
-//     collidedWithObjectInternal; el hook del mod la intercepta (g_simulating) y
-//     retorna sin efectos secundarios, tal como muestran los logs CLONE-DEATH.
-//  5. VERIFICADO: updateRotation recibe physicsDelta*60 = physicsSecond = dt, igual
-//     que la llamada updateRotation(dt) del loop; m_didReset del clon permanece false
-//     durante la simulacion (checkCollisions corre como en el juego).
-//
-// CAMBIOS v1.7.2 (validado por el log 15.36.03 con v1.7.1 en ejecucion):
-//  EL FIX DEL ORDEN FUNCIONA. Fase 1 (nivel de prueba, spawn (0,105) pico id=8):
-//  CLONE-DEATH ghost=(1.30,106.30) — el clon ya NO muere en la siembra: muere tras 1
-//  update exactamente donde el jugador real; "real death matches the predicted one
-//  (deathX=1.30 vs 1.30, objectID=8): baseline matched reality"; 11-12 matches, 0
-//  phantom deaths, 0 divergencias; spawn guard confirmo la muerte real y se desactivo
-//  para ese nivel. Los skips "other=1" de esa fase son re-sincronizaciones de boton
-//  tras cada retry (por diseño, no bugs).
-//  PERO la fase 2 (wave MINI) destapo este bug:
-//  1. first seed check MISMATCH con ghostRect=(-5,100,5,110) (10x10, full) contra
-//     realRect=(-3,102,3,108) (6x6, mini x0.6). El fail-closed funciono (UNKNOWN
-//     ghost-seed-mismatch, ningun delay reenviado) pero en secciones mini no hay
-//     asistencia. Causa: updatePlayerScale() recalcula el tamaño del clon desde su
-//     propio estado; si m_vehicleSize no llega copiado (AC_COPY requires-guardado:
-//     se salta en silencio si el binding no expone el campo) o el recalculo pisa los
-//     m_width/m_height copiados con el default full, el clon vuelve a 10x10.
-//  2. FIX: tras updatePlayerScale() se IMPONE el tamaño del jugador real:
-//     re-copia de m_vehicleSize (guardada), re-copia de m_width/m_height (guardada)
-//     y setScale(src->getScale()) para la escala del nodo. El estado impuesto es
-//     exactamente el que el seed check compara, asi que el siguiente log confirma
-//     o refuta el fix con evidencia.
-//  3. El log del seed check ahora incluye "scale ghost=... real=..." para
-//     diagnosticar de un vistazo si el tamaño vuelve a divergir.
-//
-// CAMBIOS v1.7.3 (analisis completo del log 15.56.39: veredicto por cada bloqueo):
-//  A. FIX MINI NATIVO — el v1.7.2 NO surtio efecto (107 seed checks MISMATCH en el log,
-//     ghostRect 10x10 vs realRect 6x6 con scale ghost=real=0.600). Ni la copia
-//     requires-guardada de m_width/m_height ni updatePlayerScale() reproducen el tamaño
-//     mini del clon: el binding no expone esos campos como asignables (el requires salta
-//     en silencio) y updatePlayerScale() recalcula desde un estado mini que nunca llego
-//     al clon. El camino NATIVO del juego para mini es togglePlayerScale(isMini, true) +
-//     updatePlayerScale() — el MISMO que ya usa el handler de portales del mod (case
-//     101/99) — y es el unico que recalcula la hitbox completa. Ahora seedGhost lo
-//     ejecuta tras copiar los flags de modo; las copias de respaldo quedan despues.
-//  B. VEREDICTO DEL ESCENARIO DE SPAWN: el "NO SAFE CLEARANCE" era CORRECTO. El log
-//     demuestra que el spawn (0,105) esta DENTRO del rect del pico id=8 (-3,99,3,111):
-//     el nucleo 3x3 del jugador ya lo solapa en X e Y en la siembra, y el jugador REAL
-//     muere al tick 1 tanto PRESIONANDO (y=106.30) como SOLTANDO (y=103.70, muerte real
-//     confirmada contra el mismo pico). La onda 1x solo se mueve +-1.3/tick en Y y
-//     necesita 7.5 unidades para salir de la franja 99..111 del pico, pero X despeja el
-//     pico recien al tick 4: TODA temporizacion (delays 1..8) muere al paso 1. El
-//     simulador TS que "validaba" delays >=3 usaba una zona mortal equivocada (solo la
-//     franja superior del pico); el juego real (checkCollisions nativo + muertes reales
-//     confirmadas) mata con el rect completo. Ese nivel de prueba NO tiene solucion POR
-//     DISENO: el mod esta funcionando y el modelo coincide con la realidad (matches
-//     acumulando, 0 divergencias, 0 phantom deaths).
-//  C. DIAGNOSTICO "IMPOSSIBLE SPAWN": cuando todos los candidatos mueren al mismo paso
-//     que el baseline en la ventana de spawn y el nucleo ya solapa la hitbox del objeto
-//     mortal en la siembra, el mod lo declara en consola y en el log: ese clic NO es
-//     salvable retrasandolo; hay que probar con un spawn FUERA de la hitbox del hazard.
-//  D. La compuerta save-authorization se abre sola con 2 muertes confirmadas (visto en
-//     el log: matches=1 -> 2 y la busqueda arranco); no se cambia.
-//
-// CAMBIOS v1.8.0 (version LIMPIA: solo la idea original, a peticion del usuario):
-//  A. ELIMINADO el overlay de trayectoria del futuro (v1.7.4): funciones, constantes
-//     kTraj*, globals, tecla F8 y el refresco desde el hook de update. La sim funciona
-//     igual: el overlay solo era visual.
-//  B. ELIMINADO el diagnostico NO-SOLUTION / IMPOSSIBLE SPAWN (v1.7.3): cuando la
-//     busqueda no encuentra retraso seguro, simplemente pasa el input crudo (fail
-//     open) como en la idea original, sin console ni log.
-//  C. LOG SILENCIADO: TODO el log::debug/info/warn pasa por ac_dbg() (no-op). El log
-//     de geode solo registra los SAVED (log::info). Adiós al spam de veredictos,
-//     seed checks, vetos y CLONE-DEATH por clic.
-//  D. CONSOLA = LO IMPORTANTE: banner de carga, F6 (stage), F7 (status) y los
-//     *** SAVED *** (que siguen con su detalle de ticks/frames).
-//  E. Se CONSERVAN todas las correcciones de fondo de v1.7.5/v1.7.6 (fix hitbox mini
-//     con toggle nativo antes de las copias, pads nativos modelados, fallback de
-//     perfil de edges) porque son parte del motor, no diagnostico.
-//
-// CAMBIOS v1.7.6 (investigacion profunda "factor comun de 0 SAVEDs" — reconstruccion
-//                  verificada contra decompile y mapeos de objetos de la comunidad):
-//  A. PADS NATIVOS MODELADOS (decompile GJBaseGameLayer::collisionCheckObjects): los
-//     pads aplican bumpPlayer/gravBumpPlayer AL PlayerObject QUE COLISIONA — fisica
-//     pura que el clon puede ejecutar igual que el juego real. El pad amarillo
-//     (id 35, type 8 = YellowJumpPad) generaba 41 UNKNOWNs en los logs: cualquier
-//     corredor con un pad era inautorizable. Ahora isModeled() cubre los 5 tipos de
-//     pad y el hook canBeActivatedByPlayer devuelve true para el clon+pad (el boost
-//     se aplica con getBumpMod nativo, que incluye el factor mini — sinergia con el
-//     fix de v1.7.5). Efectos contenidos: playBumpEffect (!m_isInPlayLayer),
-//     gameEventTriggered/playShineEffect ya suprimidos, bits de activacion restaurados
-//     por ActivationGuard.
-//  B. FALLBACK DE PERFIL DE EDGES: sin suficientes muestras de hold/gap medidas,
-//     futureEdgeOffsets() devolvia vacio -> "UNKNOWN (edge history 0/2)" y la busqueda
-//     NO ARRANCABA (48 casos en un solo log). Ahora se estresa con edges genericos
-//     (4/12/24 ticks ~ 16/50/100ms) hasta tener muestras reales.
-//  C. CONFIRMADO QUE NO SE TOCA (verificado contra decompile; el veto es CORRECTO):
-//     - TeleportPortal (type 28, id 747 en el nivel de pruebas en (43,127)): cambia la
-//       trayectoria al activarse; el clon no modela el link. Veto correcto: el nivel
-//       de pruebas NO PUEDE producir SAVEDs con un teleport en el corredor.
-//     - Triggers Modifier (type 20, id 901 = MOVE): mueven geometria real; veto correcto.
-//     - Orbs/rings: requieren timing de clic del futuro; siguen fail-closed.
-//  D. Verificacion del enum GameObjectType de bindings: 8=YellowJumpPad,
-//     26=WavePortal (ya exento por kModeledPortals), 28=TeleportPortal, 20=Modifier,
-//     40=Special (id 1755, platformer).
-//
-// CAMBIOS v1.7.5 (fix DEFINITIVO del mismatch mini: por fin la causa raiz, verificada
-//                  en el decompile de 2.2081):
-//  A. CAUSA RAIZ CONFIRMADA (open-source-gd-project, PlayerObject::togglePlayerScale):
-//     el toggle setea m_playerScale Y los multiplicadores de hitbox
-//     m_spriteWidthScale/m_spriteHeightScale, PERO hace EARLY-RETURN si m_playerScale
-//     YA esta en el estado objetivo — y en ese caso NO toca los sprite scales. En
-//     v1.7.3 el toggle corria DESPUES de AC_COPY(m_vehicleSize) (= m_playerScale real,
-//     ver RENAMED_BINDINGS: "m_vehicleSize -> m_playerScale"): el clon llegaba al toggle
-//     con 0.6 ya puesto -> early-return -> sprite scales quedaban en 1.0 ->
-//     getObjectRect() = m_width*m_scaleX*1.0 = 30x30 mientras el real usa
-//     30*1.0*0.6 = 18x18. Por eso el fix de v1.7.3 "no funcionaba" con el MISMO
-//     binario: el orden lo neutralizaba.
-//  B. FIX: el togglePlayerScale(srcMini, true) nativo ahora corre AL PRINCIPIO de
-//     seedGhost, ANTES de cualquier copia de tamano, y AC_COPY(m_vehicleSize) se
-//     ELIMINA de la copia (copiarlo vuelve a dejar playerScale sin sincronizar con los
-//     sprite scales, que es exactamente el bug). La deteccion de mini lee
-//     src->m_vehicleSize (estado real del juego) y no getScale() (el nodo esta animado
-//     0.5s por CCScaleTo tras el portal; el estado ya es final).
-//  C. CINTURON Y TIRANTES: si los bindings exponen m_spriteWidthScale/m_spriteHeightScale
-//     (los multiplicadores que GameObject::getObjectRect() usa) se copian del real, y si
-//     exponen m_isObjectRectDirty (getObjectRect2 devuelve el rect CACHEADO si no esta
-//     sucio) se fuerza el recalculo. requires los salta en silencio si no existen; el
-//     toggle nativo ya hizo el trabajo de todos modos.
-//  D. OVERLAY: cuando el clon muere en <=2 pasos dentro de la ventana de spawn, la
-//     etiqueta dice "SPAWN MORTAL: IMPOSIBLE SALVAR AQUI" en vez de "MUERTE EN ~NT":
-//     el spawn esta DENTRO de la hitbox de un objeto mortal y NINGUN retraso puede
-//     salvar (log 16.46.19: 26/26 clics IMPOSSIBLE SPAWN, 0 SAVED, todos correctos).
-//
-// CAMBIOS v1.7.4 (overlay visual: el mod ahora DIBUJA el futuro y aconseja):
-//  A. OVERLAY DE TRAYECTORIA (F8, ON por defecto): cada 4 ticks de fisica se siembra el
-//     clon desde el jugador real y se simulan DOS futuros nativos de hasta
-//     kTrajHorizon pasos: (A) continuar con el input tal cual (sin nuevo edge, los
-//     edges encolados incluidos) y (B) invertir el input AHORA. El mejor de los dos se
-//     dibuja sobre el nivel en color llamativo (magenta = conviene cambiar el input,
-//     verde-cian = mantener, rojo = muerte prevista con X en el punto exacto), con
-//     puntos cada 8 pasos como regla de ticks, y una etiqueta encima del jugador dice
-//     el movimiento optimo: "MANTENER"/"NO PULSAR" (seguir tal cual), "SUELTA AHORA"/
-//     "PULSA AHORA" (invertir el input salva), o "MUERTE EN ~N T" (ambos mueren: el
-//     retraso fino lo sigue decidiendo la busqueda por clic).
-//  B. simulate() gana applyCandidateEvent=false (lookahead puro, sin evento candidato)
-//     y lookaheadSteps (horizonte propio del overlay): sin ellos el plannedSteps
-//     caeria a kHorizon+1 y el overlay dibujaria 16 pasos en vez de ~96.
-//  C. Los sims del overlay corren con el mismo seedGhost/checkCollisions nativos y
-//     ActivationGuard que las predicciones: si el seed check falla (p.ej. mini antes
-//     del fix) el overlay no dibuja nada en vez de mentir.
-//  D. Estado del boton: g_button1Down se trackea en el hook de handleButton (solo
-//     edges reales del jugador 1) para saber si el futuro debe comparar mantener vs
-//     soltar o no-pulsar vs pulsar.
-//
-// Tecnicas tomadas de xdBot (ZiLko/xdBot):
-//  - jugador falso creado con PlayerObject::create y anadido a m_objectLayer
-//  - copia amplia del estado de PlayerObject mediante seedGhost/AC_COPY; no se asume completa
-//  - por paso: input inmediato -> resets -> updateInternalActions -> inputs encolados
-//    -> update -> checkCollisions -> updateSpecial -> updateRotation (orden nativo
-//    auditado contra el decompile, v1.7.1)
-//  - mientras se simula se bloquean TODOS los efectos secundarios (sfx, triggers, aros,
-//    particulas, estela, animacion de fin de nivel...) y los objetos no modelados se
-//    desactivan solo durante la llamada de colisiones (collisionCheckObjects).
-//
-// Uso personal / offline. No sirve para enviar records a listas.
-//
-// Consola: banner, ciclos F6, estado F7 y eventos "SAVED"; el diagnóstico detallado va al log de Geode.
-
-#ifdef _WIN32
-    #ifndef WIN32_LEAN_AND_MEAN
-        #define WIN32_LEAN_AND_MEAN
-    #endif
-    #ifndef NOMINMAX
-        #define NOMINMAX
-    #endif
-    #include <windows.h>
-#endif
-
-#include <mutex>
-#include <optional>
-#include <string>
-#include <limits>
-#include <chrono>
-#include <cstdint>
+// CONSOLA/LOG: los SAVED se anuncian en la CONSOLA EN VIVO (ventana "InputBuffer -
+// Live Console", misma del 1.x), en el log de Geode (*** SAVED ***) y con una
+// notificacion en pantalla. Los hotkeys tambien escriben en la consola, y el hotkey
+// de debug muestra el STATUS completo (como el F7 antiguo). El boton "Buffer" en la
+// pausa abre los ajustes del mod.
 
 #include <Geode/Geode.hpp>
-#include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
-#include <Geode/modify/PlayerObject.hpp>
-#include <Geode/modify/CCKeyboardDispatcher.hpp>
-#include <Geode/modify/EffectGameObject.hpp>
-#include <Geode/modify/GameObject.hpp>
-#include <Geode/modify/HardStreak.hpp>
-
+#include <Geode/modify/PauseLayer.hpp>
+#include <Geode/modify/PlayLayer.hpp>
+#include <Geode/ui/Notifications.hpp>
 #include <algorithm>
 #include <cmath>
-#include <deque>
-#include <unordered_map>
-#include <unordered_set>
+#include <cstdlib>
+#include <mutex>
+#include <string>
 #include <utility>
 #include <vector>
+
+#ifdef GEODE_IS_WINDOWS
+#include <Windows.h>
+#endif
 
 using namespace geode::prelude;
 
 // ============================================================================
-// Consola (solo Windows)
+// Consola en vivo (heredada del 1.x SIN cambios: nada que ver con el predictor).
+// Adjunta una consola de Windows al proceso y escribe lineas con WriteConsoleA.
+// Nunca libera/desadjunta una consola del host u otro mod; solo crea una si el
+// proceso no tiene consola.
 // ============================================================================
 namespace ac_console {
 
-#ifdef _WIN32
+#ifdef GEODE_IS_WINDOWS
 
 static std::mutex g_mutex;
 static HANDLE g_output = INVALID_HANDLE_VALUE;
@@ -488,2905 +112,579 @@ static void line(std::string const&) {}
 
 } // namespace ac_console
 
-// ============================================================================
-// v1.8.0: LOG SILENCIADO. Todo el diagnostico que antes iba al log de geode pasa
-// por ac_dbg(), un no-op que se traga cualquier lista de argumentos. El log solo
-// conserva los SAVED (log::info) y la consola solo anuncia lo importante: banner,
-// F6/F7 y *** SAVED ***.
-// ============================================================================
-template <class... A>
-inline void ac_dbg(A&&...) {}
-
-// ============================================================================
-// Nucleo
-// ============================================================================
-namespace ac {
-
-    // ---- Etapas: ticks de actualización de PlayerObject, no sub-ticks de CBF.
-    struct Stage { int all; int wave; };
-    constexpr Stage kStages[] = { {2, 2}, {4, 4}, {8, 8}, {16, 8}, {0, 0} };
-    constexpr int kStageCount = 5;
-    // BufferMod parity: let spawn/retry inputs pass through before applying wave grid.
-    constexpr int kSpawnGraceTicks = 16;
-
-    // Ventana CRITICA: ticks que se simulan tras aplicar la entrada. La simulacion mantiene
-    // Lookahead breve para decidir si tiene sentido buscar: no es el veredicto de seguridad.
-    // La validacion posterior comprueba un corredor mayor con colisiones nativas y presupuesto.
-    // Short baseline lookahead: this is only a trigger for searching, NOT proof that
-    // a candidate is safe. Candidate validation runs until it clears the baseline hazard.
-    constexpr int kHorizon = 16; // trigger for search only; never proof of safety
-    constexpr int kMaxSimSteps = 144;   // allows a slow-speed wave to reach a nearby validation corridor
-    constexpr int kMaxStepsPerInput = 2048; // aggregate simulated ticks
-    constexpr int kMaxClearanceEstimate = 128; // max estimated physics updates to the validation corridor
-    constexpr int kMaxEdgeProfileTicks = 512; // exact interval storage cap; longer intervals use a sentinel meaning no opposite edge in the modeled horizon
-    constexpr int kPostClearanceSteps = 2; // collision samples after validation corridor
-    constexpr float kPostClearanceDistance = 24.0f; // inspect nearby chained hazards without an excessive fixed tail
-    constexpr float kHazardClearancePadding = 8.0f;
-    constexpr float kTriggerBandYPad = 8.0f; // margen de la banda Y del veto exacto de triggers
-    constexpr auto kPredictionWallBudget = std::chrono::milliseconds(6);
-    constexpr int kEdgeProfileSamples = 4;
-    // v1.6.0: antes 2. Con clics que mueren manteniendo el boton, el edge opuesto real llega
-    // ~1 vez por intento; exigir 2 muestras dejaba el mod en UNKNOWN durante ~10 intentos.
-    // Con 1 muestra: el sim del candidato corre sin edge opuesto (hold/gap mantenido) y la
-    // rama observada cubre el edge opuesto en el instante medido: espacio completo cubierto.
-    constexpr int kMinimumEdgeSamples = 1;
-    constexpr float kMinConservativeHalfWidth = 20.0f; // covers normal-size and rotating hitboxes
-    constexpr bool kLogVerdicts = true; // v1.8.0: los veredictos van a ac_dbg (no-op): el log de Geode queda limpio
-
-    // v1.6.2: empieza en STAGE 3 (8/8). STAGE 1 (limite 2) casi nunca deja una ventana
-    // de 3 clears consecutivos en wave, asi que todo clic daba NO SAFE CLEARANCE por
-    // diseño, no por bug. F6 sigue ciclando todos los stages.
-    int g_stage = 2; // empieza en STAGE 3
-
-    std::string stageText(int i) {
-        auto const& s = kStages[i];
-        if (s.all == 0) {
-            return fmt::format("STAGE {}: OFF (100% Raw Input)", i + 1);
-        }
-        if (s.all == s.wave) {
-            return fmt::format(
-                "STAGE {}: {} update ticks All | {} update ticks Wave",
-                i + 1, s.all, s.wave
-            );
-        }
-        return fmt::format(
-            "STAGE {}: {} update ticks All | {} update ticks Wave",
-            i + 1, s.all, s.wave
-        );
-    }
-
-    void showBannerOnce() {
-        static bool shown = false;
-        if (shown || !ac_console::init()) return;
-        shown = true;
-
-        auto const& s = kStages[g_stage];
-        ac_console::line("===================================================");
-        ac_console::line("[InputBuffer] v1.8.1 LOADED (buffer reactivo + predictor original; consola = SAVED)");
-        ac_console::line(fmt::format(
-            "[InputBuffer] Starting Mode: STAGE {} ({} All / {} Wave)", g_stage + 1, s.all, s.wave
-        ));
-        ac_console::line("[InputBuffer] F6: 2/2 -> 4/4 -> 8/8 -> 16/8 -> OFF | F7: status");
-        ac_console::line("[InputBuffer] Tick-based only; disable CBF / Click Between Steps / Click Between Ticks");
-        ac_console::line("===================================================");
-    }
-
-    int limitFor(PlayerObject* p) {
-        auto const& s = kStages[g_stage];
-        return (p && p->m_isDart) ? s.wave : s.all;
-    }
-
-    // The reference buffer uses reactive input timing in these modes instead of
-    // trying to certify every click through a clone simulation.
-    bool isFlightBufferMode(PlayerObject* p) {
-        return p && (p->m_isShip || p->m_isBird || p->m_isSwing);
-    }
-
-    bool isGroundBufferMode(PlayerObject* p) {
-        return p && !p->m_isShip && !p->m_isBird && !p->m_isDart && !p->m_isSwing;
-    }
-
-    int touchingRingCount(PlayerObject* p) {
-        return p && p->m_touchingRings
-            ? static_cast<int>(p->m_touchingRings->count())
-            : 0;
-    }
-
-    // ---- Estado de la partida
-    int g_tick = 0;           // updates reales del jugador 1 dentro del intento actual
-    std::int64_t g_physicsSerialTick = 0; // monotonic across retries; input intervals must not use resettable g_tick
-    float g_stepDt = 0.0f;    // mediana de dt medida, nunca asumida
-    float g_lastDx = 0.0f;
-    int g_dtStable = 0;
-    std::deque<float> g_recentDt;
-    constexpr size_t kDtCalibrationSamples = 8;
-    constexpr float kDtRelativeRangeTolerance = 0.001f; // max 0.1% de rango en toda la ventana
-    constexpr float kDtAbsoluteRangeTolerance = 0.000001f;
-
-    PlayLayer* g_layer = nullptr;
-    PlayerObject* g_ghost = nullptr;
-    PlayLayer* g_ghostOwner = nullptr;
-
-    bool g_simulating = false;
-    bool g_cloneDied = false;
-    bool g_unmodeled = false; // la simulacion toco algo que no sabe modelar
-    bool g_applyingQueuedInput = false;
-
-    // ---- Diagnostico (solo log de Geode)
-    const char* g_unknownReason = "";
-    // Identidad del primer objeto que marco la simulacion como no modelada (diagnostico).
-    int g_unmodeledObjectID = -1;
-    int g_unmodeledObjectType = -1;
-    int g_clicksSeen = 0, g_clicksPredicted = 0;
-    int g_skipOff = 0, g_skipEarly = 0, g_skipDead = 0, g_skipNoGhost = 0, g_skipOther = 0;
-    int g_statKept = 0, g_statSaved = 0, g_statNoSolution = 0, g_statUnknown = 0;
-    bool g_warnedX = false, g_warnedSeed = false, g_warnedWorld = false;
-    bool g_warnedFallbackX = false, g_warnedDualMode = false, g_warnedDeathQueue = false;
-    long long g_lastPredictionMicros = 0;
-
-    // ---- v1.6.2/v1.6.3: chequeo de realidad (valida TODO el modelo contra el mundo real) ----
-    // Dos modos:
-    //  - expectDeath=true: el baseline predijo que el jugador real muere en ~steps pasos.
-    //    Si llega el deadline vivo -> PHANTOM-DEATH (muerte fantasma del clon).
-    //  - expectDeath=false: el baseline fue Safe (KEPT) o se autorizo un SAVED; el clon
-    //    recorrio la trayectoria guardada (traj, posicion por paso). El jugador real debe
-    //    seguirla: en el deadline (paso steps, tras `steps` updates) o, si llega antes un
-    //    edge nuevo, en el paso correspondiente al edge. Si difiere -> MODEL-DIVERGENCE.
-    // v1.7.0: con el orden update->checkCollisions el clon ejecuta exactamente `steps`
-    // updates; el deadline es serial+steps sin compensaciones de off-by-one.
-    constexpr float kRealityPositionTolerance = 0.5f; // v1.6.4: era 3.0; un desfase de un update entero pasaba por match
-    // Tolerancia holgada para confirmar una MUERTE prevista: la fase subtick puede
-    // desplazar el X de la muerte real en ~1 paso respecto del clon.
-    constexpr float kRealityDeathXTolerance = 8.0f;
-    // Gate de SAVED (v1.6.3): no se autoriza ningun retraso hasta que el modelo haya
-    // demostrado N coincidencias de trayectoria seguidas, y nunca con una divergencia
-    // reciente (cooldown en serial ticks).
-    constexpr int kMinTrajectoryMatchesForSave = 2;
-    constexpr int kDivergenceSaveCooldownTicks = 120;
-    struct RealityCheck {
-        bool active = false;
-        bool expectDeath = false;
-        int steps = 0;
-        float expectX = 0.0f;
-        float expectY = 0.0f;
-        // Solo para expectDeath (v1.6.3): la muerte real debe coincidir con la prevista.
-        float expectDeathX = 0.0f;
-        int expectDeathObjectID = -1;
-        // v1.6.4: identidad de INSTANCIA (m_objectID es el tipo, no el objeto).
-        GameObject* expectDeathObject = nullptr;
-        // v1.6.4: true si el chequeo se armo dentro de la ventana de spawn (g_tick<=3).
-        // Un PHANTOM-DEATH de spawn no envenena la validacion acumulada del nivel.
-        bool armedInSpawnWindow = false;
-        bool down = false;
-        int button = 1;
-        std::int64_t armSerialTick = 0;
-        std::int64_t deadlineSerialTick = 0;
-        // Posicion del clon en cada paso (indice = pasos desde el arme). v1.6.3.
-        std::vector<std::pair<float, float>> traj;
-    };
-    RealityCheck g_realityCheck;
-    int g_phantomDeaths = 0;      // muertes fantasma confirmadas (baseline decia muerte, real vivo)
-    int g_modelDivergences = 0;   // trayectorias que no coincidieron con la realidad
-    bool g_predictionsPaused = false;
-    // v1.6.2: escape del guard de spawn. Si una muerte del jugador real en <=2 pasos
-    // llega dentro de la ventana prevista, la muerte en spawn era REAL (startpos pegada
-    // a un pico): dejar de tratar el estado de spawn como no confiable. Por nivel.
-    // v1.6.3: solo si la muerte real coincide con la prevista (mismo objeto y deathX).
-    bool g_spawnDeathsReal = false;
-    // v1.6.3: validacion del modelo acumulada en ESTE nivel. Coincidencias de
-    // trayectoria consecutivas (cualquier divergencia las pone a 0) y serial tick de la
-    // ultima divergencia. Un SAVED exige matches >= kMinTrajectoryMatchesForSave y
-    // ninguna divergencia en los ultimos kDivergenceSaveCooldownTicks.
-    int g_trajectoryMatches = 0;
-    std::int64_t g_lastDivergenceSerial = -1000000;
-
-    // v1.6.3: el modelo solo puede autorizar SAVEDs cuando ha demostrado coincidencias
-    // de trayectoria y no ha divergido recientemente. Validacion acumulada POR NIVEL.
-    bool saveAuthorizationValidated() {
-        return g_trajectoryMatches >= kMinTrajectoryMatchesForSave &&
-            (g_physicsSerialTick - g_lastDivergenceSerial) > kDivergenceSaveCooldownTicks;
-    }
-
-    // v1.6.3: resuelve un chequeo de trayectoria (!expectDeath) contra el paso en el que
-    // llego el edge. En wave los edges llegan cada pocos ticks: casi ningun chequeo
-    // llegaba al deadline. Ahora cada edge real valida el paso correspondiente y el
-    // chequeo se resuelve con evidencia (match o divergencia) en vez de cancelarse.
-    // Devuelve true si el chequeo estaba activo y se resolvio aqui.
-    bool resolveRealityCheckAtEdge() {
-        if (!g_realityCheck.active || g_realityCheck.expectDeath) return false;
-        auto* player = g_layer ? g_layer->m_player1 : nullptr;
-        if (!player || g_realityCheck.traj.empty()) return false;
-        const auto sinceArm = g_physicsSerialTick - g_realityCheck.armSerialTick;
-        if (sinceArm < 1) return false; // sin updates nuevos no hay evidencia
-        const size_t idx = static_cast<size_t>(std::min<std::int64_t>(
-            sinceArm, static_cast<std::int64_t>(g_realityCheck.traj.size()) - 1));
-        const auto& [expX, expY] = g_realityCheck.traj[idx];
-        const bool matches = !player->m_isDead &&
-            std::abs(player->getPositionX() - expX) <= kRealityPositionTolerance &&
-            std::abs(player->getPositionY() - expY) <= kRealityPositionTolerance;
-        if (matches) {
-            ++g_trajectoryMatches;
-            if (g_predictionsPaused) {
-                g_predictionsPaused = false;
-                ac_dbg("[IB] PHANTOM-GUARD released at tick {} (edge match, step {}): "
-                          "real=({:.2f},{:.2f}) expect=({:.2f},{:.2f})",
-                    g_tick, idx, player->getPositionX(), player->getPositionY(), expX, expY);
-            }
-            else {
-                ac_dbg("[IB] reality trajectory match at step {} (real=({:.2f},{:.2f}) "
-                           "expect=({:.2f},{:.2f}); matches={})",
-                    idx, player->getPositionX(), player->getPositionY(), expX, expY, g_trajectoryMatches);
-            }
-        }
-        else {
-            g_trajectoryMatches = 0;
-            g_lastDivergenceSerial = g_physicsSerialTick;
-            ++g_modelDivergences;
-            g_predictionsPaused = true;
-            ac_dbg("[IB] MODEL-DIVERGENCE at edge (step {}): real=({:.2f},{:.2f}) dead={} "
-                      "but model expected ({:.2f},{:.2f}); matches reset, predictions paused",
-                idx, player->getPositionX(), player->getPositionY(),
-                player->m_isDead ? 1 : 0, expX, expY);
-        }
-        return true;
-    }
-
-    bool g_loggedFirstUpdate = false;
-
-    std::string statusLine(const char* tag) {
-        return fmt::format(
-            "[IB] {} stage={} ghost={} tick={} dtStable={} clicks={} predicted={} kept={} saved={} "
-            "nosol={} unknown={} lastUnknown={} predictUs={} | skipped: off={} early={} dead={} noGhost={} other={} "
-            "| phantom: deaths={} divergences={} paused={} spawnReal={} matches={}",
-            tag, g_stage + 1, g_ghost ? "ok" : "NULL", g_tick, g_dtStable, g_clicksSeen,
-            g_clicksPredicted, g_statKept, g_statSaved, g_statNoSolution, g_statUnknown,
-            g_unknownReason, g_lastPredictionMicros, g_skipOff, g_skipEarly, g_skipDead, g_skipNoGhost, g_skipOther,
-            g_phantomDeaths, g_modelDivergences, g_predictionsPaused ? 1 : 0, g_spawnDeathsReal ? 1 : 0,
-            g_trajectoryMatches
-        );
-    }
-
-    enum class SimResult { Safe, Died, Unknown };
-
-    struct SimPerturbation {
-        float dtScale = 1.0f;
-        float startYOffset = 0.0f;
-        float yVelocityOffset = 0.0f;
-    };
-
-    struct SimOut {
-        SimResult result;
-        int steps;
-        float deathX = 0.0f;
-        float deathObjectRight = 0.0f;
-        bool knownPhysicalDeathObject = false;
-        GameObject* deathObject = nullptr;
-        float endX = 0.0f;
-        float endY = 0.0f;
-        // v1.6.3: posicion del clon en cada paso (indice = paso; traj[0] = posicion
-        // inicial). Usada por el chequeo de realidad para comparar el paso exacto en el
-        // que llega un edge nuevo. Solo se llena en simulaciones que completan pasos.
-        std::vector<std::pair<float, float>> traj;
-        // Recorrido vertical del clon durante la simulacion (para la banda Y del corredor).
-        float minY = 0.0f;
-        float maxY = 0.0f;
-        float endYVelocity = 0.0f;
-        float endRotation = 0.0f;
-        bool endIsDart = false;
-        bool endIsShip = false;
-        bool endIsBall = false;
-        bool endIsBird = false;
-        bool endIsRobot = false;
-        bool endIsSpider = false;
-        bool endIsSwing = false;
-        bool endIsUpsideDown = false;
-        bool endIsOnGround = false;
-        bool endJumpBuffered = false;
-        bool endInputsLocked = false;
-        bool endControlsDisabled = false;
-        bool endStateFlipGravity = false;
-    };
-
-    // Populated only when the clone dies inside PlayLayer::destroyPlayer.
-    float g_cloneDeathX = 0.0f;
-    float g_cloneDeathObjectRight = 0.0f;
-    bool g_cloneDeathObjectKnown = false;
-    GameObject* g_cloneDeathObject = nullptr;
-
-    // ---- Cola de entradas
-    struct PendingInput {
-        int tick;
-        bool down;
-        int button;
-        bool isPlayer1;
-    };
-
-    struct KeyState {
-        int lastDue = 0;
-        int pending = 0;
-    };
-
-    std::deque<PendingInput> g_queue;
-    std::unordered_map<int, KeyState> g_keys;
-
-    // Reactive fallback copied in spirit from the working GMD-Buffer-Mod:
-    // - ground modes: remember an early tap until ground/orb contact;
-    // - ship/UFO/swing: enforce a minimum hold length;
-    // - wave: schedule press/release edges on a tick grid.
-    // The existing clone predictor remains available outside these cases.
-    struct LandingBufferState {
-        bool pending = false;
-        bool releasedBeforeLanding = false;
-        int startTick = 0;
-    };
-    struct FlightBufferState {
-        bool pressed = false;
-        int pressTick = -1;
-        bool delayedRelease = false;
-        int releaseAt = 0;
-    };
-    LandingBufferState g_landingBuffer;
-    FlightBufferState g_flightBuffer;
-    std::unordered_set<int> g_landingManagedKeys;
-    int g_waveLastTarget = -1;
-    bool g_waveLastDown = false;
-
-    // Delay selected for the active press of each button. A release inherits this offset,
-    // so a delayed press/release pair does not collapse to a one-tick hold.
-    std::unordered_map<int, int> g_activePressDelay;
-
-    // Recent real input intervals only; synthetic validation edges never train this profile.
-    // Timestamps use g_physicsSerialTick, because g_tick is reset on every retry.
-    struct EdgeProfile {
-        bool initialized = false;
-        bool lastDown = false;
-        std::int64_t pressStartTick = -1;
-        std::int64_t releaseTick = -1;
-        std::deque<int> holdTicks;
-        std::deque<int> releaseGapTicks;
-    };
-    std::unordered_map<int, EdgeProfile> g_edgeProfiles;
-    using SteadyClock = std::chrono::steady_clock;
-
-    int buttonKey(int button, bool isPlayer1) {
-        return button + (isPlayer1 ? 0 : 10000);
-    }
-
-    // Keep long intervals as evidence instead of discarding them. A hold/gap longer than
-    // kMaxEdgeProfileTicks cannot be represented as an exact future edge in our short native
-    // simulation window, but it is useful evidence that no opposite edge occurred inside that
-    // window. Store a saturating sentinel (513) so it counts toward calibration and maps to 0
-    // in futureEdgeOffsets().
-    void pushBounded(std::deque<int>& values, std::int64_t value) {
-        if (value <= 0) return;
-        const int stored = value > kMaxEdgeProfileTicks
-            ? kMaxEdgeProfileTicks + 1
-            : static_cast<int>(value);
-        values.push_back(stored);
-        while (values.size() > kEdgeProfileSamples) values.pop_front();
-    }
-
-    // Devuelve true si este edge cambia el estado crudo del boton (edge real para el perfil)
-    // y false si es un duplicado: GD re-envia el estado del boton al inicio de cada intento
-    // (re-sync tras muerte/retry), y ese edge duplicado no es una muestra de timing real.
-    bool observeRawInputEdge(int key, bool down) {
-        auto& profile = g_edgeProfiles[key];
-        if (!profile.initialized) {
-            profile.initialized = true;
-            profile.lastDown = down;
-            profile.pressStartTick = down ? g_physicsSerialTick : -1;
-            profile.releaseTick = down ? -1 : g_physicsSerialTick;
-            return true;
-        }
-        if (profile.lastDown == down) return false; // duplicate edge, not a timing sample
-        // v1.6.3: un edge real cambia el futuro del input. Un chequeo de MUERTE prevista
-        // ya no es comparable y se cancela. Un chequeo de TRAYECTORIA no se descarta:
-        // se resuelve contra el paso correspondiente (en wave los edges llegan cada
-        // pocos ticks y casi ningun chequeo llegaba al deadline) y luego se desactiva.
-        if (g_realityCheck.active) {
-            resolveRealityCheckAtEdge(); // valida el paso del edge; el futuro ya cambio
-        }
-        g_realityCheck.active = false;
-        if (down) {
-            if (profile.releaseTick >= 0) {
-                const auto gap = g_physicsSerialTick - profile.releaseTick;
-                pushBounded(profile.releaseGapTicks, gap);
-            }
-            profile.pressStartTick = g_physicsSerialTick;
-            profile.lastDown = true;
-        } else {
-            if (profile.pressStartTick >= 0) {
-                const auto hold = g_physicsSerialTick - profile.pressStartTick;
-                pushBounded(profile.holdTicks, hold);
-            }
-            profile.releaseTick = g_physicsSerialTick;
-            profile.lastDown = false;
-        }
-        return true;
-    }
-
-    void resetEdgeProfileClocks(bool discardSamples) {
-        if (discardSamples) {
-            g_edgeProfiles.clear();
-            return;
-        }
-        // A death/retry resets g_tick, not the physical input history. Keep the last raw
-        // button state and its monotonic timestamps so a release delivered just after reset
-        // still closes the hold interval from the previous attempt. Rebasing here made
-        // holdTicks/releaseGapTicks permanently empty for inputs that caused a death.
-    }
-
-    std::vector<int> futureEdgeOffsets(int key, bool currentDown, int maxCandidateDelay) {
-        auto it = g_edgeProfiles.find(key);
-        if (it == g_edgeProfiles.end()) return {};
-        auto const& samples = currentDown ? it->second.holdTicks : it->second.releaseGapTicks;
-        if (samples.size() < kMinimumEdgeSamples) {
-            // v1.7.6: fallback conservador. Antes: return {} -> "UNKNOWN (edge history
-            // 0/2)" y la busqueda NI ARRANCABA (48 UNKNOWNs solo en el log 19.00.13:
-            // los primeros clics de cada sesion no tenian 2 muestras de hold/gap y el
-            // input buffer no buscaba NADA). Ahora se estresa el candidato con edges
-            // genericos tipicos de wave-spam (~4/12/24 ticks = ~16/50/100ms a 240Hz)
-            // en vez de negarse a buscar. El perfil real los reemplaza en cuanto
-            // exista 1 muestra medida (kMinimumEdgeSamples).
-            static const std::vector<int> kDefaultEdgeOffsets = { 4, 12, 24 };
-            return kDefaultEdgeOffsets;
-        }
-        std::vector<int> offsets;
-        // A learned opposite edge that happens after the largest trajectory we can certify
-        // is represented by 0 (no opposite edge inside that simulated horizon). Otherwise the
-        // timestamp would force simulate() to extend past its strict step cap and always return
-        // UNKNOWN, even when the event is observed much later than the hazard corridor.
-        const int maxRepresentableOffset = std::max(1,
-            kMaxSimSteps - kHorizon - std::max(0, maxCandidateDelay) - 1);
-        for (int n : samples) {
-            if (n <= 0) continue;
-            // 0 means the observed opposite edge was later than the trajectory can model, so
-            // no synthetic opposite edge is inserted before the clearance horizon. This is not
-            // an invented duration: it is a bucket for an observed interval outside the window.
-            const int modeled = (n > maxRepresentableOffset) ? 0 : n;
-            if (std::find(offsets.begin(), offsets.end(), modeled) == offsets.end()) offsets.push_back(modeled);
-        }
-        // v1.6.0 (nota de diseño): con 1 sola muestra no hace falta anadir una rama extra
-        // "sin edge opuesto": el sim del candidato YA corre sin edge sintetico (hold/gap
-        // mantenido hasta el horizonte), y las ramas observadas cubren el edge opuesto en el
-        // instante medido. Entre ambos cubren el espacio completo de futures del edge opuesto.
-        return offsets;
-    }
-
-    struct SimulationScope {
-        bool prev;
-        SimulationScope() : prev(g_simulating) {
-            g_simulating = true;
-            g_cloneDied = false;
-            g_unmodeled = false;
-            g_unmodeledObjectID = -1;
-            g_unmodeledObjectType = -1;
-            g_cloneDeathX = 0.0f;
-            g_cloneDeathObjectRight = 0.0f;
-            g_cloneDeathObjectKnown = false;
-            g_cloneDeathObject = nullptr;
-        }
-        ~SimulationScope() { g_simulating = prev; }
-    };
-
-    struct QueuedInputScope {
-        bool prev;
-        QueuedInputScope() : prev(g_applyingQueuedInput) { g_applyingQueuedInput = true; }
-        ~QueuedInputScope() { g_applyingQueuedInput = prev; }
-    };
-
-    void clearInputs() {
-        g_queue.clear();
-        g_keys.clear();
-        g_activePressDelay.clear();
-        g_landingBuffer = {};
-        g_flightBuffer = {};
-        g_landingManagedKeys.clear();
-        g_waveLastTarget = -1;
-        g_waveLastDown = false;
-    }
-
-    // Calibrate against the full recent window; reject clock drift rather than substituting
-    // nominal physics. The strict tolerance is intentional until live dt measurements justify it.
-    void observePhysicsDt(float dt) {
-        if (!std::isfinite(dt) || dt <= 0.0f) {
-            g_recentDt.clear();
-            g_dtStable = 0;
-            g_stepDt = 0.0f;
-            return;
-        }
-        g_recentDt.push_back(dt);
-        while (g_recentDt.size() > kDtCalibrationSamples) g_recentDt.pop_front();
-        g_stepDt = dt;
-        g_dtStable = 0;
-        if (g_recentDt.size() < kDtCalibrationSamples) return;
-
-        std::vector<float> ordered(g_recentDt.begin(), g_recentDt.end());
-        std::sort(ordered.begin(), ordered.end());
-        const float median = (ordered[3] + ordered[4]) * 0.5f;
-        const float range = ordered.back() - ordered.front();
-        const float tolerance = std::max(kDtAbsoluteRangeTolerance,
-            std::abs(median) * kDtRelativeRangeTolerance);
-        if (!std::isfinite(median) || median <= 0.0f || range > tolerance) {
-            // Keep only this sample and wait for a new complete stable window.
-            g_recentDt.clear();
-            g_recentDt.push_back(dt);
-            g_stepDt = dt;
-            return;
-        }
-        g_stepDt = median;
-        g_dtStable = static_cast<int>(g_recentDt.size());
-    }
-
-    void clearState(bool retainInputTimingProfile = false, bool retainPhysicsCalibration = false) {
-        clearInputs();
-        resetEdgeProfileClocks(!retainInputTimingProfile);
-        if (!retainInputTimingProfile) g_physicsSerialTick = 0;
-        g_tick = 0;
-        g_lastDx = 0.0f;
-
-        // A retry resets the player/tick state, but not the physics clock itself. Keep a
-        // fully measured, stable dt window across retries of the SAME PlayLayer. The next
-        // real updates immediately replace the oldest samples; if timing changed, the normal
-        // full-window range check invalidates calibration before later predictions can run.
-        // New PlayLayer / quit paths pass retainPhysicsCalibration=false.
-        if (!retainPhysicsCalibration) {
-            g_stepDt = 0.0f;
-            g_dtStable = 0;
-            g_recentDt.clear();
-        }
-
-        g_cloneDied = false;
-        g_unmodeled = false;
-        g_applyingQueuedInput = false;
-        // v1.6.2: el intento termino; un chequeo de realidad pendiente ya no
-        // puede resolverse contra este intento. La pausa NO se toca: describe la
-        // confianza del modelo en el estado de spawn, que se repite en cada intento.
-        g_realityCheck.active = false;
-    }
-
-    void clearStats() {
-        g_unknownReason = "";
-        g_clicksSeen = g_clicksPredicted = 0;
-        g_skipOff = g_skipEarly = g_skipDead = g_skipNoGhost = g_skipOther = 0;
-        g_loggedFirstUpdate = false;
-        g_statKept = g_statSaved = g_statNoSolution = g_statUnknown = 0;
-        g_warnedX = g_warnedSeed = g_warnedWorld = false;
-        g_warnedFallbackX = g_warnedDualMode = g_warnedDeathQueue = false;
-        g_lastPredictionMicros = 0;
-        g_phantomDeaths = 0;
-        g_modelDivergences = 0;
-    }
-
-    // ========================================================================
-    // Objetos modelados / no modelados (misma idea que xdBot: objectTypes + portalIDs)
-    // ========================================================================
-    // Portales que SI se modelan (tamano, velocidad y FORMA v1.6.0), igual que
-    // ShowTrajectory::handlePortal. La forma se aplica al clon cambiando los flags m_is*
-    // en handlePortal(); la fisica del modo la calcula el PlayerObject nativo en update().
-    // El portal de gravedad (10/11/2926) NO esta: el flip no se modela (fail closed).
-    const std::unordered_set<int> kModeledPortals = {
-        12, 13, 47, 111, 660, 745, 1331, 1933, // forma: cube, ship, ball, ufo, wave, robot, spider, swing
-        101, 99,                                // mini / big
-        200, 201, 202, 203, 1334                // velocidad
-    };
-
-    // v1.7.6: PADS NATIVOS. Verificado en el decompile de 2.2081
-    // (GJBaseGameLayer::collisionCheckObjects): al colisionar, los pads llaman
-    // GJBaseGameLayer::bumpPlayer/gravBumpPlayer(player, obj) — fisica PURA sobre el
-    // PlayerObject que colisiona (el clon): mismo bumpMod (getBumpMod, incluye el factor
-    // mini de m_playerScale), misma velocidad, mismo flip de gravedad (pad azul). Los
-    // efectos estan contenidos: playBumpEffect hace early-return con !m_isInPlayLayer
-    // (el clon tiene m_playEffects=false), y gameEventTriggered/playShineEffect ya
-    // estan hookeados y suprimidos durante sims. Los bits m_activatedByPlayer1/2 que
-    // activa el clon los restaura ActivationGuard tras cada sim.
-    // ANTES (v1.7.5 y anteriores) los pads quedaban "unmodeled": 41 UNKNOWNs en los
-    // logs solo por el pad amarillo (id 35 type 8 = YellowJumpPad). Un corredor con un
-    // pad era imposible de autorizar aunque la fisica nativa ya supiera simularlo.
-    const std::unordered_set<GameObjectType> kNativePadTypes = {
-        GameObjectType::YellowJumpPad,   // 8  (id 35 y familia)
-        GameObjectType::PinkJumpPad,     // 9
-        GameObjectType::GravityPad,     // 10 (azul: invierte gravedad)
-        GameObjectType::RedJumpPad,     // 34
-        GameObjectType::SpiderPad,       // 44
-    };
-
-    // Fisicos: bloques, picos, picos animados, pendientes.
-    bool isPhysical(GameObject* o) {
-        switch (o->m_objectType) {
-            case GameObjectType::Solid:
-            case GameObjectType::Hazard:
-            case GameObjectType::AnimatedHazard:
-            case GameObjectType::Slope:
-                return true;
-            default:
-                return false;
-        }
-    }
-
-    bool isModeled(GameObject* o) {
-        return isPhysical(o) || kModeledPortals.contains(o->m_objectID) ||
-            kNativePadTypes.contains(o->m_objectType);
-    }
-
-    // Sin efecto en la fisica (decoracion, monedas...): se desactivan sin marcar Unknown.
-    bool isHarmless(GameObject* o) {
-        switch (o->m_objectType) {
-            case GameObjectType::Decoration:
-            case GameObjectType::SecretCoin:
-            case GameObjectType::UserCoin:
-            case GameObjectType::Collectible:
-                return true;
-            default:
-                return false;
-        }
-    }
-
-    // La predicción de limpieza solo puede usar como objetivo una colisión física estable.
-    // Los peligros animados o los objetos físicos con acciones corriendo pueden moverse mientras
-    // el nivel real avanza; el clon NO actualiza el mundo, así que se rechazan conservadoramente.
-    bool isClearancePhysical(GameObject* o) {
-        if (!o) return false;
-        switch (o->m_objectType) {
-            case GameObjectType::Solid:
-            case GameObjectType::Hazard:
-            case GameObjectType::Slope:
-                return true;
-            default:
-                return false;
-        }
-    }
-
-    bool hasDynamicPhysicalMotion(GameObject* o) {
-        if (!o || !isPhysical(o)) return false;
-        if (o->m_objectType == GameObjectType::AnimatedHazard) return true;
-        return o->numberOfRunningActions() > 0;
-    }
-
-
-    bool rectsOverlap(cocos2d::CCRect const& a, cocos2d::CCRect const& b) {
-        return a.getMinX() <= b.getMaxX() && a.getMaxX() >= b.getMinX() &&
-               a.getMinY() <= b.getMaxY() && a.getMaxY() >= b.getMinY();
-    }
-
-    // If destroyPlayer's object argument is null or unusable, search the current level's
-    // authoritative object array for static physical objects whose bounding boxes overlap the
-    // ghost's final hitbox. This is broad-phase evidence, not proof of exact shape contact, so
-    // choose the rightmost overlapping candidate (conservative clearance) and still require the
-    // full later trajectory validation. Never fabricate a target from deathX alone.
-    GameObject* findStaticDeathColliderFromObjects(PlayLayer* layer, PlayerObject* player) {
-        if (!layer || !layer->m_objects || !player) return nullptr;
-        const auto playerRect = player->GameObject::getObjectRect();
-        GameObject* best = nullptr;
-        float bestRight = -std::numeric_limits<float>::infinity();
-        for (auto* object : CCArrayExt<GameObject*>(layer->m_objects)) {
-            if (!object || object->m_isDisabled || object->m_isDisabled2 ||
-                !isClearancePhysical(object) || hasDynamicPhysicalMotion(object)) continue;
-            const auto objectRect = object->getObjectRect();
-            if (!rectsOverlap(playerRect, objectRect)) continue;
-            const float right = objectRect.getMaxX();
-            if (std::isfinite(right) && right > bestRight) {
-                best = object;
-                bestRight = right;
-            }
-        }
-        return best;
-    }
-
-    bool hasDynamicPhysicalObjectInXRange(PlayLayer* layer, float minX, float maxX) {
-        if (!layer || !layer->m_objects || !std::isfinite(minX) || !std::isfinite(maxX)) {
-            return true; // unavailable inspection is not proof of a static world
-        }
-        for (auto* obj : CCArrayExt<GameObject*>(layer->m_objects)) {
-            if (!obj || !isPhysical(obj)) continue;
-            const auto rect = obj->getObjectRect();
-            if (rect.getMaxX() < minX || rect.getMinX() > maxX) continue;
-            if (hasDynamicPhysicalMotion(obj)) return true;
-        }
-        return false;
-    }
-
-    // ---- Politica de triggers en el corredor (v1.5.0) ----
-    // Triggers que solo afectan visuales o audio. No pueden cambiar la fisica del jugador ni
-    // la geometria con la que colisiona, ni siquiera a traves de cadenas de spawn: un color
-    // trigger solo puede propagar colores (copiar canales), un pulse solo colores temporales,
-    // un shake solo mueve la camara, un animate solo reproduce animaciones de sprites.
-    // IDs verificados contra el analisis de objetos de GDBrowser (GDColon) y documentacion
-    // de la comunidad. Cualquier ID fuera de esta lista sigue vetando (fail closed).
-    const std::unordered_set<int> kCosmeticTriggerIDs = {
-        29, 30,          // color (pre-2.0 / 2.0)
-        31,              // start pos (nunca se activa jugando)
-        899, 900, 915,   // color (2.1+)
-        1006,            // pulse (color temporal)
-        1007,            // alpha (opacidad)
-        1520,            // shake (pantalla)
-        1585,            // animate (monstruos / animaciones visuales)
-        1612, 1613       // hide player / show player (visual)
-    };
-
-    bool isAudioOnlyTrigger(GameObject* o) {
-        return typeinfo_cast<SFXTriggerGameObject*>(o) != nullptr ||
-               typeinfo_cast<SongTriggerGameObject*>(o) != nullptr;
-    }
-
-    // Un EffectGameObject de la whitelist de portales o cosmético nunca invalida la simulacion.
-    bool isExemptEffectObject(GameObject* o) {
-        if (!o) return true;
-        if (kModeledPortals.contains(o->m_objectID)) return true;      // forma/velocidad/tamano modelados
-        if (kCosmeticTriggerIDs.contains(o->m_objectID)) return true;   // solo visuales
-        if (isAudioOnlyTrigger(o)) return true;                         // solo audio
-        return false;
-    }
-
-    struct EffectVetoInfo {
-        int objectID = -1;
-        int objectType = -1;
-        float x = 0.0f;
-        float y = 0.0f;
-    };
-
-    // Los triggers solo se activan cuando el hitbox del jugador REAL los cruza. El clon no
-    // avanza el timeline de triggers, asi que cualquier trigger no exento que el corredor
-    // pueda cruzar invalida la simulacion estatica. Filtros v1.5.0:
-    //  - X: solo [minX, maxX]. Un trigger completamente detras del jugador nunca vuelve a
-    //    dispararse en modo clasico (X siempre crece); el rango viejo [playerX-32, ...] vetaba
-    //    trigger lines enteras que el jugador ya habia pasado.
-    //  - Y: solo la banda vertical [yMin, yMax] alcanzable por las trayectorias simuladas.
-    //    Un trigger flotando fuera de esa banda es inalcanzable para el hitbox del jugador.
-    bool hasUnsupportedEffectObjectInBand(PlayLayer* layer, float minX, float maxX,
-                                          float yMin, float yMax,
-                                          EffectVetoInfo* veto = nullptr) {
-        if (!layer || !layer->m_objects || !std::isfinite(minX) || !std::isfinite(maxX) ||
-            !std::isfinite(yMin) || !std::isfinite(yMax)) {
-            return true; // sin inspeccion fiable no se puede certificar un mundo estatico
-        }
-        for (auto* obj : CCArrayExt<GameObject*>(layer->m_objects)) {
-            if (!obj || obj->m_isDisabled || obj->m_isDisabled2) continue;
-            if (!typeinfo_cast<EffectGameObject*>(obj)) continue;
-            if (isExemptEffectObject(obj)) continue;
-            const auto rect = obj->getObjectRect();
-            if (rect.getMaxX() < minX || rect.getMinX() > maxX) continue; // fuera del corredor X
-            if (rect.getMaxY() < yMin || rect.getMinY() > yMax) continue; // fuera de la banda Y
-            if (veto) {
-                veto->objectID = obj->m_objectID;
-                veto->objectType = static_cast<int>(obj->m_objectType);
-                veto->x = rect.getMidX();
-                veto->y = rect.getMidY();
-            }
-            return true;
-        }
-        return false;
-    }
-
-    // Igual que ShowTrajectory::handlePortal (gravedad omitida igual que en xdBot).
-    // v1.6.0: portales de FORMA. Solo se cambian los flags de modo del clon; la fisica de
-    // cada modo la ejecuta PlayerObject::update nativo. El seedGhost de cada prediccion
-    // restaura los flags desde el jugador real, asi que un portal aplicado en una
-    // prediccion no contamina la siguiente.
-    void setFormFlags(PlayerObject* player,
-                      bool ship, bool bird, bool ball, bool dart,
-                      bool robot, bool spider, bool swing) {
-        player->m_isShip = ship;
-        player->m_isBird = bird;
-        player->m_isBall = ball;
-        player->m_isDart = dart;
-        player->m_isRobot = robot;
-        player->m_isSpider = spider;
-        player->m_isSwing = swing;
-    }
-
-    void handlePortal(PlayerObject* player, int id) {
-        switch (id) {
-            case 12:  setFormFlags(player, false, false, false, false, false, false, false); break; // cube
-            case 13:  setFormFlags(player, true,  false, false, false, false, false, false); break; // ship
-            case 47:  setFormFlags(player, false, false, true,  false, false, false, false); break; // ball
-            case 111: setFormFlags(player, false, true,  false, false, false, false, false); break; // ufo
-            case 660: setFormFlags(player, false, false, false, true,  false, false, false); break; // wave
-            case 745: setFormFlags(player, false, false, false, false, true,  false, false); break; // robot
-            case 1331: setFormFlags(player, false, false, false, false, false, true,  false); break; // spider
-            case 1933: setFormFlags(player, false, false, false, false, false, false, true);  break; // swing
-            case 101: player->togglePlayerScale(true, true);  player->updatePlayerScale(); break;
-            case 99:  player->togglePlayerScale(false, true); player->updatePlayerScale(); break;
-            case 200: player->m_playerSpeed = 0.7f; break;
-            case 201: player->m_playerSpeed = 0.9f; break;
-            case 202: player->m_playerSpeed = 1.1f; break;
-            case 203: player->m_playerSpeed = 1.3f; break;
-            case 1334: player->m_playerSpeed = 1.6f; break;
-            default: break;
-        }
-    }
-
-    // ========================================================================
-    // Copia del estado del jugador (PlayerPracticeFixes::saveData/applyData)
-    // ========================================================================
-    // Cada AC_COPY solo compila si el miembro existe en los bindings 2.2081 (xdBot esta
-    // hecho para 2.2074; en 2.2081 faltan p.ej. m_currentSlope3, m_unk9e8, m_unkAAC...).
-    // NO se copian punteros a objetos propios del jugador real (arrays de colision,
-    // m_touchingRings, particulas, estela): el falso usa los suyos.
-    template <class P>
-    void seedGhost(P* dst, P* src) {
-        if (!dst || !src) return;
-
-        // Clear clone-only transient collision state before seeding it from the real player.
-        // The requires checks keep this source compatible with binding variations.
-        if constexpr (requires { dst->resetCollisionLog(true); }) {
-            dst->resetCollisionLog(true);
-        }
-        if constexpr (requires { dst->resetCollisionValues(); }) {
-            dst->resetCollisionValues();
-        }
-
-        dst->setPosition(src->getPosition());
-        dst->setRotation(src->getRotation());
-        dst->setScale(src->getScale());
-
-        // v1.7.5: FIX MINI DEFINITIVO — togglePlayerScale nativo ANTES de copiar nada.
-        // Causa raiz (decompile 2.2081): togglePlayerScale setea m_playerScale Y los
-        // multiplicadores de hitbox m_spriteWidthScale/m_spriteHeightScale, pero hace
-        // EARLY-RETURN (sin tocar los sprite scales) si m_playerScale ya esta en el
-        // estado objetivo. En v1.7.3 corria DESPUES de AC_COPY(m_vehicleSize)
-        // (= m_playerScale real): el clon llegaba con 0.6 puesto -> early-return ->
-        // sprite scales 1.0 -> rect 30x30 vs real 18x18 (seed MISMATCH de todos los
-        // logs). Corriendo aqui, el estado del clon solo coincide por un toggle previo
-        // (seed/sim), en cuyo caso los sprite scales ya estan correctos y el
-        // early-return es inocuo. La deteccion de mini lee el ESTADO (m_vehicleSize),
-        // no getScale() (nodo animado 0.5s por CCScaleTo tras el portal).
-        [[maybe_unused]] bool srcMini = src->getScale() < 0.9f;
-        if constexpr (requires { src->m_vehicleSize; }) {
-            srcMini = src->m_vehicleSize < 0.9f;
-        }
-        if constexpr (requires { dst->togglePlayerScale(srcMini, true); }) {
-            dst->togglePlayerScale(srcMini, true);
-            dst->updatePlayerScale();
-        }
-
-        #define AC_COPY(F) \
-            if constexpr (requires { dst->F = src->F; }) { dst->F = src->F; }
-
-        // contenedores de gd:: (como en xdBot: solo Windows)
-        #ifdef GEODE_IS_WINDOWS
-        AC_COPY(m_rotateObjectsRelated)
-        AC_COPY(m_maybeRotatedObjectsMap)
-        AC_COPY(m_touchedRings)
-        AC_COPY(m_ringRelatedSet)
-        AC_COPY(m_jumpPadRelated)
-        AC_COPY(m_holdingButtons)
-        AC_COPY(m_playerFollowFloats)
-        #endif
-
-        AC_COPY(position) AC_COPY(rotation) AC_COPY(m_holdingRight) AC_COPY(m_holdingLeft)
-        AC_COPY(m_wasTeleported) AC_COPY(m_fixGravityBug) AC_COPY(m_reverseSync) AC_COPY(m_yVelocityBeforeSlope)
-        AC_COPY(m_dashX) AC_COPY(m_dashY) AC_COPY(m_dashAngle) AC_COPY(m_dashStartTime)
-        AC_COPY(m_dashRing) AC_COPY(m_slopeStartTime) AC_COPY(m_maybeLastGroundObject) AC_COPY(m_lastCollisionBottom)
-        AC_COPY(m_lastCollisionTop) AC_COPY(m_lastCollisionLeft) AC_COPY(m_lastCollisionRight) AC_COPY(m_unk50C)
-        AC_COPY(m_unk510) AC_COPY(m_currentSlope2) AC_COPY(m_preLastGroundObject) AC_COPY(m_slopeAngle)
-        AC_COPY(m_slopeSlidingMaybeRotated) AC_COPY(m_quickCheckpointMode) AC_COPY(m_collidedObject) AC_COPY(m_lastGroundObject)
-        AC_COPY(m_collidingWithLeft) AC_COPY(m_collidingWithRight) AC_COPY(m_scaleXRelated2) AC_COPY(m_groundYVelocity)
-        AC_COPY(m_yVelocityRelated) AC_COPY(m_scaleXRelated3) AC_COPY(m_scaleXRelated4) AC_COPY(m_scaleXRelated5)
-        AC_COPY(m_isCollidingWithSlope) AC_COPY(m_isBallRotating) AC_COPY(m_unk669) AC_COPY(m_currentSlope3)
-        AC_COPY(m_currentSlope) AC_COPY(unk_584) AC_COPY(m_collidingWithSlopeId) AC_COPY(m_slopeFlipGravityRelated)
-        AC_COPY(m_slopeAngleRadians) AC_COPY(m_rotationSpeed) AC_COPY(m_rotateSpeed) AC_COPY(m_isRotating)
-        AC_COPY(m_isBallRotating2) AC_COPY(m_speedMultiplier) AC_COPY(m_yStart) AC_COPY(m_gravity)
-        AC_COPY(m_unk648) AC_COPY(m_gameModeChangedTime) AC_COPY(m_padRingRelated) AC_COPY(m_maybeIsFalling)
-        AC_COPY(m_shouldTryPlacingCheckpoint) AC_COPY(m_maybeCanRunIntoBlocks) AC_COPY(m_isOnGround3) AC_COPY(m_checkpointTimeout)
-        AC_COPY(m_lastCheckpointTime) AC_COPY(m_lastJumpTime) AC_COPY(m_lastFlipTime) AC_COPY(m_lastSpiderFlipTime)
-        AC_COPY(m_unkBool5) AC_COPY(m_accelerationOrSpeed) AC_COPY(m_snapDistance) AC_COPY(m_ringJumpRelated)
-        AC_COPY(m_objectSnappedTo) AC_COPY(m_onFlyCheckpointTries) AC_COPY(m_slopeRotation) AC_COPY(m_currentSlopeYVelocity)
-        AC_COPY(m_unk3d0) AC_COPY(m_blackOrbRelated) AC_COPY(m_unk3e0) AC_COPY(m_unk3e1)
-        AC_COPY(m_isAccelerating) AC_COPY(m_isCurrentSlopeTop) AC_COPY(m_collidedTopMinY) AC_COPY(m_collidedBottomMaxY)
-        AC_COPY(m_collidedLeftMaxX) AC_COPY(m_collidedRightMinX) AC_COPY(m_canPlaceCheckpoint) AC_COPY(m_maybeIsColliding)
-        AC_COPY(m_jumpBuffered) AC_COPY(m_stateRingJump) AC_COPY(m_wasJumpBuffered) AC_COPY(m_wasRobotJump)
-        AC_COPY(m_stateJumpBuffered) AC_COPY(m_stateRingJump2) AC_COPY(m_touchedRing) AC_COPY(m_touchedCustomRing)
-        AC_COPY(m_touchedGravityPortal) AC_COPY(m_maybeTouchedBreakableBlock) AC_COPY(m_jumpRelatedAC2) AC_COPY(m_touchedPad)
-        AC_COPY(m_yVelocity) AC_COPY(m_fallSpeed) AC_COPY(m_isOnSlope) AC_COPY(m_wasOnSlope)
-        AC_COPY(m_slopeVelocity) AC_COPY(m_maybeUpsideDownSlope) AC_COPY(m_isShip) AC_COPY(m_isBird)
-        AC_COPY(m_isBall) AC_COPY(m_isDart) AC_COPY(m_isRobot) AC_COPY(m_isSpider)
-        AC_COPY(m_isUpsideDown) AC_COPY(m_isOnGround) AC_COPY(m_isGoingLeft) AC_COPY(m_isSideways)
-        AC_COPY(m_isSwing) AC_COPY(m_reverseRelated) AC_COPY(m_maybeReverseSpeed) AC_COPY(m_maybeReverseAcceleration)
-        AC_COPY(m_xVelocityRelated2) AC_COPY(m_isDashing) AC_COPY(m_unk9e8) AC_COPY(m_groundObjectMaterial)
-        // v1.7.5: m_vehicleSize YA NO SE COPIA: copiarlo desincroniza m_playerScale de
-        // los sprite scales de hitbox (causa raiz del mismatch 30x30 vs 18x18); el
-        // toggle nativo de arriba lo deja en el valor exacto del juego (0.6 o 1.0).
-        AC_COPY(m_playerSpeed) AC_COPY(m_shipRotation) AC_COPY(m_lastPortalPos)
-        AC_COPY(m_unkUnused3) AC_COPY(m_isOnGround2) AC_COPY(m_lastLandTime) AC_COPY(m_platformerVelocityRelated)
-        AC_COPY(m_maybeIsBoosted) AC_COPY(m_scaleXRelatedTime) AC_COPY(m_decreaseBoostSlide) AC_COPY(m_unkA29)
-        AC_COPY(m_isLocked) AC_COPY(m_controlsDisabled) AC_COPY(m_lastGroundedPos) AC_COPY(m_lastActivatedPortal)
-        AC_COPY(m_hasEverJumped) AC_COPY(m_ringOrStreakRelated) AC_COPY(m_position) AC_COPY(m_isSecondPlayer)
-        AC_COPY(m_unkA99) AC_COPY(m_totalTime) AC_COPY(m_isBeingSpawnedByDualPortal) AC_COPY(m_unkAAC)
-        AC_COPY(m_unkAngle1) AC_COPY(m_yVelocityRelated3) AC_COPY(m_followRelated) AC_COPY(m_unk838)
-        AC_COPY(m_stateOnGround) AC_COPY(m_stateUnk) AC_COPY(m_stateNoStickX) AC_COPY(m_stateNoStickY)
-        AC_COPY(m_stateUnk2) AC_COPY(m_stateBoostX) AC_COPY(m_stateBoostY) AC_COPY(m_maybeStateForce2)
-        AC_COPY(m_stateScale) AC_COPY(m_platformerXVelocity) AC_COPY(m_leftPressedFirst) AC_COPY(m_scaleXRelated)
-        AC_COPY(m_maybeHasStopped) AC_COPY(m_xVelocityRelated) AC_COPY(m_maybeGoingCorrectSlopeDirection) AC_COPY(m_isSliding)
-        AC_COPY(m_maybeSlopeForce) AC_COPY(m_isOnIce) AC_COPY(m_physDeltaRelated) AC_COPY(m_isOnGround4)
-        AC_COPY(m_maybeSlidingTime) AC_COPY(m_maybeSlidingStartTime) AC_COPY(m_changedDirectionsTime) AC_COPY(m_slopeEndTime)
-        AC_COPY(m_isMoving) AC_COPY(m_platformerMovingLeft) AC_COPY(m_platformerMovingRight) AC_COPY(m_isSlidingRight)
-        AC_COPY(m_maybeChangedDirectionAngle) AC_COPY(m_unkUnused2) AC_COPY(m_isPlatformer) AC_COPY(m_stateNoAutoJump)
-        AC_COPY(m_stateDartSlide) AC_COPY(m_stateHitHead) AC_COPY(m_stateFlipGravity) AC_COPY(m_gravityMod)
-        AC_COPY(m_stateForce) AC_COPY(m_stateForceVector) AC_COPY(m_affectedByForces) AC_COPY(m_somethingPlayerSpeedTime)
-        AC_COPY(m_playerSpeedAC) AC_COPY(m_fixRobotJump) AC_COPY(m_inputsLocked) AC_COPY(m_unk958)
-        AC_COPY(m_unkUnused) AC_COPY(m_isOutOfBounds) AC_COPY(m_fallStartY) AC_COPY(m_disablePlayerSqueeze)
-        AC_COPY(m_robotHasRun3) AC_COPY(m_robotHasRun2) AC_COPY(m_ignoreDamage) AC_COPY(m_enable22Changes)
-        // v1.6.5: causa raiz de la muerte fantasma en spawn (log 21.26.35): el rect del
-        // clon quedaba en cubo 30x30 (default de PlayerObject::create) mientras el real
-        // usaba la hitbox de wave 10x10. Copiar el estado de tamaño del GameObject.
-        AC_COPY(m_width) AC_COPY(m_height)
-
-        #undef AC_COPY
-
-        // v1.6.5: recalcular el rect desde los flags de modo copiados. El toggle nativo
-        // de v1.7.5 ya corrio ARRIBA (antes de las copias); esto asienta la escala del
-        // nodo y la hitbox de modo (m_isDart/m_isShip -> m_width/m_height).
-        dst->updatePlayerScale();
-
-        // v1.7.5: cinturon y tirantes sobre los factores de hitbox que el toggle nativo
-        // ya dejo correctos. Si los bindings exponen m_spriteWidthScale/m_spriteHeightScale
-        // (los multiplicadores que GameObject::getObjectRect() usa: rect =
-        // m_width * m_scaleX * m_spriteWidthScale) se imponen directamente desde el
-        // real; y si exponen m_isObjectRectDirty (getObjectRect2 devuelve el rect
-        // CACHEADO mientras no este sucio) se fuerza el recalculo para que el seed
-        // check compare el rect nuevo. Si el binding no expone alguno, requires lo
-        // salta en silencio y el toggle nativo de arriba ya hizo el trabajo.
-        if constexpr (requires { dst->m_spriteWidthScale = src->m_spriteWidthScale; }) {
-            dst->m_spriteWidthScale = src->m_spriteWidthScale;
-            dst->m_spriteHeightScale = src->m_spriteHeightScale;
-        }
-        if constexpr (requires { dst->m_isObjectRectDirty = true; }) {
-            dst->m_isObjectRectDirty = true;
-        }
-        // v1.7.2: hitbox base por modo (wave 10x10, cubo 30x30). El factor mini (0.6)
-        // ya vive en los sprite scales: estos campos NO lo tocan.
-        if constexpr (requires { dst->m_width = src->m_width; }) {
-            dst->m_width = src->m_width;
-            dst->m_height = src->m_height;
-        }
-        // La escala del NODO se copia tal cual del real: durante los 0.5s de animacion
-        // elastica tras el portal el real TAMBIEN tiene la hitbox escalada (el CCScaleTo
-        // anima m_scaleX/m_scaleY, que getObjectRect multiplica), asi que copiar
-        // getScale() replica incluso ese estado transitorio.
-        dst->setScale(src->getScale());
-
-        dst->m_isDead = false;
-        dst->m_playEffects = false;
-    }
-
-    // Igual que xdBot: dos PlayerObject::create y anadidos a m_objectLayer. Aqui solo uno.
-    // Vive ligado a su PlayLayer; se libera en PlayLayer::onQuit (NO en onExit).
-    bool ensureGhost(PlayLayer* layer) {
-        if (!layer || !layer->m_objectLayer) return false;
-        if (g_ghost && g_ghostOwner == layer) return true;
-
-        // The retained clone can outlive its old layer. Release our retain without
-        // dereferencing g_ghostOwner (which may already be stale).
-        if (g_ghost) {
-            auto* staleGhost = g_ghost;
-            g_ghost = nullptr;
-            g_ghostOwner = nullptr;
-            staleGhost->removeFromParentAndCleanup(true);
-            staleGhost->release();
-        }
-
-        auto* ghost = PlayerObject::create(1, 1, layer, layer, true);
-        if (!ghost) {
-            log::error("[IB] ghost creation failed");
-            return false;
-        }
-
-        ghost->retain();
-        ghost->setPosition({0, 105});
-        ghost->setVisible(false);
-        ghost->m_playEffects = false;
-        if (layer->m_objectLayer) {
-            layer->m_objectLayer->addChild(ghost);
-        }
-
-        g_ghost = ghost;
-        g_ghostOwner = layer;
-        ac_dbg("[IB] ghost created");
-        return true;
-    }
-
-    void destroyGhost() {
-        auto* ghost = g_ghost;
-        g_ghost = nullptr;
-        g_ghostOwner = nullptr;
-        if (ghost) {
-            ghost->removeFromParentAndCleanup(true);
-            ghost->release();
-        }
-    }
-
-    // ========================================================================
-    // Proteccion del mundo real (flags de activacion de objetos)
-    // ========================================================================
-    struct ActivationBits {
-        bool isActivated = false;
-        bool hasEnhanced = false;
-        bool p1 = false, p2 = false;
-    };
-
-    struct ActivationGuard {
-        std::vector<std::pair<GameObject*, ActivationBits>> saved;
-
-        explicit ActivationGuard(PlayLayer* layer) {
-            if (!layer || !layer->m_objects) return;
-            saved.reserve(static_cast<size_t>(layer->m_objects->count()));
-            for (auto* obj : CCArrayExt<GameObject*>(layer->m_objects)) {
-                if (!obj) continue;
-                ActivationBits bits;
-                bits.isActivated = obj->m_isActivated;
-                if (auto* e = typeinfo_cast<EnhancedGameObject*>(obj)) {
-                    bits.hasEnhanced = true;
-                    bits.p1 = e->m_activatedByPlayer1;
-                    bits.p2 = e->m_activatedByPlayer2;
-                }
-                saved.emplace_back(obj, bits);
-            }
-        }
-
-        void restore() {
-            for (auto& [obj, bits] : saved) {
-                obj->m_isActivated = bits.isActivated;
-                if (bits.hasEnhanced) {
-                    if (auto* e = typeinfo_cast<EnhancedGameObject*>(obj)) {
-                        e->m_activatedByPlayer1 = bits.p1;
-                        e->m_activatedByPlayer2 = bits.p2;
-                    }
-                }
-            }
-        }
-
-        ~ActivationGuard() { restore(); }
-    };
-
-    // ========================================================================
-    // Tick de aplicacion
-    // ========================================================================
-    // delay 0 = proximo update del jugador; delay N = N updates despues.
-    int effectiveDue(int key, int delay) {
-        int due = g_tick + 1 + delay;
-        auto it = g_keys.find(key);
-        if (it != g_keys.end() && it->second.pending > 0) {
-            due = std::max(due, it->second.lastDue + 1);
-        }
-        return due;
-    }
-
-    // ========================================================================
-    // Simulacion (misma secuencia que ShowTrajectory::createTrajectory)
-    // ========================================================================
-    struct SimEvent {
-        int step;
-        bool down;
-        int button;
-        bool candidate;
-        bool beforeCollision;
-        bool syntheticOpposite = false; // prediction-only stress edge, never forwarded to the game
-    };
-
-    static SimOut unknown(const char* why) {
-        g_unknownReason = why;
-        return {SimResult::Unknown, 0};
-    }
-
-    template <class P>
-    void setCloneY(P* player, float y) {
-        player->setPositionY(y);
-        if constexpr (requires { player->m_position.y = y; }) {
-            player->m_position.y = y;
-        }
-    }
-
-    bool nearFloat(float a, float b, float tolerance) {
-        return std::isfinite(a) && std::isfinite(b) && std::abs(a - b) <= tolerance;
-    }
-
-    bool sameBaselineDeath(SimOut const& a, SimOut const& b) {
-        return a.result == SimResult::Died && b.result == SimResult::Died &&
-            a.steps == b.steps && a.knownPhysicalDeathObject && b.knownPhysicalDeathObject &&
-            a.deathObject == b.deathObject &&
-            nearFloat(a.deathX, b.deathX, 0.05f) &&
-            nearFloat(a.deathObjectRight, b.deathObjectRight, 0.05f);
-    }
-
-    bool sameSafeClearance(SimOut const& a, SimOut const& b) {
-        return a.result == SimResult::Safe && b.result == SimResult::Safe &&
-            a.steps == b.steps &&
-            nearFloat(a.endX, b.endX, 0.05f) &&
-            nearFloat(a.endY, b.endY, 0.05f) &&
-            nearFloat(a.endYVelocity, b.endYVelocity, 0.1f) &&
-            nearFloat(a.endRotation, b.endRotation, 0.1f) &&
-            a.endIsDart == b.endIsDart && a.endIsShip == b.endIsShip &&
-            a.endIsBall == b.endIsBall && a.endIsBird == b.endIsBird &&
-            a.endIsRobot == b.endIsRobot && a.endIsSpider == b.endIsSpider &&
-            a.endIsSwing == b.endIsSwing && a.endIsUpsideDown == b.endIsUpsideDown &&
-            a.endIsOnGround == b.endIsOnGround && a.endJumpBuffered == b.endJumpBuffered &&
-            a.endInputsLocked == b.endInputsLocked && a.endControlsDisabled == b.endControlsDisabled &&
-            a.endStateFlipGravity == b.endStateFlipGravity;
-    }
-
-    SimOut simulate(
-        PlayLayer* layer,
-        PlayerObject* real,
-        bool down,
-        int button,
-        int candidateDue,
-        std::optional<float> clearTargetX = std::nullopt,
-        int stepBudget = kMaxSimSteps,
-        bool candidateImmediate = false,
-        SimPerturbation perturbation = {},
-        int oppositeEdgeAfterCandidateTicks = 0,
-        SteadyClock::time_point deadline = SteadyClock::time_point::max(),
-        // v1.7.4: modo lookahead del overlay. applyCandidateEvent=false ejecuta el futuro
-        // SIN ningun edge candidato (el input queda tal cual, con los encolados incluidos);
-        // lookaheadSteps alarga el horizonte propio (sin el, plannedSteps caeria a
-        // kHorizon+1 porque no hay evento cuyo paso lo estire).
-        bool applyCandidateEvent = true,
-        int lookaheadSteps = 0
-    ) {
-        if (!layer || !real || !g_ghost) return unknown("no-ghost");
-        if (g_dtStable < static_cast<int>(kDtCalibrationSamples)) return unknown("dt-window-not-calibrated");
-        if (!std::isfinite(g_stepDt) || g_stepDt <= 0.0f) return unknown("invalid-dt");
-        if (stepBudget <= 0) return unknown("per-click-budget-exhausted");
-        if (!g_ghost->m_collisionLogTop || !g_ghost->m_collisionLogBottom ||
-            !g_ghost->m_collisionLogLeft || !g_ghost->m_collisionLogRight) {
-            return unknown("ghost-collision-log-null");
-        }
-
-        const int base = g_tick + 1;
-        if (oppositeEdgeAfterCandidateTicks < 0) return unknown("invalid-opposite-edge-offset");
-        std::vector<SimEvent> events;
-        events.reserve(g_queue.size() + (oppositeEdgeAfterCandidateTicks > 0 ? 2 : 1));
-        for (auto const& q : g_queue) {
-            events.push_back({std::max(0, q.tick - base), q.down, q.button, false, false});
-        }
-        // v1.7.1: split EXACTO de los dos caminos de input (auditoria del decompile).
-        // El input inmediato (delay 0) se aplica por handleButton sincrono ENTRE pasos:
-        // antes de los resets y de updateInternalActions -> beforeCollision=true. Los
-        // encolados los inyecta dispatchPending desde el hook de PlayerObject::update:
-        // despues de updateInternalActions, antes del cuerpo nativo de update ->
-        // beforeCollision=false. El orden (step, beforeCollision) del sort estable
-        // garantiza que el while del loop consuma primero los beforeCollision.
-        const bool applyCandidateBeforeCollision = applyCandidateEvent && candidateImmediate && candidateDue == base;
-        const int candidateStep = std::max(0, candidateDue - base);
-        if (applyCandidateEvent) {
-            events.push_back({candidateStep, down, button, true, applyCandidateBeforeCollision});
-        }
-        if (oppositeEdgeAfterCandidateTicks > 0) {
-            // The actual future raw edge is not known when the current click is predicted.
-            // Stress each possible opposite edge within the stage's timing envelope. This
-            // synthetic event affects only the ghost, never PlayLayer/the real player.
-            events.push_back({candidateStep + oppositeEdgeAfterCandidateTicks, !down, button,
-                false, false, true});
-        }
-        std::stable_sort(events.begin(), events.end(), [](SimEvent const& a, SimEvent const& b) {
-            if (a.step != b.step) return a.step < b.step;
-            return a.beforeCollision && !b.beforeCollision;
-        });
-
-        const int latestEventStep = events.empty() ? 0 : events.back().step;
-        if (latestEventStep >= kMaxSimSteps) return unknown("too-many-steps");
-
-        int plannedSteps = latestEventStep + kHorizon + 1;
-        if (lookaheadSteps > 0) {
-            // v1.7.4: el overlay pide su propio horizonte; sin evento candidato nada
-            // estiraria plannedSteps y solo se dibujarian kHorizon+1 pasos.
-            plannedSteps = std::max(plannedSteps, std::min(lookaheadSteps, kMaxSimSteps));
-        }
-        if (clearTargetX) {
-            // A target whose distance cannot be estimated reliably is not a safe prediction.
-            float dxPerTick = std::abs(g_lastDx);
-            if (!std::isfinite(dxPerTick) || dxPerTick < 0.001f) {
-                dxPerTick = static_cast<float>(std::abs(real->getCurrentXVelocity() * g_stepDt));
-            }
-            if (!std::isfinite(dxPerTick) || dxPerTick < 0.001f) {
-                return unknown("clearance-speed-unknown");
-            }
-            const float distance = std::max(0.0f, *clearTargetX - real->getPositionX());
-            const int estimatedTicks = static_cast<int>(std::ceil(distance / dxPerTick));
-            if (estimatedTicks > kMaxClearanceEstimate) {
-                return unknown("clearance-target-too-far");
-            }
-            // Speed portals can slow the clone after the estimate. Use a generous multiplier,
-            // but keep a strict hard cap so one click cannot freeze the game for a long sweep.
-            const int modeLimit = std::max(0, limitFor(real));
-            plannedSteps = std::min(
-                kMaxSimSteps,
-                std::max(kHorizon + modeLimit + 8, estimatedTicks * 3 + modeLimit + 8)
-            );
-        }
-        const int totalSteps = std::min(plannedSteps, stepBudget);
-        const bool budgetTruncated = totalSteps < plannedSteps;
-        const float dt = g_stepDt * perturbation.dtScale;
-        if (!std::isfinite(dt) || dt <= 0.0f) return unknown("perturbed-dt-invalid");
-        const float rx = real->getPositionX();
-        const float ry = real->getPositionY();
-        const double rv = real->m_yVelocity;
-
-        SimOut out{SimResult::Safe, totalSteps};
-        float trajMinY = ry;
-        float trajMaxY = ry;
-        bool candidateApplied = false;
-        bool oppositeEdgeApplied = false;
-        int oppositeEdgeStep = -1;
-        bool clearedTarget = false;
-        int targetCrossStep = -1;
-
-        {
-            SimulationScope scope;
-            seedGhost(g_ghost, real);
-
-            const bool seedOK =
-                nearFloat(g_ghost->getPositionX(), rx, 0.001f) &&
-                nearFloat(g_ghost->getPositionY(), ry, 0.001f) &&
-                nearFloat(static_cast<float>(g_ghost->m_yVelocity), static_cast<float>(rv), 0.001f) &&
-                nearFloat(g_ghost->getRotation(), real->getRotation(), 0.05f) &&
-                nearFloat(g_ghost->getScale(), real->getScale(), 0.001f) &&
-                nearFloat(g_ghost->m_playerSpeed, real->m_playerSpeed, 0.0001f) &&
-                nearFloat(g_ghost->m_speedMultiplier, real->m_speedMultiplier, 0.0001f) &&
-                g_ghost->m_isDart == real->m_isDart &&
-                g_ghost->m_isShip == real->m_isShip &&
-                g_ghost->m_isBall == real->m_isBall &&
-                g_ghost->m_isBird == real->m_isBird &&
-                g_ghost->m_isRobot == real->m_isRobot &&
-                g_ghost->m_isSpider == real->m_isSpider &&
-                g_ghost->m_isSwing == real->m_isSwing &&
-                g_ghost->m_isUpsideDown == real->m_isUpsideDown &&
-                g_ghost->m_isPlatformer == real->m_isPlatformer &&
-                // Match state that changes the next frame's jump/gravity response, not just pose.
-                g_ghost->m_isOnGround == real->m_isOnGround &&
-                g_ghost->m_isOnGround2 == real->m_isOnGround2 &&
-                g_ghost->m_isOnGround3 == real->m_isOnGround3 &&
-                g_ghost->m_isOnGround4 == real->m_isOnGround4 &&
-                g_ghost->m_jumpBuffered == real->m_jumpBuffered &&
-                g_ghost->m_wasJumpBuffered == real->m_wasJumpBuffered &&
-                g_ghost->m_stateJumpBuffered == real->m_stateJumpBuffered &&
-                g_ghost->m_stateFlipGravity == real->m_stateFlipGravity &&
-                g_ghost->m_controlsDisabled == real->m_controlsDisabled &&
-                g_ghost->m_inputsLocked == real->m_inputsLocked &&
-                g_ghost->m_isOnSlope == real->m_isOnSlope &&
-                g_ghost->m_wasOnSlope == real->m_wasOnSlope &&
-                g_ghost->m_isCollidingWithSlope == real->m_isCollidingWithSlope &&
-                nearFloat(g_ghost->m_gravity, real->m_gravity, 0.0001f) &&
-                nearFloat(g_ghost->m_fallSpeed, real->m_fallSpeed, 0.001f) &&
-                nearFloat(g_ghost->m_yStart, real->m_yStart, 0.001f) &&
-                nearFloat(g_ghost->m_slopeVelocity, real->m_slopeVelocity, 0.001f) &&
-                nearFloat(g_ghost->m_currentSlopeYVelocity, real->m_currentSlopeYVelocity, 0.001f) &&
-                // v1.6.5: el rect de GameObject ES la hitbox que usa checkCollisions.
-                // El log 21.26.35 mostro un clon 30x30 (cubo) contra un real 10x10
-                // (wave) en el spawn: el seed check anterior solo comparaba pose y
-                // flags, y daba "OK" con el hitbox roto. Sin esto, cualquier muerte
-                // del clon es contra una hitbox que el jugador real no tiene.
-                [&]() {
-                    const auto gr = g_ghost->GameObject::getObjectRect();
-                    const auto rr = real->GameObject::getObjectRect();
-                    return nearFloat(gr.size.width, rr.size.width, 0.5f) &&
-                           nearFloat(gr.size.height, rr.size.height, 0.5f);
-                }();
-
-            if (!g_warnedSeed) {
-                g_warnedSeed = true;
-                const auto gr = g_ghost->GameObject::getObjectRect();
-                const auto rr = real->GameObject::getObjectRect();
-                ac_dbg("[IB] first seed check: {} | ghostRect=({:.2f},{:.2f},{:.2f},{:.2f}) realRect=({:.2f},{:.2f},{:.2f},{:.2f}) | scale ghost={:.3f} real={:.3f}",
-                    seedOK ? "OK" : "MISMATCH",
-                    gr.getMinX(), gr.getMinY(), gr.getMaxX(), gr.getMaxY(),
-                    rr.getMinX(), rr.getMinY(), rr.getMaxX(), rr.getMaxY(),
-                    g_ghost->getScale(), real->getScale());
-            }
-
-            if (!seedOK) {
-                out = unknown("ghost-seed-mismatch");
-            } else {
-                // Candidate stress tests deliberately perturb the copy by tiny amounts. A
-                // candidate that only survives one exact floating-point trajectory is too
-                // brittle to authorize an automated delay.
-                if (perturbation.startYOffset != 0.0f) {
-                    setCloneY(g_ghost, g_ghost->getPositionY() + perturbation.startYOffset);
-                }
-                if (perturbation.yVelocityOffset != 0.0f) {
-                    g_ghost->m_yVelocity += perturbation.yVelocityOffset;
-                }
-                size_t next = 0;
-                auto applySimEvent = [&](SimEvent const& event) {
-                    auto pb = static_cast<PlayerButton>(event.button);
-                    if (event.down) g_ghost->pushButton(pb);
-                    else g_ghost->releaseButton(pb);
-                    if (event.candidate) candidateApplied = true;
-                    if (event.syntheticOpposite) {
-                        oppositeEdgeApplied = true;
-                        oppositeEdgeStep = event.step;
-                    }
-                };
-
-                // v1.7.0: traj[k] = posicion tras `k` updates (traj[0] = siembra, ya con
-                // las perturbaciones aplicadas). Se registra despues del update de cada paso
-                // para que el paso final (muerte o cruce) tambien tenga su entrada exacta.
-                if (out.traj.size() < 256) {
-                    out.traj.emplace_back(g_ghost->getPositionX(), g_ghost->getPositionY());
-                }
-                // v1.7.0: el juego pasa physicsSecond (0.25, lo que medimos como g_stepDt) a
-                // PlayerObject::update, y physicsDelta (= physicsSecond/60) a
-                // updateInternalActions y updateSpecial (GJBaseGameLayer::update decompilado,
-                // camila314/gdp).
-                const float subDt = dt / 60.0f;
-
-                for (int step = 0; step < totalSteps; ++step) {
-                    if (SteadyClock::now() >= deadline) {
-                        out = unknown("prediction-wall-budget-exhausted");
-                        out.steps = step;
-                        break;
-                    }
-                    // v1.7.1: primera mitad del split de inputs. El input INMEDIATO llega
-                    // por handleButton sincrono (entre pasos, antes de todo el paso de
-                    // fisica siguiente): se aplica antes de los resets y de
-                    // updateInternalActions. Los eventos estan ordenados por
-                    // (step, beforeCollision), asi que este while consume solo los
-                    // beforeCollision de este paso y deja los encolados para despues.
-                    while (next < events.size() && events[next].step <= step &&
-                           events[next].beforeCollision) {
-                        applySimEvent(events[next++]);
-                    }
-
-                    // Fase pre-jugador del paso: el juego llama resetTouchedRings y
-                    // resetCollisionLog (en ese orden) al inicio de cada paso de fisica.
-                    if constexpr (requires { g_ghost->resetTouchedRings(false); }) {
-                        g_ghost->resetTouchedRings(false);
-                    }
-                    if constexpr (requires { g_ghost->resetCollisionLog(false); }) {
-                        g_ghost->resetCollisionLog(false);
-                    } else {
-                        g_ghost->m_collisionLogTop->removeAllObjects();
-                        g_ghost->m_collisionLogBottom->removeAllObjects();
-                        g_ghost->m_collisionLogLeft->removeAllObjects();
-                        g_ghost->m_collisionLogRight->removeAllObjects();
-                    }
-
-                    // v1.7.0/1.7.1: ORDEN EXACTO del loop de fisica del juego
-                    // (GJBaseGameLayer::update decompilado, camila314/gdp): resets ->
-                    // updateInternalActions -> update -> checkCollisions -> updateSpecial
-                    // -> updateRotation. v1.6.x ejecutaba la pasada de colisiones ANTES del
-                    // update: el clon era chequeado en la posicion de siembra y moria al
-                    // paso 0 (log 21.44.12: CLONE-DEATH en (0,105)) mientras el jugador
-                    // real siempre es chequeado tras moverse (muertes reales en x=1.30,
-                    // baseline que "sobrevive" al soltar). Ese orden invertido era la
-                    // causa raiz de TODAS las muertes fantasma en la ventana de spawn y
-                    // del NO SAFE CLEARANCE sistematico.
-                    if constexpr (requires { g_ghost->updateInternalActions(0.0f); }) {
-                        g_ghost->updateInternalActions(subDt);
-                    }
-
-                    // v1.7.1: segunda mitad del split de inputs. Los ENCOLADOS vencidos se
-                    // aplican aqui, exactamente donde dispatchPending los inyecta en el
-                    // juego real: inicio del hook de PlayerObject::update, o sea despues
-                    // de updateInternalActions y antes del cuerpo nativo de update.
-                    while (next < events.size() && events[next].step <= step) {
-                        applySimEvent(events[next++]);
-                    }
-
-                    const float beforeX = g_ghost->getPositionX();
-                    g_ghost->update(dt);
-                    const float movedX = g_ghost->getPositionX() - beforeX;
-                    const float afterY = g_ghost->getPositionY();
-                    if (afterY < trajMinY) trajMinY = afterY;
-                    if (afterY > trajMaxY) trajMaxY = afterY;
-                    if (out.traj.size() < 256) {
-                        out.traj.emplace_back(g_ghost->getPositionX(), g_ghost->getPositionY());
-                    }
-
-                    // Do not synthesize horizontal movement. The clone must advance through
-                    // PlayerObject::update like xdBot's native trajectory. If this state does
-                    // not move X naturally, fail closed instead of making a path by hand.
-                    if (std::abs(movedX) < 0.0001f) {
-                        if (!g_warnedX) {
-                            g_warnedX = true;
-                            ac_dbg("[IB] native clone X did not advance; refusing prediction");
-                        }
-                        out = unknown("ghost-x-did-not-advance-natively");
-                        out.steps = step + 1;
-                        break;
-                    }
-
-                    layer->checkCollisions(g_ghost, dt, false);
-
-                    if (g_unmodeled) {
-                        out = unknown("unmodeled-object-or-trigger");
-                        out.steps = step + 1;
-                        ac_dbg("[IB] sim step {} hit unmodeled object: id={} type={}",
-                            step, g_unmodeledObjectID, g_unmodeledObjectType);
-                        break;
-                    }
-                    if (g_cloneDied || g_ghost->m_isDead) {
-                        // Muerte tras `step+1` updates: exactamente los mismos updates que
-                        // ejecutaria el jugador real hasta morir (v1.6.x: solo `step`).
-                        out = {SimResult::Died, step + 1};
-                        out.deathX = g_cloneDeathX;
-                        out.deathObjectRight = g_cloneDeathObjectRight;
-                        out.knownPhysicalDeathObject = g_cloneDeathObjectKnown;
-                        out.deathObject = g_cloneDeathObject;
-                        break;
-                    }
-
-                    if (clearTargetX && candidateApplied &&
-                        g_ghost->getPositionX() >= *clearTargetX) {
-                        if (targetCrossStep < 0) targetCrossStep = step;
-                        const bool oppositeEdgeSettled = oppositeEdgeAfterCandidateTicks == 0 ||
-                            (oppositeEdgeApplied && step - oppositeEdgeStep >= kPostClearanceSteps);
-                        if (step - targetCrossStep >= kPostClearanceSteps && oppositeEdgeSettled) {
-                            // v1.6.4: "out = {SimResult::Safe, step+1}" reasignaba el SimOut
-                            // entero y BORRABA out.traj: chosenTraj llegaba vacio y la
-                            // validacion por edge de los SAVED se descartaba sin evidencia.
-                            out.result = SimResult::Safe;
-                            out.steps = step + 1;
-                            clearedTarget = true;
-                            break;
-                        }
-                    }
-
-                    if constexpr (requires { g_ghost->updateSpecial(0.0f); }) {
-                        g_ghost->updateSpecial(subDt);
-                    }
-                    g_ghost->updateRotation(dt);
-                }
-            }
-        }
-
-        if (g_ghost) {
-            out.endX = g_ghost->getPositionX();
-            out.endY = g_ghost->getPositionY();
-            out.minY = trajMinY;
-            out.maxY = trajMaxY;
-            out.endYVelocity = static_cast<float>(g_ghost->m_yVelocity);
-            out.endRotation = g_ghost->getRotation();
-            out.endIsDart = g_ghost->m_isDart;
-            out.endIsShip = g_ghost->m_isShip;
-            out.endIsBall = g_ghost->m_isBall;
-            out.endIsBird = g_ghost->m_isBird;
-            out.endIsRobot = g_ghost->m_isRobot;
-            out.endIsSpider = g_ghost->m_isSpider;
-            out.endIsSwing = g_ghost->m_isSwing;
-            out.endIsUpsideDown = g_ghost->m_isUpsideDown;
-            out.endIsOnGround = g_ghost->m_isOnGround;
-            out.endJumpBuffered = g_ghost->m_jumpBuffered;
-            out.endInputsLocked = g_ghost->m_inputsLocked;
-            out.endControlsDisabled = g_ghost->m_controlsDisabled;
-            out.endStateFlipGravity = g_ghost->m_stateFlipGravity;
-        }
-
-        if (clearTargetX && !clearedTarget && out.result == SimResult::Safe) {
-            out = unknown(budgetTruncated ? "clearance-budget-exhausted" : "hazard-clearance-timeout");
-            out.steps = totalSteps;
-        }
-
-        if (std::abs(real->getPositionX() - rx) > 0.0001f ||
-            std::abs(real->getPositionY() - ry) > 0.0001f ||
-            std::abs(real->m_yVelocity - rv) > 0.0001) {
-            if (!g_warnedWorld) {
-                g_warnedWorld = true;
-                ac_dbg("[IB] simulation modified the real player state");
-            }
-            return unknown("real-state-changed");
-        }
-
-        return out;
-    }
-
-    struct PredictionTimer {
-        SteadyClock::time_point start = SteadyClock::now();
-        ~PredictionTimer() {
-            g_lastPredictionMicros = std::chrono::duration_cast<std::chrono::microseconds>(
-                SteadyClock::now() - start).count();
-        }
-    };
-
-    // v1.6.1: el veredicto UNKNOWN por objeto/trigger no modelado pega el ID en la
-    // misma linea del veredicto (antes habia que buscar la linea "sim step" anterior).
-    // g_unmodeledObjectID se resetea en cada SimulationScope, y cualquier sim que lo
-    // marca termina rompiendo la busqueda como Unknown, asi que aqui es del clic actual.
-    std::string unmodeledSuffix() {
-        return g_unmodeledObjectID >= 0
-            ? fmt::format(" [unmodeledID={} type={}]", g_unmodeledObjectID, g_unmodeledObjectType)
-            : std::string();
-    }
-
-    int predictDelay(PlayLayer* layer, PlayerObject* player, bool down, int button,
-        int inheritedPressDelay = 0) {
-        const int safeFallbackDelay = std::max(0, inheritedPressDelay);
-        const int limit = limitFor(player);
-        if (!layer || !player) { ++g_skipOther; return safeFallbackDelay; }
-        if (limit <= 0)        { ++g_skipOff; return safeFallbackDelay; }
-        // On the first attempt there is no observed clock yet, so fail open and keep the
-        // user's immediate input. On retries, a previously stable measured dt window may be
-        // reused at tick 0; otherwise every first input after reset would be skipped forever.
-        if (g_tick < 2 && g_dtStable < static_cast<int>(kDtCalibrationSamples)) {
-            ++g_skipEarly;
-            g_unknownReason = "early-input-before-physics-calibration";
-            return safeFallbackDelay;
-        }
-        if (player->m_isDead)  { ++g_skipDead; return safeFallbackDelay; }
-        if (player->m_isPlatformer || button != 1 || layer->m_gameState.m_isDualMode) {
-            ++g_skipOther;
-            return safeFallbackDelay; // platformer, dual, or directional input is not modeled
-        }
-        if (!ensureGhost(layer)) { ++g_skipNoGhost; return safeFallbackDelay; }
-
-        const int key = buttonKey(button, true);
-        auto keyIt = g_keys.find(key);
-        if (keyIt != g_keys.end() && keyIt->second.pending > 0) {
-            ++g_skipOther;
-            return safeFallbackDelay; // never predict a second press/release while the matching key is pending
-        }
-
-        const int baselineTick = g_tick + 1;
-        const int requestedBaselineDelay = std::max(0, inheritedPressDelay);
-        const int immediateDue = effectiveDue(key, requestedBaselineDelay);
-        const int baselineDelay = std::max(0, immediateDue - baselineTick);
-        if (baselineDelay > limit) {
-            ++g_skipOther;
-            ac_dbg("[IB] {} tick {} -> PRESERVE-DELAY +{} (stage cap {})",
-                down ? "PRESS" : "RELEASE", g_tick, baselineDelay, limit);
-            return baselineDelay; // preserve the paired press/release offset even outside search cap
-        }
-
-        PredictionTimer timer;
-        ++g_clicksPredicted;
-        g_unknownReason = "";
-        const auto deadline = SteadyClock::now() + kPredictionWallBudget;
-
-        // A raw input with no queue is applied synchronously. Otherwise even a zero-delay event
-        // is queued and lands after the due tick's collision pass. This boolean fixes the phase
-        // used by the baseline simulation; candidate delays > baseline are always queued.
-        const bool baselineImmediate = g_queue.empty() && baselineDelay == 0;
-
-        ActivationGuard guard(layer);
-        int remainingSteps = kMaxStepsPerInput;
-        // Banda Y exacta alcanzada por TODAS las simulaciones de este clic (baseline,
-        // candidatos, centro, envolventes y ramas de estres). El veto final de triggers
-        // usa esta banda: si un trigger no exento es alcanzable por alguna trayectoria
-        // simulada, el mundo no es estatico para el clon y no se autoriza el retraso.
-        float bandMinY = player->getPositionY();
-        float bandMaxY = player->getPositionY();
-        auto runSimulation = [&](int due, std::optional<float> clearTarget = std::nullopt,
-                                 bool directInput = false,
-                                 SimPerturbation perturbation = {},
-                                 int oppositeEdgeAfterTicks = 0) -> SimOut {
-            if (remainingSteps <= 0) return unknown("per-click-budget-exhausted");
-            if (SteadyClock::now() >= deadline) return unknown("prediction-wall-budget-exhausted");
-            const SimOut result = simulate(layer, player, down, button, due, clearTarget,
-                std::min(kMaxSimSteps, remainingSteps), directInput, perturbation,
-                oppositeEdgeAfterTicks, deadline);
-            remainingSteps = std::max(0, remainingSteps - std::max(1, result.steps));
-            if (result.result != SimResult::Unknown) {
-                bandMinY = std::min(bandMinY, result.minY);
-                bandMaxY = std::max(bandMaxY, result.maxY);
-            }
-            if (SteadyClock::now() >= deadline) return unknown("prediction-wall-budget-exhausted");
-            return result;
-        };
-
-        const SimOut base = runSimulation(immediateDue, std::nullopt, baselineImmediate);
-        guard.restore();
-
-        int chosen = baselineDelay;
-        int chosenDue = immediateDue;
-
-        if (base.result == SimResult::Safe) {
-            // v1.6.2: NO se libera la pausa aqui. "El baseline no murio de inmediato" es
-            // evidencia debil (mira solo el horizonte corto); la pausa se libera cuando
-            // la TRAYECTORIA del jugador real coincide con la del clon. Se arma el chequeo
-            // con la trayectoria por paso: si el mundo real diverge, MODEL-DIVERGENCE.
-            // v1.6.3: deadline con off-by-one corregido (el clon hacia steps-1 updates).
-            // v1.7.0: el orden update->checkCollisions hace que el clon ejecute exactamente
-            // `steps` updates; el jugador real alcanza expectX/expectY en serial+steps.
-            g_realityCheck.active = true;
-            g_realityCheck.expectDeath = false;
-            g_realityCheck.steps = base.steps;
-            g_realityCheck.expectX = base.endX;
-            g_realityCheck.expectY = base.endY;
-            g_realityCheck.expectDeathX = 0.0f;
-            g_realityCheck.expectDeathObjectID = -1;
-            g_realityCheck.expectDeathObject = nullptr;
-            g_realityCheck.armedInSpawnWindow = (g_tick <= 3);
-            g_realityCheck.down = down;
-            g_realityCheck.button = button;
-            g_realityCheck.armSerialTick = g_physicsSerialTick;
-            g_realityCheck.deadlineSerialTick = g_physicsSerialTick + std::max(1, base.steps);
-            g_realityCheck.traj = base.traj;
-            ++g_statKept;
-            if constexpr (kLogVerdicts) {
-                ac_dbg("[IB] {} tick {} -> NO-IMMEDIATE-DEATH (lookahead={} steps; {} budget steps left)",
-                    down ? "PRESS" : "RELEASE", g_tick, base.steps, remainingSteps);
-            }
-        }
-        else if (base.result == SimResult::Unknown) {
-            ++g_statUnknown;
-            if constexpr (kLogVerdicts) {
-                ac_dbg("[IB] {} tick {} -> UNKNOWN ({}){}",
-                    down ? "PRESS" : "RELEASE", g_tick, g_unknownReason, unmodeledSuffix());
-            }
-        }
-        else {
-            // A delayed event is only justified when the baseline death is repeatable and
-            // tied to one stable physical object. Otherwise the target edge is untrustworthy.
-            if (!base.knownPhysicalDeathObject || !base.deathObject ||
-                !std::isfinite(base.deathObjectRight)) {
-                ++g_statUnknown;
-                g_unknownReason = "death-without-known-static-physical-object";
-                ac_dbg("[IB] {} tick {} -> UNKNOWN ({})",
-                    down ? "PRESS" : "RELEASE", g_tick, g_unknownReason);
-                return safeFallbackDelay;
-            }
-
-            const SimOut baselineConfirm = runSimulation(immediateDue, std::nullopt, baselineImmediate);
-            guard.restore();
-            if (!sameBaselineDeath(base, baselineConfirm)) {
-                ++g_statUnknown;
-                g_unknownReason = "nondeterministic-baseline-death";
-                ac_dbg("[IB] tick {} rejected: baseline death did not reproduce ({} vs {})",
-                    g_tick, base.steps, baselineConfirm.steps);
-                return safeFallbackDelay;
-            }
-
-            // ---- v1.6.2: chequeo de realidad (modo muerte prevista) ----
-            // Esta muerte de referencia solo deberia verse en la realidad si el input
-            // pasa tal cual (fail open). Programa el chequeo: si el serialTick de la
-            // muerte prevista llega con el jugador real vivo y sin edges nuevos, el
-            // baseline era una muerte fantasma del modelo, no del mundo.
-            // v1.6.3: se guarda el objeto y el X previstos: la muerte real solo cuenta
-            // como "baseline acerto" (y como escape de spawn) si coincide con ellos.
-            g_realityCheck.active = true;
-            g_realityCheck.expectDeath = true;
-            g_realityCheck.steps = base.steps;
-            g_realityCheck.expectX = 0.0f;
-            g_realityCheck.expectY = 0.0f;
-            g_realityCheck.expectDeathX = base.deathX;
-            g_realityCheck.expectDeathObjectID = base.deathObject ? base.deathObject->m_objectID : -1;
-            g_realityCheck.expectDeathObject = base.deathObject;
-            g_realityCheck.armedInSpawnWindow = (g_tick <= 3);
-            g_realityCheck.down = down;
-            g_realityCheck.button = button;
-            g_realityCheck.armSerialTick = g_physicsSerialTick;
-            g_realityCheck.deadlineSerialTick = g_physicsSerialTick + base.steps + 3;
-            g_realityCheck.traj.clear();
-
-            // v1.6.2: muerte del clon en <=2 pasos con el intento recien arrancado
-            // (g_tick<=3). El respawn asienta colisiones en el jugador real que el clon
-            // recien sembrado no replica (el log 20.22.21 muestra 36 muertes asi contra
-            // un objeto con objectRight=3.00 mientras el jugador real vive ~160 ticks).
-            // No se busca retraso contra una muerte en la que no se confia. ESCAPE: si
-            // el jugador real muere de verdad en <=2 pasos dentro de la ventana prevista
-            // (startpos pegada a un pico), g_spawnDeathsReal lo desactiva para siempre
-            // en este nivel: la muerte de spawn era real.
-            if (base.steps <= 2 && g_tick <= 3 && !g_spawnDeathsReal) {
-                g_predictionsPaused = true;
-                ++g_statUnknown;
-                g_unknownReason = "baseline-death-at-spawn-state";
-                ac_dbg("[IB] {} tick {} -> UNKNOWN ({}; cloneDiedStep={} objectRight={:.2f} deathX={:.2f} dart={} y={:.2f})",
-                    down ? "PRESS" : "RELEASE", g_tick, g_unknownReason, base.steps,
-                    base.deathObjectRight, base.deathX,
-                    player->m_isDart, player->getPositionY());
-                return safeFallbackDelay;
-            }
-
-            // v1.6.2: el modelo esta en pausa y seguimos en la ventana de spawn
-            // (g_tick<=3): el estado de arranque todavia no coincide con la realidad, no
-            // gastes la busqueda. A mitad de intento (g_tick>3) se busca NORMAL aunque
-            // haya pausa: el estado ya no es el de spawn y bloquear ahi impide saves
-            // reales. Si ese clic a mitad de intento encuentra solucion, su chequeo de
-            // trayectoria valida el modelo y libera la pausa si coincide.
-            if (g_predictionsPaused && g_tick <= 3) {
-                ++g_statUnknown;
-                g_unknownReason = "phantom-guard-paused";
-                ac_dbg("[IB] {} tick {} -> UNKNOWN ({}; phantomDeaths={})",
-                    down ? "PRESS" : "RELEASE", g_tick, g_unknownReason, g_phantomDeaths);
-                return safeFallbackDelay;
-            }
-
-            // ---- v1.6.3: gate de autorizacion de SAVEDs ----
-            // La validacion del modelo debe ser un requisito, no solo un diagnostico:
-            // si nunca se ha confirmado la trayectoria (o divergio hace poco), autorizar
-            // retrasos seria confiar el input a un modelo sin respaldo. Fail open: el
-            // clic pasa crudo, sin retraso. Los KEPTs siguen armando chequeos; cada
-            // coincidencia de trayectoria (deadline o edge) acumula evidencia y, con
-            // kMinTrajectoryMatchesForSave, desbloquea los SAVEDs.
-            if (!saveAuthorizationValidated()) {
-                ++g_statUnknown;
-                g_unknownReason = "save-authorization-unvalidated-model";
-                ac_dbg("[IB] {} tick {} -> UNKNOWN ({}; matches={} lastDivergenceSerial={} now={})",
-                    down ? "PRESS" : "RELEASE", g_tick, g_unknownReason, g_trajectoryMatches,
-                    g_lastDivergenceSerial, g_physicsSerialTick);
-                return safeFallbackDelay;
-            }
-
-            const auto playerRect = player->GameObject::getObjectRect();
-            const float halfPlayerWidth = std::max(
-                kMinConservativeHalfWidth,
-                std::abs(playerRect.size.width) * 0.5f
-            );
-            const float hazardClearTargetX = base.deathObjectRight + halfPlayerWidth + kHazardClearancePadding;
-            // Do not call one cleared obstacle "safe" immediately. Continue through a 24-unit
-            // corridor so nearby chained hazards are checked by native collision simulation.
-            const float validationTargetX = hazardClearTargetX + kPostClearanceDistance;
-            if (!std::isfinite(validationTargetX) ||
-                hazardClearTargetX <= player->getPositionX() + 0.1f ||
-                hazardClearTargetX <= base.deathX + 0.1f || validationTargetX <= hazardClearTargetX) {
-                ++g_statUnknown;
-                g_unknownReason = "invalid-hazard-validation-target";
-                ac_dbg("[IB] tick {} -> UNKNOWN ({}) hazardX={:.2f} validationX={:.2f} deathX={:.2f}",
-                    g_tick, g_unknownReason, hazardClearTargetX, validationTargetX, base.deathX);
-                return safeFallbackDelay;
-            }
-
-            // Geometry moved by actions/triggers is not advanced by checkCollisions(clone).
-            // If a physical moving/animated object exists in the predicted X corridor, do not
-            // use the static-world simulation to authorize a delayed click.
-            if (hasDynamicPhysicalObjectInXRange(
-                    layer, player->getPositionX() - 32.0f, validationTargetX + 24.0f)) {
-                ++g_statUnknown;
-                g_unknownReason = "dynamic-physical-object-in-corridor";
-                ac_dbg("[IB] tick {} -> UNKNOWN ({})", g_tick, g_unknownReason);
-                return safeFallbackDelay;
-            }
-
-            const auto calibratedEdgeOffsets = futureEdgeOffsets(key, down, limit);
-            if (calibratedEdgeOffsets.empty()) {
-                ++g_statUnknown;
-                g_unknownReason = "future-edge-history-not-calibrated";
-                auto profileIt = g_edgeProfiles.find(key);
-                const size_t available = profileIt == g_edgeProfiles.end() ? 0 :
-                    (down ? profileIt->second.holdTicks.size() : profileIt->second.releaseGapTicks.size());
-                ac_dbg("[IB] {} tick {} -> UNKNOWN (edge history {}/{}; serialTick={}, profile={} samples)",
-                    down ? "PRESS" : "RELEASE", g_tick, available, kMinimumEdgeSamples,
-                    g_physicsSerialTick, down ? "hold" : "gap");
-                return safeFallbackDelay;
-            }
-
-            // ---- Veto temprano de triggers (v1.5.0) ----
-            // Un trigger no exento (mover/toggle/spawn/count/portal de gravedad...) solo
-            // invalida la prediccion si el jugador puede cruzarlo dentro del corredor. La
-            // version vieja rechazaba CUALQUIER EffectGameObject en [playerX-32, valX+24],
-            // sin importar Y ni tipo: con una trigger line normal al inicio del nivel (colores,
-            // bg, shake...) el 100% de las predicciones acababa en UNKNOWN y el input buffer
-            // nunca salvaba nada. Ahora:
-            //  - X: desde el borde del hitbox del jugador (lo que queda detras ya no puede
-            //    volver a dispararse en modo clasico) hasta el final del corredor de validacion.
-            //  - Y: banda conservadora que cubre la baseline + toda excursion posible de los
-            //    candidatos y del estres de release aprendido.
-            //  - whitelist: triggers puramente visuales/audio nunca vetan.
-            int maxEdgeOffset = 0;
-            for (int n : calibratedEdgeOffsets) maxEdgeOffset = std::max(maxEdgeOffset, n);
-            // Cota de |dy| por subpaso: la onda es diagonal (|dy| = |dx| ~ 1.3 en 1x);
-            // usar el suelo 3.5 en wave infla la banda y veta triggers inalcanzables.
-            // El resto de modos puede caer mas rapido que su dx: suelo conservador.
-            // v1.6.3: justo despues de un reset g_lastDx es 0 y el floor 0.5 subestimaba
-            // la excursion. Fallback con la velocidad nativa medida del jugador real.
-            float dxPerTickGuess = std::abs(g_lastDx);
-            if (!(dxPerTickGuess > 0.0f) || !std::isfinite(dxPerTickGuess)) {
-                dxPerTickGuess = std::abs(static_cast<float>(player->getCurrentXVelocity()) * g_stepDt);
-            }
-            const float dyPerTickGuess = (player->m_isDart)
-                ? std::max(dxPerTickGuess, 0.5f)
-                : std::max(dxPerTickGuess, 3.5f);
-            // v1.6.2: floor 96 -> 48: la banda era mas ancha que cualquier salto de
-            // corredor; el veto exacto post-candidato sigue de respaldo fail-closed.
-            const float coarseExcursion = std::max(48.0f,
-                (static_cast<float>(maxEdgeOffset) + static_cast<float>(kHorizon) +
-                 static_cast<float>(limit) + 8.0f) * dyPerTickGuess);
-            const float coarseMinY = std::min(base.minY, player->getPositionY()) - coarseExcursion;
-            const float coarseMaxY = std::max(base.maxY, player->getPositionY()) + coarseExcursion;
-            EffectVetoInfo corridorVeto;
-            if (hasUnsupportedEffectObjectInBand(
-                    layer, playerRect.getMinX(), validationTargetX + 24.0f,
-                    coarseMinY, coarseMaxY, &corridorVeto)) {
-                ++g_statUnknown;
-                g_unknownReason = "unsupported-effect-object-in-corridor";
-                ac_dbg("[IB] {} tick {} -> UNKNOWN ({}) vetoedObjectID={} type={} x={:.2f} y={:.2f}",
-                    down ? "PRESS" : "RELEASE", g_tick, g_unknownReason,
-                    corridorVeto.objectID, corridorVeto.objectType,
-                    corridorVeto.x, corridorVeto.y);
-                return safeFallbackDelay;
-            }
-
-            bool found = false;
-            bool unstable = false;
-            int unknownCands = 0;
-            int fragileCandidates = 0;
-            int bestSurvive = 0;
-            int bestDelay = 0;
-            int chosenClearSteps = 0;
-            int chosenEdgeBranches = 0;
-            float chosenEndX = 0.0f;
-            float chosenEndY = 0.0f;
-            std::vector<std::pair<float, float>> chosenTraj;
-
-            int lastDueChecked = immediateDue;
-            for (int totalDelay = baselineDelay + 1; totalDelay <= limit; ++totalDelay) {
-                if (remainingSteps <= 0) {
-                    g_unknownReason = "per-click-budget-exhausted";
-                    unstable = true;
-                    break;
-                }
-                const int due = effectiveDue(key, totalDelay);
-                const int effectiveDelay = due - baselineTick;
-                if (due == lastDueChecked) continue;
-                lastDueChecked = due;
-                if (effectiveDelay <= baselineDelay || effectiveDelay > limit) continue;
-
-                const SimOut r = runSimulation(due, validationTargetX);
-                guard.restore();
-
-                if (r.result == SimResult::Safe) {
-                    // A positive verdict is replayed from a freshly seeded clone. The same
-                    // clearance step and end-state must be reproduced before any click moves.
-                    const SimOut confirm = runSimulation(due, validationTargetX);
-                    guard.restore();
-                    if (!sameSafeClearance(r, confirm)) {
-                        ++unknownCands;
-                        g_unknownReason = "nondeterministic-safe-candidate";
-                        ac_dbg("[IB] tick {} delay {} rejected: clearance replay differs ({} vs {})",
-                            g_tick, effectiveDelay, r.steps, confirm.steps);
-                        unstable = true;
-                        break;
-                    }
-
-                    // Robustness envelope: validate the chosen timing under small, symmetric
-                    // perturbations of timestep, initial Y, and Y velocity. These are not claimed
-                    // to be alternate GD physics; they are a conservative sensitivity check for
-                    // a candidate that depends on a razor-thin numerical boundary.
-                    const SimPerturbation lowerEnvelope{0.999f, -0.05f, -0.01f};
-                    const SimOut lower = runSimulation(due, validationTargetX, false, lowerEnvelope);
-                    guard.restore();
-                    if (lower.result == SimResult::Unknown) {
-                        ++unknownCands;
-                        g_unknownReason = "lower-sensitivity-envelope-unknown";
-                        unstable = true;
-                        break;
-                    }
-                    if (lower.result != SimResult::Safe) {
-                        ++fragileCandidates;
-                        continue;
-                    }
-
-                    const SimPerturbation upperEnvelope{1.001f, 0.05f, 0.01f};
-                    const SimOut upper = runSimulation(due, validationTargetX, false, upperEnvelope);
-                    guard.restore();
-                    if (upper.result == SimResult::Unknown) {
-                        ++unknownCands;
-                        g_unknownReason = "upper-sensitivity-envelope-unknown";
-                        unstable = true;
-                        break;
-                    }
-                    if (upper.result != SimResult::Safe) {
-                        ++fragileCandidates;
-                        continue;
-                    }
-
-                    // The original 3-tick margin made every SAVED impossible when the wave cap
-                    // was 2: a fatal baseline plus three safe delays cannot fit in that range.
-                    // Use a 3-tick contiguous window where available, otherwise a 2-tick window
-                    // and choose the later tick. Sensitivity and replay checks still apply.
-                    const bool twoTickWindow = (limit - baselineDelay) < 3;
-                    const int centerRequested = totalDelay + 1;
-                    const int tailRequested = totalDelay + 2;
-                    if (centerRequested > limit || (!twoTickWindow && tailRequested > limit)) {
-                        ++fragileCandidates;
-                        continue;
-                    }
-                    const int centerDue = effectiveDue(key, centerRequested);
-                    const int tailDue = twoTickWindow ? centerDue : effectiveDue(key, tailRequested);
-                    const int centerDelay = centerDue - baselineTick;
-                    const int tailDelay = tailDue - baselineTick;
-                    if (centerDelay != effectiveDelay + 1 ||
-                        (!twoTickWindow && (tailDelay != centerDelay + 1 || tailDelay > limit))) {
-                        ++fragileCandidates;
-                        continue;
-                    }
-
-                    const SimOut centerProbe = runSimulation(centerDue, validationTargetX);
-                    guard.restore();
-                    if (centerProbe.result == SimResult::Unknown) {
-                        ++unknownCands;
-                        g_unknownReason = "timing-window-center-unknown";
-                        unstable = true;
-                        break;
-                    }
-                    if (centerProbe.result != SimResult::Safe) {
-                        ++fragileCandidates;
-                        continue;
-                    }
-                    if (!twoTickWindow) {
-                        const SimOut tailProbe = runSimulation(tailDue, validationTargetX);
-                        guard.restore();
-                        if (tailProbe.result == SimResult::Unknown) {
-                            ++unknownCands;
-                            g_unknownReason = "timing-window-tail-unknown";
-                            unstable = true;
-                            break;
-                        }
-                        if (tailProbe.result != SimResult::Safe) {
-                            ++fragileCandidates;
-                            continue;
-                        }
-                    }
-
-                    // Replay the actual selected center timing; the first robust tick is not
-                    // the one sent to the game. The center itself must pass replay + envelope.
-                    const SimOut centerConfirm = runSimulation(centerDue, validationTargetX);
-                    guard.restore();
-                    if (!sameSafeClearance(centerProbe, centerConfirm)) {
-                        ++unknownCands;
-                        g_unknownReason = "timing-window-center-replay-differs";
-                        unstable = true;
-                        break;
-                    }
-
-                    const SimOut centerLower = runSimulation(centerDue, validationTargetX, false, lowerEnvelope);
-                    guard.restore();
-                    if (centerLower.result == SimResult::Unknown) {
-                        ++unknownCands;
-                        g_unknownReason = "timing-window-center-lower-unknown";
-                        unstable = true;
-                        break;
-                    }
-                    if (centerLower.result != SimResult::Safe) {
-                        ++fragileCandidates;
-                        continue;
-                    }
-
-                    const SimOut centerUpper = runSimulation(centerDue, validationTargetX, false, upperEnvelope);
-                    guard.restore();
-                    if (centerUpper.result == SimResult::Unknown) {
-                        ++unknownCands;
-                        g_unknownReason = "timing-window-center-upper-unknown";
-                        unstable = true;
-                        break;
-                    }
-                    if (centerUpper.result != SimResult::Safe) {
-                        ++fragileCandidates;
-                        continue;
-                    }
-
-                    // Test only observed recent hold/gap durations, not every arbitrary tick.
-                    // The all-offset sweep made wave candidates fail on hypothetical edge times
-                    // that the player never uses and routinely exhausted the work budget.
-                    bool inputEdgeProfileRobust = true;
-                    int inputEdgeBranchesPassed = 0;
-                    for (int oppositeOffset : calibratedEdgeOffsets) {
-                        const SimOut edgeBranch = runSimulation(
-                            centerDue, validationTargetX, false, {}, oppositeOffset);
-                        guard.restore();
-                        if (edgeBranch.result == SimResult::Unknown) {
-                            ++unknownCands;
-                            g_unknownReason = "measured-input-edge-branch-unknown";
-                            unstable = true;
-                            inputEdgeProfileRobust = false;
-                            break;
-                        }
-                        if (edgeBranch.result != SimResult::Safe) {
-                            ++fragileCandidates;
-                            inputEdgeProfileRobust = false;
-                            break;
-                        }
-                        ++inputEdgeBranchesPassed;
-                    }
-                    if (unstable) break;
-                    if (!inputEdgeProfileRobust) continue;
-
-                    // ---- Veto exacto de triggers (v1.5.0) ----
-                    // Banda Y = union de TODAS las trayectorias simuladas para este clic.
-                    // Si un trigger no exento puede cruzarse dentro del corredor X, la
-                    // simulacion estatica no describe el mundo real: fail closed.
-                    EffectVetoInfo exactVeto;
-                    if (hasUnsupportedEffectObjectInBand(
-                            layer, playerRect.getMinX(), validationTargetX + 24.0f,
-                            bandMinY - kTriggerBandYPad, bandMaxY + kTriggerBandYPad,
-                            &exactVeto)) {
-                        ++unknownCands;
-                        g_unknownReason = "unsupported-effect-object-in-candidate-band";
-                        ac_dbg("[IB] {} tick {} delay {} -> UNKNOWN ({}) vetoedObjectID={} type={} x={:.2f} y={:.2f}",
-                            down ? "PRESS" : "RELEASE", g_tick, effectiveDelay, g_unknownReason,
-                            exactVeto.objectID, exactVeto.objectType, exactVeto.x, exactVeto.y);
-                        unstable = true;
-                        break;
-                    }
-
-                    chosen = centerDelay;
-                    chosenDue = centerDue;
-                    chosenClearSteps = centerConfirm.steps;
-                    chosenEdgeBranches = inputEdgeBranchesPassed;
-                    chosenEndX = centerConfirm.endX;
-                    chosenEndY = centerConfirm.endY;
-                    chosenTraj = centerConfirm.traj;
-                    found = true;
-                    break; // center of a three-tick clear window, replayed and sensitivity-checked
-                }
-                if (r.result == SimResult::Died && r.steps > bestSurvive) {
-                    bestSurvive = r.steps;
-                    bestDelay = effectiveDelay;
-                }
-                if (r.result == SimResult::Unknown) {
-                    ++unknownCands;
-                    // Unknown state (unsupported effect, moving geometry, X mismatch or budget
-                    // exhaustion) invalidates this whole search; don't cherry-pick later trials.
-                    unstable = true;
-                    break;
-                }
-            }
-
-            if (SteadyClock::now() >= deadline) {
-                unstable = true;
-                found = false;
-                g_unknownReason = "prediction-wall-budget-exhausted";
-            }
-            if (unstable) {
-                ++g_statUnknown;
-                if (!g_unknownReason || g_unknownReason[0] == '\0') g_unknownReason = "candidate-simulation-unknown";
-                ac_dbg("[IB] {} tick {} -> UNKNOWN ({}, testedStepsLeft={}){}",
-                    down ? "PRESS" : "RELEASE", g_tick, g_unknownReason, remainingSteps, unmodeledSuffix());
-            }
-            else if (found) {
-                // v1.6.2: el retraso autorizado cambia el futuro respecto al baseline, asi
-                // que se arma un NUEVO chequeo de realidad con la trayectoria que el clon
-                // siguio con el input retrasado (centerConfirm). El jugador real recorrera
-                // esa misma trayectoria (el input encolado se aplica en el mismo due); si
-                // su posicion en el deadline no coincide, el SAVED era falso:
-                // MODEL-DIVERGENCE + pausa. Asi se verifican los SAVED a posteriori.
-                // v1.6.3: deadline con off-by-one corregido y trayectoria por paso para
-                // que un edge temprano tambien valide el SAVED.
-                // v1.7.0: orden update->checkCollisions => el cruce ocurre tras exactamente
-                // chosenClearSteps updates; deadline serial+steps sin compensacion.
-                g_realityCheck.active = true;
-                g_realityCheck.expectDeath = false;
-                g_realityCheck.steps = chosenClearSteps;
-                g_realityCheck.expectX = chosenEndX;
-                g_realityCheck.expectY = chosenEndY;
-                g_realityCheck.expectDeathX = 0.0f;
-                g_realityCheck.expectDeathObjectID = -1;
-                g_realityCheck.expectDeathObject = nullptr;
-                g_realityCheck.armedInSpawnWindow = (g_tick <= 3);
-                g_realityCheck.down = down;
-                g_realityCheck.button = button;
-                g_realityCheck.armSerialTick = g_physicsSerialTick;
-                g_realityCheck.deadlineSerialTick = g_physicsSerialTick + std::max(1, chosenClearSteps);
-                g_realityCheck.traj = chosenTraj;
-                ++g_statSaved;
-                const int actualDelay = chosenDue - baselineTick;
-                const float nominalFrames = actualDelay * g_stepDt * 60.0f;
-                ac_console::line(fmt::format(
-                    "[InputBuffer] *** SAVED +{} UPDATE-TICKS ({:.2f} measured frames @ 60fps) {}! "
-                    "(base death step={} object-right={:.2f} -> validation-X={:.2f}, step={}) [Limit: {}] ***",
-                    actualDelay, nominalFrames, down ? "PRESS" : "RELEASE",
-                    base.steps, base.deathObjectRight, validationTargetX, chosenClearSteps, limit
-                ));
-                log::info(
-                    "[IB] SAVED profile-validated event={} tick={} delay={} limit={} validationX={:.2f} "
-                    "validatedThroughStep={} oppositeEdgeBranches={} remainingBudget={}",
-                    down ? "PRESS" : "RELEASE", g_tick, actualDelay, limit, validationTargetX,
-                    chosenClearSteps, chosenEdgeBranches, remainingSteps
-                );
-            }
-            else {
-                // v1.8.0: sin diagnostico de spawn imposible ni log — el veredicto es
-                // simplemente "ningun retraso seguro encontrado": el input pasa crudo.
-                ++g_statNoSolution;
-            }
-        }
-
-        return chosen;
-    }
-
-
-    // ========================================================================
-    // Cola
-    // ========================================================================
-    void queueInput(PlayLayer* layer, bool down, int button, bool isPlayer1, int delay) {
-        if (!layer) return;
-
-        const int key = buttonKey(button, isPlayer1);
-        auto it = g_keys.find(key);
-        const bool keyPending = it != g_keys.end() && it->second.pending > 0;
-
-        if (delay == 0 && g_queue.empty() && !keyPending) {
-            if (down) g_activePressDelay[key] = 0;
-            QueuedInputScope scope;
-            layer->handleButton(down, button, isPlayer1);
-            if (!down) g_activePressDelay.erase(key);
-            return;
-        }
-
-        const int baseTick = g_tick + 1;
-        const int due = effectiveDue(key, delay);
-        const int scheduledShift = std::max(0, due - baseTick);
-        if (down) g_activePressDelay[key] = scheduledShift;
-
-        auto pos = std::upper_bound(
-            g_queue.begin(), g_queue.end(), due,
-            [](int v, PendingInput const& item) { return v < item.tick; });
-        g_queue.insert(pos, PendingInput{due, down, button, isPlayer1});
-
-        auto& ks = g_keys[key];
-        ks.lastDue = std::max(ks.lastDue, due);
-        ++ks.pending;
-        // This is the logical state of the latest raw edge, not a report of delivery. Clear it
-        // when release is captured so a later queued press can establish a new hold shift.
-        if (!down) g_activePressDelay.erase(key);
-    }
-
-    // Queue at an absolute physics-update tick even when the delay is zero. This is
-    // needed for the wave grid: a grid edge due on the next update must not be applied
-    // synchronously between updates just because its relative delay is 0.
-    void queueInputAtTick(PlayLayer* layer, bool down, int button, bool isPlayer1, int due) {
-        if (!layer) return;
-        const int key = buttonKey(button, isPlayer1);
-        due = std::max(due, g_tick + 1);
-
-        const int baseTick = g_tick + 1;
-        if (down) g_activePressDelay[key] = std::max(0, due - baseTick);
-
-        auto pos = std::upper_bound(
-            g_queue.begin(), g_queue.end(), due,
-            [](int v, PendingInput const& item) { return v < item.tick; });
-        g_queue.insert(pos, PendingInput{due, down, button, isPlayer1});
-
-        auto& ks = g_keys[key];
-        ks.lastDue = std::max(ks.lastDue, due);
-        ++ks.pending;
-        if (!down) g_activePressDelay.erase(key);
-    }
-
-    // Resolve the reactive buffer before the next native PlayerObject update, so the
-    // input is delivered in the same phase as the original mod's buffered commands.
-    void serviceReactiveBuffers(PlayLayer* layer, int nextTick) {
-        if (!layer || !layer->m_player1 || layer->m_player1->m_isDead) return;
-        auto* player = layer->m_player1;
-        constexpr int kJumpButton = 1;
-        const int key = buttonKey(kJumpButton, true);
-
-        if (g_landingBuffer.pending) {
-            const int limit = limitFor(player);
-            const int waited = nextTick - g_landingBuffer.startTick;
-            if (limit <= 0 || waited > limit || !isGroundBufferMode(player)) {
-                g_landingBuffer = {};
-            }
-            else if (player->m_isOnGround || touchingRingCount(player) > 0) {
-                const bool released = g_landingBuffer.releasedBeforeLanding;
-                const bool onRing = touchingRingCount(player) > 0;
-                const int bufferedTicks = waited;
-                g_landingBuffer = {};
-                queueInputAtTick(layer, true, kJumpButton, true, nextTick);
-                if (released) {
-                    // A tap released before landing still produces one short jump input.
-                    queueInputAtTick(layer, false, kJumpButton, true, nextTick + 1);
-                }
-                else {
-                    // Its eventual real release should not be re-predicted independently.
-                    g_landingManagedKeys.insert(key);
-                }
-                ac_console::line(fmt::format(
-                    "[InputBuffer] *** SAVED +{} UPDATE-TICKS (landing buffer; {}) PRESS! [Limit: {}] ***",
-                    bufferedTicks, onRing ? "ORB" : "GROUND", limit));
-                ac_dbg("[IB] landing-buffer fired at tick {} (releasedEarly={})",
-                    nextTick, released ? 1 : 0);
-            }
-        }
-
-        if (g_flightBuffer.delayedRelease &&
-            (!isFlightBufferMode(player) || nextTick >= g_flightBuffer.releaseAt)) {
-            g_flightBuffer.delayedRelease = false;
-            g_flightBuffer.pressed = false;
-            g_flightBuffer.pressTick = -1;
-            queueInputAtTick(layer, false, kJumpButton, true, nextTick);
-            ac_dbg("[IB] minimum-hold release fired at tick {}", nextTick);
-        }
-    }
-
-    void dispatchPending(PlayLayer* layer, int nextTick) {
-        if (!layer) return;
-        if (!layer->m_player1 || layer->m_player1->m_isDead) {
-            if (!g_queue.empty() && !g_warnedDeathQueue) {
-                g_warnedDeathQueue = true;
-                ac_dbg("[IB] pending inputs discarded because the real player is dead");
-            }
-            clearInputs();
-            return;
-        }
-
-        while (!g_queue.empty() && g_queue.front().tick <= nextTick) {
-            const auto input = g_queue.front();
-            g_queue.pop_front();
-
-            auto it = g_keys.find(buttonKey(input.button, input.isPlayer1));
-            if (it != g_keys.end() && --it->second.pending <= 0) {
-                g_keys.erase(it);
-            }
-
-            QueuedInputScope scope;
-            layer->handleButton(input.down, input.button, input.isPlayer1);
-        }
-    }
-
-    void flushPendingNow(PlayLayer* layer) {
-        if (!layer || !layer->m_player1 || layer->m_player1->m_isDead) {
-            clearInputs();
-            return;
-        }
-        while (!g_queue.empty()) {
-            const auto input = g_queue.front();
-            g_queue.pop_front();
-            QueuedInputScope scope;
-            layer->handleButton(input.down, input.button, input.isPlayer1);
-        }
-        g_keys.clear();
-        g_activePressDelay.clear();
-    }
-
-} // namespace ac
-
-$on_mod(Loaded) {
-    ac::showBannerOnce();
+// ---- settings --------------------------------------------------------
+static constexpr char const* STAGE_NAMES[] = {"2 ticks", "4 ticks", "8 ticks", "16 ticks", "Off"};
+static constexpr int STAGES[] = {2, 4, 8, 16, 0};
+static constexpr int STAGE_COUNT = 5;
+static int g_stage = 1;
+
+static constexpr int WAVE_MAX_TICKS = 8;
+
+// After a spawn, wave Grid / Min Gap are skipped for this many ticks.
+static constexpr int SPAWN_GRACE_TICKS = 16;
+
+// Index: 0 cube, 1 ball, 2 robot, 3 spider, 4 ship, 5 ufo, 6 swing, 7 wave.
+// Value: -1 = same as main window, 0 = off, >0 = custom ticks.
+static constexpr int MODE_COUNT = 8;
+static constexpr int MODE_WAVE = 7;
+static constexpr char const* MODE_KEYS[] = {
+    "cube-ticks", "ball-ticks", "robot-ticks", "spider-ticks",
+    "ship-ticks", "ufo-ticks", "swing-ticks", "wave-ticks"
+};
+static int g_modeTicks[MODE_COUNT] = {-1, -1, -1, -1, -1, -1, -1, -1};
+
+static constexpr char const* WAVE_NAMES[] = {"Min Hold", "Min Gap", "Grid"};
+enum WaveMode { WAVE_HOLD = 0, WAVE_GAP = 1, WAVE_GRID = 2 };
+static constexpr int WAVE_MODE_COUNT = 3;
+static int g_waveMode = WAVE_GRID;
+
+static constexpr char const* TPS_NAMES[] = {"60", "120", "240", "360", "480", "720", "960", "1000"};
+static constexpr int TPS_PRESETS[] = {60, 120, 240, 360, 480, 720, 960, 1000};
+static constexpr int TPS_COUNT = 8;
+static int g_tpsIndex = 2;
+
+static bool g_debug = false;
+
+// Hotkeys. Order: 0 stage, 1 tps up, 2 tps down, 3 debug, 4 wave mode.
+static constexpr int KEY_COUNT = 5;
+static constexpr char const* KEY_SETTINGS[] = {"key-stage", "key-tps-up", "key-tps-down", "key-debug", "key-wave"};
+static int g_keyVK[KEY_COUNT] = {0, 0, 0, 0, 0}; // 0 = none
+
+// Raised whenever the level resets (death, restart, checkpoint).
+static int g_resetEpoch = 0;
+// ----------------------------------------------------------------------
+
+#define DBG(...) do { if (g_debug) log::info(__VA_ARGS__); } while (0)
+
+static int indexOf(char const* const* names, int n, std::string const& v, int def) {
+    for (int i = 0; i < n; i++) if (v == names[i]) return i;
+    return def;
 }
 
-// ============================================================================
-// Hooks
-// ============================================================================
-class $modify(IBKeyboard, CCKeyboardDispatcher) {
-    bool dispatchKeyboardMSG(cocos2d::enumKeyCodes key, bool down, bool repeat, double timestamp) {
-        if (down && !repeat) {
-            if (key == cocos2d::enumKeyCodes::KEY_F6 && PlayLayer::get()) {
-                ac::g_stage = (ac::g_stage + 1) % ac::kStageCount;
-                ac_console::line("[InputBuffer] F6 Cycle -> " + ac::stageText(ac::g_stage));
-            }
-            else if (key == cocos2d::enumKeyCodes::KEY_F7 && PlayLayer::get()) {
-                const auto status = ac::statusLine("STATUS");
-                ac_console::line(status);
-                ac_dbg("{}", status);
-            }
-        }
+static int vkFromName(std::string const& n) {
+#ifdef GEODE_IS_WINDOWS
+    if (n == "None") return 0;
+    if (n.size() >= 2 && n[0] == 'F') {
+        int num = std::atoi(n.c_str() + 1);
+        if (num >= 1 && num <= 12) return VK_F1 + (num - 1);
+    }
+    if (n == "Insert") return VK_INSERT;
+    if (n == "Delete") return VK_DELETE;
+    if (n == "Home") return VK_HOME;
+    if (n == "End") return VK_END;
+    if (n == "Page Up") return VK_PRIOR;
+    if (n == "Page Down") return VK_NEXT;
+#endif
+    return 0;
+}
 
-        return CCKeyboardDispatcher::dispatchKeyboardMSG(key, down, repeat, timestamp);
+static void loadSettings() {
+    auto m = Mod::get();
+    g_stage = indexOf(STAGE_NAMES, STAGE_COUNT, m->getSettingValue<std::string>("stage"), 1);
+    g_tpsIndex = indexOf(TPS_NAMES, TPS_COUNT, m->getSettingValue<std::string>("tps"), 2);
+    g_waveMode = indexOf(WAVE_NAMES, WAVE_MODE_COUNT, m->getSettingValue<std::string>("wave-mode"), WAVE_GRID);
+    for (int i = 0; i < MODE_COUNT; i++) {
+        g_modeTicks[i] = static_cast<int>(m->getSettingValue<int64_t>(MODE_KEYS[i]));
+    }
+    for (int i = 0; i < KEY_COUNT; i++) {
+        g_keyVK[i] = vkFromName(m->getSettingValue<std::string>(KEY_SETTINGS[i]));
+    }
+    g_debug = m->getSettingValue<bool>("debug");
+}
+
+static char const* waveModeName() { return WAVE_NAMES[g_waveMode]; }
+
+static float stepsPerTick() {
+    return TPS_PRESETS[g_tpsIndex] / 240.0f;
+}
+
+static int mainLimitSteps() {
+    return static_cast<int>(std::lround(STAGES[g_stage] * stepsPerTick()));
+}
+
+static bool isFlyMode(PlayerObject* p) {
+    return p->m_isShip || p->m_isBird || p->m_isDart || p->m_isSwing;
+}
+
+static bool isGroundMode(PlayerObject* p) {
+    return !isFlyMode(p);
+}
+
+static int modeIndex(PlayerObject* p) {
+    if (p->m_isShip) return 4;
+    if (p->m_isBird) return 5;
+    if (p->m_isDart) return 7;
+    if (p->m_isSwing) return 6;
+    if (p->m_isBall) return 1;
+    if (p->m_isRobot) return 2;
+    if (p->m_isSpider) return 3;
+    return 0;
+}
+
+static int ticksForMode(int idx) {
+    int c = g_modeTicks[idx];
+    if (c < 0) {
+        int t = STAGES[g_stage];
+        if (idx == MODE_WAVE && t > 0) t = std::min(t, WAVE_MAX_TICKS);
+        return t;
+    }
+    return c;
+}
+
+static int modeLimitSteps(PlayerObject* p) {
+    int ticks = ticksForMode(modeIndex(p));
+    if (ticks <= 0) return 0;
+    return std::max(1, static_cast<int>(std::lround(ticks * stepsPerTick())));
+}
+
+static int waveGridSteps() {
+    int ticks = ticksForMode(MODE_WAVE);
+    if (ticks <= 0) return 0;
+    return std::max(1, static_cast<int>(std::lround(ticks * stepsPerTick())));
+}
+
+static int spawnGraceSteps() {
+    return std::max(1, static_cast<int>(std::lround(SPAWN_GRACE_TICKS * stepsPerTick())));
+}
+
+static int ringsTouching(PlayerObject* p) {
+    return p->m_touchingRings ? static_cast<int>(p->m_touchingRings->count()) : 0;
+}
+
+static char const* modeName(PlayerObject* p) {
+    if (p->m_isShip) return "ship";
+    if (p->m_isBird) return "ufo";
+    if (p->m_isDart) return "wave";
+    if (p->m_isSwing) return "swing";
+    if (p->m_isBall) return "ball";
+    if (p->m_isRobot) return "robot";
+    if (p->m_isSpider) return "spider";
+    return "cube";
+}
+
+// Todo lo que el usuario debe ver en vivo va a la consola Y al log de Geode.
+static void announce(std::string const& msg) {
+    ac_console::line(msg);
+    log::info("{}", msg);
+}
+
+static int g_savedCount = 0;
+
+// STATUS completo (equivalente al F7 del 1.x, ahora en el hotkey key-debug).
+static std::string statusLine() {
+    return fmt::format(
+        "[InputBuffer] STATUS | stage: {} | tps: {} ({:.2f} steps/tick) | wave: {} "
+        "(grid {} steps) | grace: {} ticks | debug: {} | saves: {}",
+        STAGE_NAMES[g_stage], TPS_PRESETS[g_tpsIndex], stepsPerTick(), waveModeName(),
+        waveGridSteps(), SPAWN_GRACE_TICKS, g_debug ? "ON" : "OFF", g_savedCount);
+}
+
+static void doHotkey(int action) {
+    auto m = Mod::get();
+    switch (action) {
+        case 0:
+            g_stage = (g_stage + 1) % STAGE_COUNT;
+            m->setSettingValue<std::string>("stage", STAGE_NAMES[g_stage]);
+            announce(fmt::format("[InputBuffer] Main window -> {} ({} steps, wave {} steps @ {} TPS)",
+                      STAGE_NAMES[g_stage], mainLimitSteps(), waveGridSteps(), TPS_PRESETS[g_tpsIndex]));
+            break;
+        case 1:
+            g_tpsIndex = std::min(g_tpsIndex + 1, TPS_COUNT - 1);
+            m->setSettingValue<std::string>("tps", TPS_NAMES[g_tpsIndex]);
+            announce(fmt::format("[InputBuffer] TPS -> {} ({:.2f} steps/tick)",
+                      TPS_PRESETS[g_tpsIndex], stepsPerTick()));
+            break;
+        case 2:
+            g_tpsIndex = std::max(g_tpsIndex - 1, 0);
+            m->setSettingValue<std::string>("tps", TPS_NAMES[g_tpsIndex]);
+            announce(fmt::format("[InputBuffer] TPS -> {} ({:.2f} steps/tick)",
+                      TPS_PRESETS[g_tpsIndex], stepsPerTick()));
+            break;
+        case 3:
+            g_debug = !g_debug;
+            m->setSettingValue<bool>("debug", g_debug);
+            announce(fmt::format("[InputBuffer] Debug logging -> {}", g_debug ? "ON" : "OFF"));
+            announce(statusLine());
+            break;
+        case 4:
+            g_waveMode = (g_waveMode + 1) % WAVE_MODE_COUNT;
+            m->setSettingValue<std::string>("wave-mode", WAVE_NAMES[g_waveMode]);
+            announce(fmt::format("[InputBuffer] Wave mode -> {} ({} steps)",
+                      waveModeName(), waveGridSteps()));
+            break;
+    }
+}
+
+static void pollKeys() {
+#ifdef GEODE_IS_WINDOWS
+    static bool prev[KEY_COUNT] = {false, false, false, false, false};
+    bool now[KEY_COUNT];
+    for (int i = 0; i < KEY_COUNT; i++) {
+        now[i] = g_keyVK[i] != 0 && (GetAsyncKeyState(g_keyVK[i]) & 0x8000) != 0;
+    }
+    for (int i = 0; i < KEY_COUNT; i++) {
+        if (now[i] && !prev[i]) doHotkey(i);
+    }
+    for (int i = 0; i < KEY_COUNT; i++) prev[i] = now[i];
+#endif
+}
+
+// Banner de la consola (heredado del 1.x): se muestra una sola vez al cargar.
+static void showBannerOnce() {
+    static bool shown = false;
+    if (shown || !ac_console::init()) return;
+    shown = true;
+
+    ac_console::line("===================================================");
+    ac_console::line("[InputBuffer] Assisted Click v2.0.0 LOADED (buffer ciego: clic pendiente hasta suelo/orbe; min-hold; wave grid/gap; grace de spawn)");
+    ac_console::line(fmt::format(
+        "[InputBuffer] Stage: {} | TPS: {} | Wave: {} | Debug: {}",
+        STAGE_NAMES[g_stage], TPS_PRESETS[g_tpsIndex], waveModeName(), g_debug ? "ON" : "OFF"));
+    ac_console::line("[InputBuffer] Hotkeys (settings): key-stage, key-tps-up, key-tps-down, key-debug (muestra STATUS), key-wave");
+    ac_console::line("[InputBuffer] TPS debe coincidir con tu setup (240 = CBF desactivado)");
+    ac_console::line("===================================================");
+}
+
+$on_mod(Loaded) {
+    loadSettings();
+    listenForSettingChanges<std::string>("stage", [](std::string) { loadSettings(); });
+    listenForSettingChanges<std::string>("tps", [](std::string) { loadSettings(); });
+    listenForSettingChanges<std::string>("wave-mode", [](std::string) { loadSettings(); });
+    for (auto key : MODE_KEYS) {
+        listenForSettingChanges<int64_t>(key, [](int64_t) { loadSettings(); });
+    }
+    for (auto key : KEY_SETTINGS) {
+        listenForSettingChanges<std::string>(key, [](std::string) { loadSettings(); });
+    }
+    listenForSettingChanges<bool>("debug", [](bool) { loadSettings(); });
+
+    showBannerOnce();
+
+    log::info("[InputBuffer] Assisted Click v2.0.0 loaded (buffer ciego: clic pendiente hasta suelo/orbe; min-hold; wave grid/gap; grace de spawn). Main: {}, TPS: {}, wave: {}",
+              STAGE_NAMES[g_stage], TPS_PRESETS[g_tpsIndex], waveModeName());
+}
+
+class $modify(BufferPause, PauseLayer) {
+    void customSetup() {
+        PauseLayer::customSetup();
+
+        auto menu = CCMenu::create();
+        auto spr = ButtonSprite::create("Buffer");
+        spr->setScale(0.7f);
+        auto btn = CCMenuItemSpriteExtra::create(spr, this, menu_selector(BufferPause::onBufferSettings));
+        menu->addChild(btn);
+
+        auto win = CCDirector::get()->getWinSize();
+        menu->setPosition({win.width - 60.f, 30.f});
+        this->addChild(menu);
+    }
+
+    void onBufferSettings(CCObject*) {
+        openSettingsPopup(Mod::get(), false);
     }
 };
 
-class $modify(IBPlayLayer, PlayLayer) {
-    void setupHasCompleted() {
-        PlayLayer::setupHasCompleted();
-
-        ac::showBannerOnce();
-        ac::g_layer = this;
-        ac::clearState(false, false);
-        ac::clearStats();
-
-        // ensureGhost cleans up the retained clone from any previous PlayLayer.
-        ac::ensureGhost(this);
-    }
-
+// Raises the reset flag on death, restart and checkpoint loads. The buffer
+// layer clears its state on the next step.
+class $modify(BufferReset, PlayLayer) {
     void resetLevel() {
-        // Resumen automatico en cada reinicio/muerte (no hace falta pulsar F7).
-        if (ac::g_clicksSeen > 0 || ac::g_tick > 0) {
-            ac_dbg("{}", ac::statusLine("ATTEMPT"));
-        }
-        ac::clearState(true, true);
         PlayLayer::resetLevel();
-        ac::clearState(true, true);
-        ac::clearStats(); // Keep ATTEMPT diagnostics scoped to one attempt.
+        g_resetEpoch++;
     }
 
-    // onExit tambien se dispara al pausar: no se destruye nada.
-    void onExit() {
-        ac::clearInputs();
-        PlayLayer::onExit();
+    void resetLevelFromStart() {
+        PlayLayer::resetLevelFromStart();
+        g_resetEpoch++;
     }
 
-    void onQuit() {
-        if (ac::g_clicksSeen > 0 || ac::g_tick > 0) {
-            ac_dbg("{}", ac::statusLine("QUIT"));
-        }
-        ac::clearState(false, false);
-        // v1.6.1: al salir del nivel el estado de spawn cambia por completo; la pausa
-        // del guard de muertes fantasma describe la confianza en ESTE nivel.
-        ac::g_predictionsPaused = false;
-        // v1.6.2: el escape del guard de spawn (muerte real en spawn confirmada) tambien
-        // es por nivel: en el siguiente nivel hay que volver a detectarla desde cero.
-        ac::g_spawnDeathsReal = false;
-        // v1.6.3: la validacion del modelo (matches/divergencias) es por nivel: el estado
-        // de spawn y la fisica del siguiente nivel no heredan evidencia.
-        ac::g_trajectoryMatches = 0;
-        ac::g_lastDivergenceSerial = -1000000;
-        ac::destroyGhost();
-        ac::g_layer = nullptr;
-        PlayLayer::onQuit();
+    void loadFromCheckpoint(CheckpointObject* object) {
+        PlayLayer::loadFromCheckpoint(object);
+        g_resetEpoch++;
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
-        if (ac::g_simulating && player == ac::g_ghost) {
-            // v1.6.1/v1.6.5: dump de la muerte del clon en la ventana de spawn. ESTE dump
-            // identifico la causa raiz (log 21.26.35): el rect del clon era 30x30 (cubo,
-            // default de PlayerObject::create sin recalcular) contra el 10x10 real de
-            // wave -> el clon solapaba al pico del spawn y moria en el paso 0. v1.6.5
-            // corrige la siembra (updatePlayerScale + copia de tamaño + seed check del
-            // rect); el dump queda para verificar el fix y diagnosticar otras causas.
-            // v1.6.2: gate ampliado a g_tick<=3 (v1.6.1 solo cubria tick 0/1).
-            if (ac::g_tick <= 3) {
-                const auto gr = player->GameObject::getObjectRect();
-                auto* realPlayer = this->m_player1;
-                if (realPlayer) {
-                    const auto rr = realPlayer->GameObject::getObjectRect();
-                    ac_dbg("[IB] CLONE-DEATH ghost=({:.2f},{:.2f}) rect=({:.2f},{:.2f},{:.2f},{:.2f}) | "
-                               "real=({:.2f},{:.2f}) rect=({:.2f},{:.2f},{:.2f},{:.2f}) | "
-                               "obj id={} type={} rect=({:.2f},{:.2f},{:.2f},{:.2f})",
-                        player->getPositionX(), player->getPositionY(),
-                        gr.getMinX(), gr.getMinY(), gr.getMaxX(), gr.getMaxY(),
-                        realPlayer->getPositionX(), realPlayer->getPositionY(),
-                        rr.getMinX(), rr.getMinY(), rr.getMaxX(), rr.getMaxY(),
-                        object ? object->m_objectID : -1,
-                        object ? static_cast<int>(object->m_objectType) : -1,
-                        object ? object->getObjectRect().getMinX() : 0.0f,
-                        object ? object->getObjectRect().getMinY() : 0.0f,
-                        object ? object->getObjectRect().getMaxX() : 0.0f,
-                        object ? object->getObjectRect().getMaxY() : 0.0f);
-                } else {
-                    ac_dbg("[IB] CLONE-DEATH ghost=({:.2f},{:.2f}) rect=({:.2f},{:.2f},{:.2f},{:.2f}) | "
-                               "real=NULL | obj id={} type={} rect=({:.2f},{:.2f},{:.2f},{:.2f})",
-                        player->getPositionX(), player->getPositionY(),
-                        gr.getMinX(), gr.getMinY(), gr.getMaxX(), gr.getMaxY(),
-                        object ? object->m_objectID : -1,
-                        object ? static_cast<int>(object->m_objectType) : -1,
-                        object ? object->getObjectRect().getMinX() : 0.0f,
-                        object ? object->getObjectRect().getMinY() : 0.0f,
-                        object ? object->getObjectRect().getMaxX() : 0.0f,
-                        object ? object->getObjectRect().getMaxY() : 0.0f);
-                }
-            }
-            ac::g_cloneDied = true;
-            ac::g_cloneDeathX = player ? player->getPositionX() : 0.0f;
-            ac::g_cloneDeathObjectKnown = false;
-            ac::g_cloneDeathObjectRight = 0.0f;
-            ac::g_cloneDeathObject = nullptr;
-
-            GameObject* evidence = object;
-            const char* evidenceSource = "destroyPlayer-argument";
-            const bool argumentIsUsable = evidence && ac::isClearancePhysical(evidence) &&
-                !ac::hasDynamicPhysicalMotion(evidence);
-            if (!argumentIsUsable) {
-                // Use a second evidence source when the engine's argument is absent or not a
-                // usable static target. The fallback scans only this level's objects and requires
-                // overlap with the ghost's final hitbox; later clearance validation is still mandatory.
-                auto* recovered = ac::findStaticDeathColliderFromObjects(this, player);
-                if (recovered) {
-                    evidence = recovered;
-                    evidenceSource = "static-object-overlap-scan";
-                }
-            }
-            if (evidence && ac::isClearancePhysical(evidence) && !ac::hasDynamicPhysicalMotion(evidence)) {
-                const auto rect = evidence->getObjectRect();
-                const float right = rect.getMaxX();
-                if (std::isfinite(right)) {
-                    ac::g_cloneDeathObjectRight = right;
-                    ac::g_cloneDeathObjectKnown = true;
-                    ac::g_cloneDeathObject = evidence;
-                    if (evidence != object) {
-                        ac_dbg("[IB] clone death collider recovered from {}: objectID={} type={} right={:.2f}",
-                            evidenceSource, evidence->m_objectID, static_cast<int>(evidence->m_objectType), right);
-                    }
-                }
-            }
-            if (!ac::g_cloneDeathObjectKnown) {
-                ac_dbg("[IB] clone death target unresolved: arg={} id={} type={} dynamic={} x={:.2f} y={:.2f}; fail closed",
-                    static_cast<void*>(object), object ? object->m_objectID : -1,
-                    object ? static_cast<int>(object->m_objectType) : -1,
-                    object ? ac::hasDynamicPhysicalMotion(object) : false,
-                    ac::g_cloneDeathX, player ? player->getPositionY() : 0.0f);
-            }
-            return;
-        }
-        if (!ac::g_simulating) {
-            auto* liveLayer = PlayLayer::get();
-            if (liveLayer && player == liveLayer->m_player1) {
-                // v1.6.3: resolucion del chequeo de realidad cuando el jugador real muere.
-                if (ac::g_realityCheck.active) {
-                    if (ac::g_realityCheck.expectDeath &&
-                        ac::g_physicsSerialTick <= ac::g_realityCheck.deadlineSerialTick) {
-                        // v1.6.3: la muerte real solo confirma el baseline si COINCIDE con
-                        // la muerte prevista. v1.6.4: la identidad es la INSTANCIA
-                        // (puntero), no m_objectID (el tipo: dos picos cualquiera
-                        // "coincidian"). v1.6.4: una muerte confirmada tambien valida el
-                        // modelo: sin esto, una startpos pegada a un pico jamas abria el
-                        // gate (el primer clic ya es el mortal, nunca hay KEPT previo).
-                        const bool sameObject = object &&
-                            object == ac::g_realityCheck.expectDeathObject;
-                        const bool sameX = object && std::abs(
-                            player->getPositionX() - ac::g_realityCheck.expectDeathX) <=
-                            ac::kRealityDeathXTolerance;
-                        if (sameObject && sameX) {
-                            ac::g_predictionsPaused = false;
-                            ++ac::g_trajectoryMatches;
-                            if (ac::g_realityCheck.steps <= 2 && !ac::g_spawnDeathsReal) {
-                                ac::g_spawnDeathsReal = true;
-                                ac_dbg("[IB] real spawn death confirmed (steps={} <= 2, objectID={}): "
-                                           "spawn guard disabled for this level",
-                                    ac::g_realityCheck.steps, ac::g_realityCheck.expectDeathObjectID);
-                            }
-                            ac_dbg("[IB] real death matches the predicted one (serialTick={} <= {}, "
-                                       "objectID={}, deathX={:.2f} vs {:.2f}): baseline matched reality",
-                                ac::g_physicsSerialTick, ac::g_realityCheck.deadlineSerialTick,
-                                ac::g_realityCheck.expectDeathObjectID,
-                                player->getPositionX(), ac::g_realityCheck.expectDeathX);
-                        }
-                        else {
-                            ac_dbg("[IB] real death within the predicted window but NOT the predicted "
-                                       "death (objectID={} vs {}, deathX={:.2f} vs {:.2f}): no validation, "
-                                       "no spawn escape",
-                                object ? object->m_objectID : -1, ac::g_realityCheck.expectDeathObjectID,
-                                player ? player->getPositionX() : 0.0f, ac::g_realityCheck.expectDeathX);
-                        }
-                    }
-                    else if (!ac::g_realityCheck.expectDeath) {
-                        // El modelo decia que la trayectoria era segura (KEPT) o que el
-                        // retraso la evitaba (SAVED) y el jugador real murio dentro del
-                        // horizonte del chequeo: divergencia del modelo, pausa.
-                        ++ac::g_modelDivergences;
-                        ac::g_predictionsPaused = true;
-                        ac::g_trajectoryMatches = 0;
-                        ac::g_lastDivergenceSerial = ac::g_physicsSerialTick;
-                        ac_dbg("[IB] MODEL-DIVERGENCE: el modelo preveia trayectoria segura "
-                                  "(expect=({:.2f},{:.2f}) steps={} button={} down={}) pero el jugador real "
-                                  "murio en serialTick {}; predicciones en pausa",
-                            ac::g_realityCheck.expectX, ac::g_realityCheck.expectY,
-                            ac::g_realityCheck.steps, ac::g_realityCheck.button,
-                            ac::g_realityCheck.down, ac::g_physicsSerialTick);
-                    }
-                    // Si expectDeath pero serialTick > deadline: la muerte llego tarde;
-                    // el chequeo de realidad ya expiro (la posicion se valida por
-                    // trayectoria en PlayerObject::update o el intento termino).
-                }
-                ac::g_realityCheck.active = false;
-                const auto discarded = ac::g_queue.size();
-                ac::clearInputs();
-                if (discarded > 0) ac_dbg("[IB] cancelled {} pending edge(s) on player death", discarded);
-            }
-        }
         PlayLayer::destroyPlayer(player, object);
-    }
-
-    void playEndAnimationToPos(cocos2d::CCPoint p0) {
-        if (!ac::g_simulating) PlayLayer::playEndAnimationToPos(p0);
+        g_resetEpoch++;
     }
 };
 
-class $modify(IBBaseLayer, GJBaseGameLayer) {
-    void handleButton(bool down, int button, bool isPlayer1) {
-        if (ac::g_applyingQueuedInput || ac::g_simulating) {
-            GJBaseGameLayer::handleButton(down, button, isPlayer1);
-            return;
+struct PState {
+    bool held = false;
+    bool pending = false;
+    int pendingStart = 0;
+    int lastRingCount = 0;
+    bool releaseNext = false;
+
+    int pressStep = -1;
+    bool delayedRelease = false;
+    int releaseAt = 0;
+
+    std::vector<std::pair<bool, int>> waveQueue;
+    int lastReleaseStep = -1000000;
+};
+
+class $modify(BufferLayer, GJBaseGameLayer) {
+    struct Fields {
+        int step = 0;
+        int epoch = 0;
+        int graceUntil = 0;
+        PState ps[2];
+    };
+
+    // True in a one-player level with a dual portal: a single click is sent
+    // as player 1 and the game applies it to both icons.
+    bool sharedDualInput() {
+        return m_gameState.m_isDualMode && m_levelSettings && !m_levelSettings->m_twoPlayerMode;
+    }
+
+    // Press or release for the icon at idx. In shared dual input, player 1's
+    // events also go to player 2 (rescued clicks only if player 2 is in a
+    // landing mode, so a cube rescue does not tap a wave).
+    void sendInput(PlayerObject* p, int idx, bool down, bool groundOnly) {
+        auto one = [&](PlayerObject* q) {
+            if (down) q->pushButton(PlayerButton::Jump);
+            else q->releaseButton(PlayerButton::Jump);
+        };
+        one(p);
+        if (idx == 0 && m_player2 && sharedDualInput()) {
+            if (!groundOnly || isGroundMode(m_player2)) one(m_player2);
         }
+    }
 
-        auto* layer = PlayLayer::get();
+    // Clears our state after a death / restart / checkpoint load.
+    void syncState() {
+        auto f = m_fields.operator->();
+        if (f->epoch == g_resetEpoch) return;
+        f->epoch = g_resetEpoch;
 
-        if (!layer ||
-            static_cast<GJBaseGameLayer*>(layer) != static_cast<GJBaseGameLayer*>(this) ||
-            !isPlayer1) {
-            GJBaseGameLayer::handleButton(down, button, isPlayer1);
-            return;
-        }
-
-        if (layer->m_gameState.m_isDualMode) {
-            if (!ac::g_warnedDualMode) {
-                ac::g_warnedDualMode = true;
-                ac_dbg("[IB] dual mode detected: prediction disabled; passing raw input");
+        bool inconsistent = false;
+        for (auto& s : f->ps) {
+            if (s.delayedRelease || s.releaseNext || !s.waveQueue.empty()) {
+                inconsistent = true;
             }
-            ac::flushPendingNow(layer);
-            GJBaseGameLayer::handleButton(down, button, isPlayer1);
-            return;
+            s = PState();
         }
 
-        ++ac::g_clicksSeen;
-        if (ac::g_clicksSeen <= 3) {
-            ac_dbg(
-                "[IB] handleButton #{} down={} button={} stage={} tick={} dtStable={} ghost={} dart={}",
-                ac::g_clicksSeen, down, button, ac::g_stage + 1, ac::g_tick, ac::g_dtStable,
-                ac::g_ghost ? "ok" : "NULL", layer->m_player1 ? layer->m_player1->m_isDart : false
-            );
+        // Wave Grid / Min Gap are skipped briefly after a spawn so the first
+        // clicks go straight through.
+        f->graceUntil = f->step + spawnGraceSteps();
+
+        // We may have held back a release the game never saw. Releasing a
+        // button that is not held is harmless, so make sure nothing is stuck.
+        if (inconsistent) {
+            if (m_player1) m_player1->releaseButton(PlayerButton::Jump);
+            if (m_player2) m_player2->releaseButton(PlayerButton::Jump);
         }
+        DBG("[InputBuffer] state reset (death/restart), spawn grace until step {}{}",
+            f->graceUntil, inconsistent ? ", released stuck button" : "");
+    }
 
-        ac_dbg("[IB] raw button edge: down={} button={}", down, button);
-
-        int delay = 0;
-        auto* player = layer->m_player1;
-        const int key = ac::buttonKey(button, isPlayer1);
-        const bool rawEdgeChanged = ac::observeRawInputEdge(key, down);
-        auto keyIt = ac::g_keys.find(key);
-        const bool keyPending = keyIt != ac::g_keys.end() && keyIt->second.pending > 0;
-        auto activeIt = ac::g_activePressDelay.find(key);
-        const bool hasActivePress = activeIt != ac::g_activePressDelay.end();
-        const int inheritedDelay = hasActivePress ? activeIt->second : 0;
-
-        // A pending early ground-mode click owns its matching release too. If the user
-        // lets go before contact, remember that fact instead of sending a naked release.
-        if (player && button == 1 && isPlayer1 && ac::g_landingBuffer.pending) {
-            if (down) {
-                if (rawEdgeChanged) {
-                    ac::g_landingBuffer.startTick = ac::g_tick;
-                    ac::g_landingBuffer.releasedBeforeLanding = false;
-                }
-                return;
-            }
-            ac::g_landingBuffer.releasedBeforeLanding = true;
-            return;
+    void flushWaveQueue(PlayerObject* p, PState& s, int idx) {
+        for (auto const& ev : s.waveQueue) {
+            sendInput(p, idx, ev.first, false);
         }
+        s.waveQueue.clear();
+    }
 
-        // Once a buffered landing press has fired, pass its release through normally
-        // instead of running a second physics prediction for the paired edge.
-        if (!down && ac::g_landingManagedKeys.erase(key) > 0) {
-            ac::queueInput(layer, false, button, isPlayer1, inheritedDelay);
-            return;
-        }
+    void stepPlayer(PlayerObject* p, PState& s, int idx) {
+        int step = m_fields->step;
+        char const* tag = idx == 0 ? "P1" : "P2";
 
-        // Swallow duplicate release edges while a minimum-hold release is waiting.
-        if (!down && ac::g_flightBuffer.delayedRelease && button == 1 && isPlayer1) {
-            return;
-        }
-
-        const bool assistEnabled = player && ac::kStages[ac::g_stage].all > 0 &&
-            button == 1 && isPlayer1 && !player->m_isPlatformer;
-        const bool keyFree = !keyPending && ac::g_queue.empty();
-
-        if (assistEnabled && keyFree && ac::isFlightBufferMode(player) && rawEdgeChanged) {
-            if (down) {
-                // Match the known-good mod: flush a withheld release before starting a new hold.
-                if (ac::g_flightBuffer.delayedRelease) {
-                    ac::g_flightBuffer.delayedRelease = false;
-                    ac::g_flightBuffer.pressed = false;
-                    ac::g_flightBuffer.pressTick = -1;
-                    ac::QueuedInputScope scope;
-                    layer->handleButton(false, button, isPlayer1);
-                }
-                ac::g_flightBuffer.pressed = true;
-                ac::g_flightBuffer.pressTick = ac::g_tick;
-                ac::queueInput(layer, true, button, isPlayer1, 0);
-                return;
-            }
-            if (ac::g_flightBuffer.pressed) {
-                const int heldFor = ac::g_tick - ac::g_flightBuffer.pressTick;
-                const int minHold = ac::limitFor(player);
-                if (minHold > 0 && heldFor < minHold) {
-                    ac::g_flightBuffer.delayedRelease = true;
-                    ac::g_flightBuffer.releaseAt = ac::g_flightBuffer.pressTick + minHold;
-                    return;
-                }
-                ac::g_flightBuffer.pressed = false;
-                ac::g_flightBuffer.pressTick = -1;
-                ac::queueInput(layer, false, button, isPlayer1, 0);
-                return;
-            }
-        }
-
-        // Wave input uses the reference mod's deterministic Grid behavior. Spawn-grace
-        // clicks pass through; afterward press/release edges are aligned to update ticks.
-        if (assistEnabled && player->m_isDart && ac::limitFor(player) > 0 && rawEdgeChanged) {
-            if (ac::g_tick < ac::kSpawnGraceTicks) {
-                ac::queueInput(layer, down, button, isPlayer1, inheritedDelay);
-                return;
-            }
-            const int grid = ac::limitFor(player);
-            int target = ((ac::g_tick + grid - 1) / grid) * grid;
-            if (ac::g_waveLastTarget >= 0) {
-                target = std::max(target, ac::g_waveLastTarget);
-                // A quick tap must occupy at least one full grid cell.
-                if (!down && ac::g_waveLastDown) {
-                    target = std::max(target, ac::g_waveLastTarget + grid);
-                }
-            }
-            for (auto it = ac::g_queue.rbegin(); it != ac::g_queue.rend(); ++it) {
-                if (it->button == button && it->isPlayer1 == isPlayer1) {
-                    target = std::max(target, it->tick);
-                    if (!down && it->down) target = std::max(target, it->tick + grid);
-                    break;
-                }
-            }
-            ac::g_waveLastTarget = target;
-            ac::g_waveLastDown = down;
-            ac::queueInputAtTick(layer, down, button, isPlayer1,
-                std::max(target, ac::g_tick + 1));
-            return;
-        }
-
-        // Main reactive fallback: an early press in cube/ball/robot/spider is held until
-        // ground or orb contact, like the working reference. The physics predictor remains
-        // active for other events and when the contact buffer is not applicable.
-        if (assistEnabled && keyFree && down && rawEdgeChanged &&
-            ac::isGroundBufferMode(player) && !player->m_isOnGround &&
-            ac::touchingRingCount(player) == 0 && !hasActivePress) {
-            ac::g_landingBuffer.pending = true;
-            ac::g_landingBuffer.releasedBeforeLanding = false;
-            ac::g_landingBuffer.startTick = ac::g_tick;
-            ac_dbg("[IB] landing-buffer armed at tick {}", ac::g_tick);
-            return;
-        }
-
-        if (player && ac::kStages[ac::g_stage].all > 0) {
-            if (keyPending) {
-                // An edge that arrives while a same-button edge is pending cannot be simulated
-                // independently. Preserve order and inherit the current press shift.
-                delay = inheritedDelay;
-                ++ac::g_skipOther;
-            } else if (down && hasActivePress) {
-                // Duplicate down edge while this hold is active: do not independently retime it.
-                delay = inheritedDelay;
-                ++ac::g_skipOther;
-            } else if (!rawEdgeChanged) {
-                // v1.6.0: GD re-delivers the button state at the start of every attempt
-                // (re-sync after death/retry). The raw button state did not change, so this is
-                // not a real input edge: it carries no new timing evidence and must not spend
-                // the prediction budget. Pass it through with the inherited shift, like any
-                // other duplicate.
-                delay = inheritedDelay;
-                ++ac::g_skipOther;
+        if (!s.waveQueue.empty()) {
+            if (!p->m_isDart) {
+                flushWaveQueue(p, s, idx);
             } else {
-                delay = ac::predictDelay(layer, player, down, button,
-                    (!down && hasActivePress) ? inheritedDelay : 0);
+                size_t applied = 0;
+                while (applied < s.waveQueue.size() &&
+                       step >= s.waveQueue[applied].second) {
+                    auto ev = s.waveQueue[applied];
+                    sendInput(p, idx, ev.first, false);
+                    DBG("[InputBuffer] {} WAVE {} {} applied at step {}",
+                        tag, waveModeName(), ev.first ? "PRESS" : "RELEASE", step);
+                    applied++;
+                }
+                s.waveQueue.erase(s.waveQueue.begin(), s.waveQueue.begin() + applied);
             }
-        } else {
-            ++ac::g_skipOff;
-            // Turning assistance OFF during a delayed hold must not shift only one edge.
-            if (hasActivePress) delay = inheritedDelay;
         }
 
-        ac::queueInput(layer, down, button, isPlayer1, delay);
-    }
+        if (s.delayedRelease) {
+            if (!isFlyMode(p) || step >= s.releaseAt) {
+                s.delayedRelease = false;
+                s.held = false;
+                sendInput(p, idx, false, false);
+                DBG("[InputBuffer] {} MIN-HOLD release applied at step {} [{}]",
+                    tag, step, modeName(p));
+            }
+        }
 
-    // xdBot: durante la simulacion se desactivan los objetos que no se modelan SOLO durante
-    // esta llamada. Los que realmente tocan al fantasma marcan la simulacion como Unknown.
-    void collisionCheckObjects(PlayerObject* p0, gd::vector<GameObject*>* objects, int p2, float p3) {
-        if (!ac::g_simulating || p0 != ac::g_ghost || !objects) {
-            GJBaseGameLayer::collisionCheckObjects(p0, objects, p2, p3);
+        if (s.releaseNext) {
+            s.releaseNext = false;
+            if (!s.held) sendInput(p, idx, false, true);
+        }
+
+        if (!s.pending) return;
+
+        int waited = step - s.pendingStart;
+        int limit = modeLimitSteps(p);
+
+        if (limit <= 0 || waited > limit || !isGroundMode(p)) {
+            DBG("[InputBuffer] {} pending EXPIRED waited={} limit={} mode={}",
+                tag, waited, limit, modeName(p));
+            s.pending = false;
             return;
         }
 
-        std::vector<GameObject*> disabled;
-        const cocos2d::CCRect pr = p0->GameObject::getObjectRect();
-        constexpr float kMargin = 8.0f;
-        const cocos2d::CCRect probe(
-            pr.origin.x - kMargin, pr.origin.y - kMargin,
-            pr.size.width + kMargin * 2.0f, pr.size.height + kMargin * 2.0f
-        );
-
-        for (auto* obj : *objects) {
-            if (!obj) continue;
-            if (obj->m_isDisabled || obj->m_isDisabled2) continue;
-
-            const bool nearby = probe.intersectsRect(obj->getObjectRect());
-            const bool modeled = ac::isModeled(obj);
-            const bool harmless = ac::isHarmless(obj);
-            // v1.5.0: un trigger puramente visual/audio que el clon cruza no puede cambiar la
-            // fisica, asi que ya no marca la simulacion como Unknown. Sigue desactivandose
-            // durante la pasada de colision para impedir cualquier activacion real.
-            const bool exemptEffect =
-                typeinfo_cast<EffectGameObject*>(obj) != nullptr && ac::isExemptEffectObject(obj);
-
-            if (nearby && !harmless && !exemptEffect &&
-                (!modeled || ac::hasDynamicPhysicalMotion(obj))) {
-                if (ac::g_unmodeledObjectID < 0) {
-                    ac::g_unmodeledObjectID = obj->m_objectID;
-                    ac::g_unmodeledObjectType = static_cast<int>(obj->m_objectType);
-                }
-                ac::g_unmodeled = true;
-            }
-
-            if (modeled) continue;
-            disabled.push_back(obj);
-            obj->m_isDisabled = true;
-            obj->m_isDisabled2 = true;
+        int rings = ringsTouching(p);
+        if (rings != s.lastRingCount) {
+            DBG("[InputBuffer] {} ring overlap count {} -> {} (waited {})",
+                tag, s.lastRingCount, rings, waited);
+            s.lastRingCount = rings;
         }
 
-        GJBaseGameLayer::collisionCheckObjects(p0, objects, p2, p3);
+        bool onGround = p->m_isOnGround;
+        bool onRing = rings > 0;
 
-        for (auto* obj : disabled) {
-            // Objects were only added if both flags were false, so false is the exact prior state.
-            obj->m_isDisabled = false;
-            obj->m_isDisabled2 = false;
+        if (onGround || onRing) {
+            s.pending = false;
+            float ticksSaved = waited / stepsPerTick();
+            char const* what = onRing ? "RING" : "GROUND";
+
+            if (s.held) {
+                DBG("[InputBuffer] {} reached {} after {} steps but button still held, skipping ({})",
+                    tag, what, waited, modeName(p));
+            } else {
+                sendInput(p, idx, true, true);
+                s.releaseNext = true;
+                ++g_savedCount;
+                announce(fmt::format(
+                    "[InputBuffer] *** SAVED +{:.1f} TICKS ({:.2f} frames @ 60fps) PRESS! [{} {} {}] (Step0: {} -> Delayed: {}) [Limit: {} steps] ***",
+                    ticksSaved, ticksSaved / 4.0f, tag, modeName(p), what,
+                    s.pendingStart, step, limit));
+                // v2.0.0: ademas de consola y log, notificacion en pantalla —
+                // ver el SAVED sin abrir el log de Geode.
+                NotificationBuilder()
+                    .title("Assisted Click")
+                    .text(fmt::format("SAVED +{:.1f} ticks ({} {})", ticksSaved, modeName(p), what))
+                    .show();
+            }
         }
     }
 
-    bool canBeActivatedByPlayer(PlayerObject* p0, EffectGameObject* p1) {
-        if (ac::g_simulating) {
-            if (p0 == ac::g_ghost && p1 && ac::kModeledPortals.contains(p1->m_objectID)) {
-                ac::handlePortal(p0, p1->m_objectID);
-            } else if (p0 == ac::g_ghost && p1 &&
-                       ac::kNativePadTypes.contains(p1->m_objectType)) {
-                // v1.7.6: pads nativos — dejar pasar el return true para que
-                // GJBaseGameLayer::bumpPlayer/gravBumpPlayer aplique al clon el boost
-                // con la fisica EXACTA del juego (decompile: PlayerObject::bumpPlayer es
-                // propellPlayer + flags de estado; efectos auto-suprimidos). El pad no
-                // se desactiva en la pasada de colision porque isModeled() ya lo cubre.
+    bool inputPlayer(PlayerObject* p, PState& s, int idx, bool down) {
+        int step = m_fields->step;
+        char const* tag = idx == 0 ? "P1" : "P2";
+
+        if (!p->m_isDart && !s.waveQueue.empty()) {
+            flushWaveQueue(p, s, idx);
+        }
+
+        int n = waveGridSteps();
+        bool inGrace = step < m_fields->graceUntil;
+        if (p->m_isDart && inGrace && n > 0 && g_waveMode != WAVE_HOLD) {
+            DBG("[InputBuffer] {} WAVE {} {} passed through (spawn grace) at step {}",
+                tag, waveModeName(), down ? "PRESS" : "RELEASE", step);
+        }
+
+        if (p->m_isDart && n > 0 && g_waveMode != WAVE_HOLD && !inGrace) {
+            int target;
+            if (g_waveMode == WAVE_GRID) {
+                target = ((step + n - 1) / n) * n;
+                if (!s.waveQueue.empty()) {
+                    auto const& last = s.waveQueue.back();
+                    target = std::max(target, last.second);
+                    // A tap must hold for at least one grid cell, or the
+                    // press and release would cancel out in the same step.
+                    if (!down && last.first) {
+                        target = std::max(target, last.second + n);
+                    }
+                }
+            } else { // WAVE_GAP
+                target = step;
+                if (!s.waveQueue.empty()) {
+                    target = std::max(target, s.waveQueue.back().second);
+                }
+                if (down) {
+                    target = std::max(target, s.lastReleaseStep + n);
+                } else {
+                    s.lastReleaseStep = target;
+                }
+                if (target == step && s.waveQueue.empty()) {
+                    s.held = down;
+                    return false;
+                }
+            }
+
+            s.held = down;
+            s.waveQueue.emplace_back(down, target);
+            DBG("[InputBuffer] {} WAVE {} {} queued at step {} -> {} ({} steps)",
+                tag, waveModeName(), down ? "PRESS" : "RELEASE", step, target, n);
+            return true;
+        }
+
+        if (down && s.delayedRelease) {
+            s.delayedRelease = false;
+            s.held = false;
+            sendInput(p, idx, false, false);
+        }
+
+        if (!down && isFlyMode(p) && s.pressStep >= 0) {
+            int minHold = modeLimitSteps(p);
+            int heldFor = step - s.pressStep;
+            if (minHold > 0 && heldFor < minHold) {
+                s.delayedRelease = true;
+                s.releaseAt = s.pressStep + minHold;
+                DBG("[InputBuffer] {} MIN-HOLD delaying release: held {} < {} steps [{}]",
+                    tag, heldFor, minHold, modeName(p));
                 return true;
+            }
+        }
+
+        s.held = down;
+
+        if (down) {
+            s.pressStep = isFlyMode(p) ? step : -1;
+
+            bool early = isGroundMode(p) && !p->m_isOnGround && ringsTouching(p) == 0;
+            if (early && modeLimitSteps(p) > 0) {
+                s.pending = true;
+                s.pendingStart = step;
+                s.lastRingCount = 0;
             } else {
-                if (ac::g_unmodeledObjectID < 0 && p1) {
-                    ac::g_unmodeledObjectID = p1->m_objectID;
-                    ac::g_unmodeledObjectType = static_cast<int>(p1->m_objectType);
-                }
-                ac::g_unmodeled = true;
+                s.pending = false;
             }
-            return false; // never let the clone activate a real level object
         }
-        return GJBaseGameLayer::canBeActivatedByPlayer(p0, p1);
+        return false;
     }
 
-    void playerTouchedRing(PlayerObject* p0, RingObject* p1) {
-        if (ac::g_simulating) {
-            if (p0 == ac::g_ghost) {
-                if (ac::g_unmodeledObjectID < 0 && p1) {
-                    ac::g_unmodeledObjectID = p1->m_objectID;
-                    ac::g_unmodeledObjectType = static_cast<int>(p1->m_objectType);
-                }
-                ac::g_unmodeled = true;
-            }
+    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
+        auto f = m_fields.operator->();
+        f->step++;
+        pollKeys();
+        syncState();
+
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+
+        if (!PlayLayer::get()) {
+            for (auto& s : f->ps) s = PState();
             return;
         }
-        GJBaseGameLayer::playerTouchedRing(p0, p1);
+
+        if (m_player1) stepPlayer(m_player1, f->ps[0], 0);
+        if (m_player2) stepPlayer(m_player2, f->ps[1], 1);
     }
 
-    void playerTouchedTrigger(PlayerObject* p0, EffectGameObject* p1) {
-        if (ac::g_simulating) {
-            if (p0 == ac::g_ghost && p1 && ac::kModeledPortals.contains(p1->m_objectID)) {
-                ac::handlePortal(p0, p1->m_objectID);
-            } else {
-                if (ac::g_unmodeledObjectID < 0 && p1) {
-                    ac::g_unmodeledObjectID = p1->m_objectID;
-                    ac::g_unmodeledObjectType = static_cast<int>(p1->m_objectType);
-                }
-                ac::g_unmodeled = true;
-            }
-            return;
-        }
-        GJBaseGameLayer::playerTouchedTrigger(p0, p1);
-    }
+    void handleButton(bool down, int button, bool isPlayer1) {
+        auto f = m_fields.operator->();
+        syncState();
 
-    void activateSFXTrigger(SFXTriggerGameObject* p0) {
-        if (!ac::g_simulating) GJBaseGameLayer::activateSFXTrigger(p0);
-    }
-
-    void activateSongEditTrigger(SongTriggerGameObject* p0) {
-        if (!ac::g_simulating) GJBaseGameLayer::activateSongEditTrigger(p0);
-    }
-
-    void gameEventTriggered(GJGameEvent p0, int p1, int p2) {
-        if (!ac::g_simulating) GJBaseGameLayer::gameEventTriggered(p0, p1, p2);
-    }
-};
-
-class $modify(IBPlayerObject, PlayerObject) {
-    void update(float dt) {
-        auto* layer = PlayLayer::get();
-        const bool real = layer && this == layer->m_player1 && !ac::g_simulating;
-
-        const bool advancingTick = real && std::isfinite(dt) && dt > 0.0f;
-        if (advancingTick) {
-            ac::serviceReactiveBuffers(layer, ac::g_tick + 1);
-            ac::dispatchPending(layer, ac::g_tick + 1);
-        }
-
-        const float beforeX = getPositionX();
-        // Increment the monotonic input-history clock before entering the native update: death
-        // and resetLevel can happen synchronously inside PlayerObject::update, and the tick that
-        // caused that death must be included in the press/release interval.
-        if (advancingTick) ++ac::g_physicsSerialTick;
-        PlayerObject::update(dt);
-
-        if (advancingTick) {
-            ac::observePhysicsDt(dt);
-            ac::g_lastDx = getPositionX() - beforeX;
-            ++ac::g_tick;
-
-            if (!ac::g_loggedFirstUpdate) {
-                ac::g_loggedFirstUpdate = true;
-                ac_dbg("[IB] first real update dt={} dx={}", dt, ac::g_lastDx);
-            }
-
-            // ---- v1.6.2: resolucion del chequeo de realidad ----
-            // El serialTick del deadline ya paso y no llego ningun edge nuevo (eso
-            // cancela el chequeo en observeRawInputEdge). Dos modos:
-            //  - expectDeath: el baseline predijo muerte; jugador real vivo ->
-            //    PHANTOM-DEATH confirmada, pausa. (Si murio, lo maneja destroyPlayer.)
-            //  - !expectDeath: KEPT o SAVED; la posicion real debe coincidir con la del
-            //    clon (+-kRealityPositionTolerance). Divergencia (o muerte) ->
-            //    MODEL-DIVERGENCE, pausa. Coincidencia -> el modelo describe la
-            //    realidad: liberar la pausa si estaba activa.
-            if (ac::g_realityCheck.active &&
-                ac::g_physicsSerialTick >= ac::g_realityCheck.deadlineSerialTick) {
-                const bool posMatches =
-                    !this->m_isDead &&
-                    std::abs(getPositionX() - ac::g_realityCheck.expectX) <= ac::kRealityPositionTolerance &&
-                    std::abs(getPositionY() - ac::g_realityCheck.expectY) <= ac::kRealityPositionTolerance;
-                if (ac::g_realityCheck.expectDeath) {
-                    if (!this->m_isDead) {
-                        ac::g_realityCheck.active = false;
-                        ++ac::g_phantomDeaths;
-                        ac::g_predictionsPaused = true;
-                        // v1.6.4: un PHANTOM-DEATH del estado de spawn (chequeo armado con
-                        // g_tick<=3) NO envenena la validacion del nivel: en el escenario
-                        // del log hay un fantasma por cada clic al reaparecer y el gate de
-                        // SAVED casi nunca llegaba a abrirse. El spawn es un problema ya
-                        // aislado (guard propio); el modelo a mitad de nivel se valida aparte.
-                        if (!ac::g_realityCheck.armedInSpawnWindow) {
-                            ac::g_trajectoryMatches = 0;
-                            ac::g_lastDivergenceSerial = ac::g_physicsSerialTick;
-                        }
-                        ac_dbg("[IB] PHANTOM-DEATH: el baseline predijo muerte del clon en {} pasos "
-                                  "(button={} down={} spawnArmed={}) pero el jugador real sigue vivo en el "
-                                  "serialTick {}; predicciones en pausa hasta que el modelo vuelva a coincidir "
-                                  "con la realidad",
-                            ac::g_realityCheck.steps, ac::g_realityCheck.button, ac::g_realityCheck.down,
-                            ac::g_realityCheck.armedInSpawnWindow ? 1 : 0,
-                            ac::g_physicsSerialTick);
-                    }
-                    // Si m_isDead: la muerte la resuelve destroyPlayer (libera pausa /
-                    // marca spawnDeathsReal si coincide). El chequeo se desactiva alli.
-                }
-                else {
-                    ac::g_realityCheck.active = false;
-                    if (posMatches) {
-                        ++ac::g_trajectoryMatches;
-                        if (ac::g_predictionsPaused) {
-                            ac::g_predictionsPaused = false;
-                            ac_dbg("[IB] PHANTOM-GUARD released at tick {}: trajectory matches reality "
-                                      "(real=({:.2f},{:.2f}) expect=({:.2f},{:.2f}); matches={})",
-                                ac::g_tick, getPositionX(), getPositionY(),
-                                ac::g_realityCheck.expectX, ac::g_realityCheck.expectY, ac::g_trajectoryMatches);
-                        }
-                    }
-                    else {
-                        ++ac::g_modelDivergences;
-                        ac::g_predictionsPaused = true;
-                        ac::g_trajectoryMatches = 0;
-                        ac::g_lastDivergenceSerial = ac::g_physicsSerialTick;
-                        ac_dbg("[IB] MODEL-DIVERGENCE: tras {} pasos el jugador real quedo en ({:.2f},{:.2f}) "
-                                  "pero el modelo preveia ({:.2f},{:.2f}) (button={} down={} dead={}); "
-                                  "predicciones en pausa hasta que el modelo vuelva a coincidir con la realidad",
-                            ac::g_realityCheck.steps, getPositionX(), getPositionY(),
-                            ac::g_realityCheck.expectX, ac::g_realityCheck.expectY,
-                            ac::g_realityCheck.button, ac::g_realityCheck.down,
-                            this->m_isDead ? 1 : 0);
-                    }
-                }
+        if (PlayLayer::get() && button == 1) {
+            int idx = isPlayer1 ? 0 : 1;
+            auto p = isPlayer1 ? m_player1 : m_player2;
+            if (p) {
+                if (inputPlayer(p, f->ps[idx], idx, down)) return;
             }
         }
-    }
 
-    void playSpiderDashEffect(cocos2d::CCPoint p0, cocos2d::CCPoint p1) {
-        if (!ac::g_simulating) PlayerObject::playSpiderDashEffect(p0, p1);
-    }
-
-    void incrementJumps() {
-        if (!ac::g_simulating) PlayerObject::incrementJumps();
-    }
-
-    void ringJump(RingObject* p0, bool p1) {
-        if (!ac::g_simulating) PlayerObject::ringJump(p0, p1);
-    }
-};
-
-class $modify(IBHardStreak, HardStreak) {
-    void addPoint(cocos2d::CCPoint p0) {
-        if (!ac::g_simulating) HardStreak::addPoint(p0);
-    }
-};
-
-class $modify(IBGameObject, GameObject) {
-    void playShineEffect() {
-        if (!ac::g_simulating) GameObject::playShineEffect();
-    }
-};
-
-class $modify(IBEffectObject, EffectGameObject) {
-    void triggerObject(GJBaseGameLayer* layer, int id, gd::vector<int> const* groups) {
-        if (ac::g_simulating) {
-            if (ac::g_unmodeledObjectID < 0) {
-                ac::g_unmodeledObjectID = this->m_objectID;
-                ac::g_unmodeledObjectType = static_cast<int>(this->m_objectType);
-            }
-            ac::g_unmodeled = true; // un trigger cambiaria el nivel: no se modela
-            return;
-        }
-        EffectGameObject::triggerObject(layer, id, groups);
+        GJBaseGameLayer::handleButton(down, button, isPlayer1);
     }
 };
