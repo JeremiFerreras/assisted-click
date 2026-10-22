@@ -1,28 +1,70 @@
-"settings": {
-    "stage": {
-        "type": "string", "default": "4 ticks",
-        "one-of": { "2 ticks": "2 ticks", "4 ticks": "4 ticks", "8 ticks": "8 ticks", "16 ticks": "16 ticks", "Off": "Off" }
+{
+    "geode": "5.11.2",
+    "gd": {
+        "win": "2.2081",
+        "android": "2.2081"
     },
-    "tps": {
-        "type": "string", "default": "240",
-        "one-of": { "60": "60", "120": "120", "240": "240", "360": "360", "480": "480", "720": "720", "960": "960", "1000": "1000" }
-    },
-    "wave-mode": {
-        "type": "string", "default": "Grid",
-        "one-of": { "Min Hold": "Min Hold", "Min Gap": "Min Gap", "Grid": "Grid" }
-    },
-    "cube-ticks":  { "type": "int", "default": -1 },
-    "ball-ticks":  { "type": "int", "default": -1 },
-    "robot-ticks": { "type": "int", "default": -1 },
-    "spider-ticks":{ "type": "int", "default": -1 },
-    "ship-ticks":  { "type": "int", "default": -1 },
-    "ufo-ticks":   { "type": "int", "default": -1 },
-    "swing-ticks": { "type": "int", "default": -1 },
-    "wave-ticks":  { "type": "int", "default": -1 },
-    "key-stage":    { "type": "string", "default": "None", "one-of": { "None": "None", "F1": "F1", "F2": "F2", "F3": "F3", "F4": "F4", "F5": "F5", "F6": "F6", "F7": "F7", "F8": "F8", "F9": "F9", "F10": "F10", "F11": "F11", "F12": "F12", "Insert": "Insert", "Delete": "Delete", "Home": "Home", "End": "End", "Page Up": "Page Up", "Page Down": "Page Down" } },
-    "key-tps-up":   { "type": "string", "default": "None", "one-of": { "None": "None", "F1": "F1", "F2": "F2", "F3": "F3", "F4": "F4", "F5": "F5", "F6": "F6", "F7": "F7", "F8": "F8", "F9": "F9", "F10": "F10", "F11": "F11", "F12": "F12", "Insert": "Insert", "Delete": "Delete", "Home": "Home", "End": "End", "Page Up": "Page Up", "Page Down": "Page Down" } },
-    "key-tps-down": { "type": "string", "default": "None", "one-of": { "None": "None", "F1": "F1", "F2": "F2", "F3": "F3", "F4": "F4", "F5": "F5", "F6": "F6", "F7": "F7", "F8": "F8", "F9": "F9", "F10": "F10", "F11": "F11", "F12": "F12", "Insert": "Insert", "Delete": "Delete", "Home": "Home", "End": "End", "Page Up": "Page Up", "Page Down": "Page Down" } },
-    "key-debug":    { "type": "string", "default": "None", "one-of": { "None": "None", "F1": "F1", "F2": "F2", "F3": "F3", "F4": "F4", "F5": "F5", "F6": "F6", "F7": "F7", "F8": "F8", "F9": "F9", "F10": "F10", "F11": "F11", "F12": "F12", "Insert": "Insert", "Delete": "Delete", "Home": "Home", "End": "End", "Page Up": "Page Up", "Page Down": "Page Down" } },
-    "key-wave":     { "type": "string", "default": "None", "one-of": { "None": "None", "F1": "F1", "F2": "F2", "F3": "F3", "F4": "F4", "F5": "F5", "F6": "F6", "F7": "F7", "F8": "F8", "F9": "F9", "F10": "F10", "F11": "F11", "F12": "F12", "Insert": "Insert", "Delete": "Delete", "Home": "Home", "End": "End", "Page Up": "Page Up", "Page Down": "Page Down" } },
-    "debug": { "type": "bool", "default": false }
+    "id": "jeremi.assistedclick",
+    "name": "Assisted Click",
+    "version": "v2.0.0",
+    "developer": "jeremiferreras",
+    "description": "Input buffer: un clic aereo queda pendiente hasta tocar suelo u orbe (SAVED), min-hold en modos de vuelo, wave grid/gap y grace tras spawn.",
+    "tags": ["gameplay", "utility"],
+    "settings": {
+        "stage": {
+            "type": "string",
+            "default": "4 ticks",
+            "name": "Ventana principal (stage)",
+            "description": "Cuantos ticks puede esperar un clic aereo antes de aplicarse al tocar suelo u orbe.",
+            "one-of": { "2 ticks": "2 ticks", "4 ticks": "4 ticks", "8 ticks": "8 ticks", "16 ticks": "16 ticks", "Off": "Off" }
+        },
+        "tps": {
+            "type": "string",
+            "default": "240",
+            "name": "TPS del juego",
+            "description": "Debe coincidir con tu setup. 240 = Click Between Frames desactivado.",
+            "one-of": { "60": "60", "120": "120", "240": "240", "360": "360", "480": "480", "720": "720", "960": "960", "1000": "1000" }
+        },
+        "wave-mode": {
+            "type": "string",
+            "default": "Grid",
+            "name": "Modo de wave",
+            "description": "Grid: cuantiza inputs a una rejilla de N steps. Min Gap: minimo N steps entre release y press. Min Hold: desactivado.",
+            "one-of": { "Min Hold": "Min Hold", "Min Gap": "Min Gap", "Grid": "Grid" }
+        },
+        "cube-ticks":   { "type": "int", "default": -1, "name": "Ticks cubo",   "description": "-1 = usar la ventana principal." },
+        "ball-ticks":   { "type": "int", "default": -1, "name": "Ticks bola",    "description": "-1 = usar la ventana principal." },
+        "robot-ticks":  { "type": "int", "default": -1, "name": "Ticks robot",   "description": "-1 = usar la ventana principal." },
+        "spider-ticks": { "type": "int", "default": -1, "name": "Ticks arana",  "description": "-1 = usar la ventana principal." },
+        "ship-ticks":   { "type": "int", "default": -1, "name": "Ticks ship",    "description": "-1 = usar la ventana principal." },
+        "ufo-ticks":    { "type": "int", "default": -1, "name": "Ticks ufo",     "description": "-1 = usar la ventana principal." },
+        "swing-ticks":  { "type": "int", "default": -1, "name": "Ticks swing",   "description": "-1 = usar la ventana principal." },
+        "wave-ticks":   { "type": "int", "default": -1, "name": "Ticks wave",    "description": "-1 = usar la ventana principal (max 8)." },
+        "key-stage": {
+            "type": "string", "default": "None", "name": "Hotkey: ventana (stage)",
+            "description": "Cicla 2/4/8/16/Off y anuncia en consola.",
+            "one-of": { "None": "None", "F1": "F1", "F2": "F2", "F3": "F3", "F4": "F4", "F5": "F5", "F6": "F6", "F7": "F7", "F8": "F8", "F9": "F9", "F10": "F10", "F11": "F11", "F12": "F12", "Insert": "Insert", "Delete": "Delete", "Home": "Home", "End": "End", "Page Up": "Page Up", "Page Down": "Page Down" }
+        },
+        "key-tps-up": {
+            "type": "string", "default": "None", "name": "Hotkey: TPS arriba",
+            "description": "Sube el TPS un preset.",
+            "one-of": { "None": "None", "F1": "F1", "F2": "F2", "F3": "F3", "F4": "F4", "F5": "F5", "F6": "F6", "F7": "F7", "F8": "F8", "F9": "F9", "F10": "F10", "F11": "F11", "F12": "F12", "Insert": "Insert", "Delete": "Delete", "Home": "Home", "End": "End", "Page Up": "Page Up", "Page Down": "Page Down" }
+        },
+        "key-tps-down": {
+            "type": "string", "default": "None", "name": "Hotkey: TPS abajo",
+            "description": "Baja el TPS un preset.",
+            "one-of": { "None": "None", "F1": "F1", "F2": "F2", "F3": "F3", "F4": "F4", "F5": "F5", "F6": "F6", "F7": "F7", "F8": "F8", "F9": "F9", "F10": "F10", "F11": "F11", "F12": "F12", "Insert": "Insert", "Delete": "Delete", "Home": "Home", "End": "End", "Page Up": "Page Up", "Page Down": "Page Down" }
+        },
+        "key-debug": {
+            "type": "string", "default": "None", "name": "Hotkey: debug + STATUS",
+            "description": "Activa/desactiva el log detallado y muestra el STATUS en la consola.",
+            "one-of": { "None": "None", "F1": "F1", "F2": "F2", "F3": "F3", "F4": "F4", "F5": "F5", "F6": "F6", "F7": "F7", "F8": "F8", "F9": "F9", "F10": "F10", "F11": "F11", "F12": "F12", "Insert": "Insert", "Delete": "Delete", "Home": "Home", "End": "End", "Page Up": "Page Up", "Page Down": "Page Down" }
+        },
+        "key-wave": {
+            "type": "string", "default": "None", "name": "Hotkey: modo de wave",
+            "description": "Cicla Min Hold / Min Gap / Grid.",
+            "one-of": { "None": "None", "F1": "F1", "F2": "F2", "F3": "F3", "F4": "F4", "F5": "F5", "F6": "F6", "F7": "F7", "F8": "F8", "F9": "F9", "F10": "F10", "F11": "F11", "F12": "F12", "Insert": "Insert", "Delete": "Delete", "Home": "Home", "End": "End", "Page Up": "Page Up", "Page Down": "Page Down" }
+        },
+        "debug": { "type": "bool", "default": false, "name": "Log detallado (DBG)", "description": "Muestra eventos internos del buffer en el log de Geode." }
+    }
 }
