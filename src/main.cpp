@@ -1,4 +1,4 @@
-// Assisted Click - src/main.cpp -- v1.7.5 (fix hitbox mini: toggle nativo ANTES de copiar; aviso de spawn imposible en overlay)
+// Assisted Click - src/main.cpp -- v1.7.6 (pads nativos modelados + fallback de perfil de edges; investigacion de causa comun de 0 SAVEDs)
 //
 // Que hace: al recibir un clic (PRESS/RELEASE) simula un jugador nativo clonado en pasos
 // medidos de PlayerObject::update, usando PlayLayer::checkCollisions del propio juego. Solo
@@ -290,6 +290,32 @@
 //  D. La compuerta save-authorization se abre sola con 2 muertes confirmadas (visto en
 //     el log: matches=1 -> 2 y la busqueda arranco); no se cambia.
 //
+// CAMBIOS v1.7.6 (investigacion profunda "factor comun de 0 SAVEDs" — reconstruccion
+//                  verificada contra decompile y mapeos de objetos de la comunidad):
+//  A. PADS NATIVOS MODELADOS (decompile GJBaseGameLayer::collisionCheckObjects): los
+//     pads aplican bumpPlayer/gravBumpPlayer AL PlayerObject QUE COLISIONA — fisica
+//     pura que el clon puede ejecutar igual que el juego real. El pad amarillo
+//     (id 35, type 8 = YellowJumpPad) generaba 41 UNKNOWNs en los logs: cualquier
+//     corredor con un pad era inautorizable. Ahora isModeled() cubre los 5 tipos de
+//     pad y el hook canBeActivatedByPlayer devuelve true para el clon+pad (el boost
+//     se aplica con getBumpMod nativo, que incluye el factor mini — sinergia con el
+//     fix de v1.7.5). Efectos contenidos: playBumpEffect (!m_isInPlayLayer),
+//     gameEventTriggered/playShineEffect ya suprimidos, bits de activacion restaurados
+//     por ActivationGuard.
+//  B. FALLBACK DE PERFIL DE EDGES: sin suficientes muestras de hold/gap medidas,
+//     futureEdgeOffsets() devolvia vacio -> "UNKNOWN (edge history 0/2)" y la busqueda
+//     NO ARRANCABA (48 casos en un solo log). Ahora se estresa con edges genericos
+//     (4/12/24 ticks ~ 16/50/100ms) hasta tener muestras reales.
+//  C. CONFIRMADO QUE NO SE TOCA (verificado contra decompile; el veto es CORRECTO):
+//     - TeleportPortal (type 28, id 747 en el nivel de pruebas en (43,127)): cambia la
+//       trayectoria al activarse; el clon no modela el link. Veto correcto: el nivel
+//       de pruebas NO PUEDE producir SAVEDs con un teleport en el corredor.
+//     - Triggers Modifier (type 20, id 901 = MOVE): mueven geometria real; veto correcto.
+//     - Orbs/rings: requieren timing de clic del futuro; siguen fail-closed.
+//  D. Verificacion del enum GameObjectType de bindings: 8=YellowJumpPad,
+//     26=WavePortal (ya exento por kModeledPortals), 28=TeleportPortal, 20=Modifier,
+//     40=Special (id 1755, platformer).
+//
 // CAMBIOS v1.7.5 (fix DEFINITIVO del mismatch mini: por fin la causa raiz, verificada
 //                  en el decompile de 2.2081):
 //  A. CAUSA RAIZ CONFIRMADA (open-source-gd-project, PlayerObject::togglePlayerScale):
@@ -506,7 +532,7 @@ namespace ac {
 
         auto const& s = kStages[g_stage];
         ac_console::line("===================================================");
-        ac_console::line("[InputBuffer] v1.7.5 LOADED (mini hitbox fixed: native toggle BEFORE copies; on-screen impossible-spawn warning)");
+        ac_console::line("[InputBuffer] v1.7.6 LOADED (native pads modeled; edge-profile fallback; mini hitbox fixed; impossible-spawn warning)");
         ac_console::line(fmt::format(
             "[InputBuffer] Starting Mode: STAGE {} ({} All / {} Wave)", g_stage + 1, s.all, s.wave
         ));
@@ -838,7 +864,17 @@ namespace ac {
         auto it = g_edgeProfiles.find(key);
         if (it == g_edgeProfiles.end()) return {};
         auto const& samples = currentDown ? it->second.holdTicks : it->second.releaseGapTicks;
-        if (samples.size() < kMinimumEdgeSamples) return {};
+        if (samples.size() < kMinimumEdgeSamples) {
+            // v1.7.6: fallback conservador. Antes: return {} -> "UNKNOWN (edge history
+            // 0/2)" y la busqueda NI ARRANCABA (48 UNKNOWNs solo en el log 19.00.13:
+            // los primeros clics de cada sesion no tenian 2 muestras de hold/gap y el
+            // input buffer no buscaba NADA). Ahora se estresa el candidato con edges
+            // genericos tipicos de wave-spam (~4/12/24 ticks = ~16/50/100ms a 240Hz)
+            // en vez de negarse a buscar. El perfil real los reemplaza en cuanto
+            // exista 1 muestra medida (kMinimumEdgeSamples).
+            static const std::vector<int> kDefaultEdgeOffsets = { 4, 12, 24 };
+            return kDefaultEdgeOffsets;
+        }
         std::vector<int> offsets;
         // A learned opposite edge that happens after the largest trajectory we can certify
         // is represented by 0 (no opposite edge inside that simulated horizon). Otherwise the
@@ -974,6 +1010,26 @@ namespace ac {
         200, 201, 202, 203, 1334                // velocidad
     };
 
+    // v1.7.6: PADS NATIVOS. Verificado en el decompile de 2.2081
+    // (GJBaseGameLayer::collisionCheckObjects): al colisionar, los pads llaman
+    // GJBaseGameLayer::bumpPlayer/gravBumpPlayer(player, obj) — fisica PURA sobre el
+    // PlayerObject que colisiona (el clon): mismo bumpMod (getBumpMod, incluye el factor
+    // mini de m_playerScale), misma velocidad, mismo flip de gravedad (pad azul). Los
+    // efectos estan contenidos: playBumpEffect hace early-return con !m_isInPlayLayer
+    // (el clon tiene m_playEffects=false), y gameEventTriggered/playShineEffect ya
+    // estan hookeados y suprimidos durante sims. Los bits m_activatedByPlayer1/2 que
+    // activa el clon los restaura ActivationGuard tras cada sim.
+    // ANTES (v1.7.5 y anteriores) los pads quedaban "unmodeled": 41 UNKNOWNs en los
+    // logs solo por el pad amarillo (id 35 type 8 = YellowJumpPad). Un corredor con un
+    // pad era imposible de autorizar aunque la fisica nativa ya supiera simularlo.
+    const std::unordered_set<GameObjectType> kNativePadTypes = {
+        GameObjectType::YellowJumpPad,   // 8  (id 35 y familia)
+        GameObjectType::PinkJumpPad,     // 9
+        GameObjectType::GravityPad,     // 10 (azul: invierte gravedad)
+        GameObjectType::RedJumpPad,     // 34
+        GameObjectType::SpiderPad,       // 44
+    };
+
     // Fisicos: bloques, picos, picos animados, pendientes.
     bool isPhysical(GameObject* o) {
         switch (o->m_objectType) {
@@ -988,7 +1044,8 @@ namespace ac {
     }
 
     bool isModeled(GameObject* o) {
-        return isPhysical(o) || kModeledPortals.contains(o->m_objectID);
+        return isPhysical(o) || kModeledPortals.contains(o->m_objectID) ||
+            kNativePadTypes.contains(o->m_objectType);
     }
 
     // Sin efecto en la fisica (decoracion, monedas...): se desactivan sin marcar Unknown.
@@ -3088,6 +3145,14 @@ class $modify(IBBaseLayer, GJBaseGameLayer) {
         if (ac::g_simulating) {
             if (p0 == ac::g_ghost && p1 && ac::kModeledPortals.contains(p1->m_objectID)) {
                 ac::handlePortal(p0, p1->m_objectID);
+            } else if (p0 == ac::g_ghost && p1 &&
+                       ac::kNativePadTypes.contains(p1->m_objectType)) {
+                // v1.7.6: pads nativos — dejar pasar el return true para que
+                // GJBaseGameLayer::bumpPlayer/gravBumpPlayer aplique al clon el boost
+                // con la fisica EXACTA del juego (decompile: PlayerObject::bumpPlayer es
+                // propellPlayer + flags de estado; efectos auto-suprimidos). El pad no
+                // se desactiva en la pasada de colision porque isModeled() ya lo cubre.
+                return true;
             } else {
                 if (ac::g_unmodeledObjectID < 0 && p1) {
                     ac::g_unmodeledObjectID = p1->m_objectID;
