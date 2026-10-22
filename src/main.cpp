@@ -1,4 +1,4 @@
-// Assisted Click - src/main.cpp -- v1.6.0 (form portals modeled + 1-sample edge calibration)
+// Assisted Click - src/main.cpp -- v1.6.4 (anti-envenamiento del gate; trayectoria de SAVED arreglada; tolerancia estricta)
 //
 // Que hace: al recibir un clic (PRESS/RELEASE) simula un jugador nativo clonado en pasos
 // medidos de PlayerObject::update, usando PlayLayer::checkCollisions del propio juego. Solo
@@ -40,6 +40,115 @@
 //     boton) ya no gastan predictDelay ni spamean UNKNOWN: heredan el delay activo y se
 //     encolan tal cual. La deteccion es la misma del perfil de edges (observeRawInputEdge):
 //     si el estado crudo del boton no cambia, no es un edge real.
+//
+// CAMBIOS v1.6.1 (arreglo del log 20.22.21: 36 muertes fantasma del clon en el spawn):
+//  El log muestra 36 baselines que mueren en el PASO 1 contra un objeto con
+//  objectRight=3.00, siempre en tick 0 (primer clic tras reaparecer), con todos los
+//  retrasos candidatos muriendo tambien en el paso 1 (bestDelay=1, surviveSteps=1),
+//  mientras el jugador real vive ~160 ticks. La simulacion a mitad de nivel funciona
+//  (tick 30/52 -> NO-IMMEDIATE-DEATH), asi que el problema esta en el estado de
+//  arranque del clon, no en el buscador. Mientras no se identifique el objeto exacto,
+//  el mod deja de gastar presupuesto buscando retrasos contra una muerte que no
+//  existe en la realidad:
+//  1. DIAGNOSTICO: en cada muerte del clon con el intento recien arrancado (g_tick<=1)
+//     se registra el rect del clon, el rect del jugador real y el rect/id/tipo del
+//     objeto que mata. Con un log se identifica si es (a) hitbox distinta del clon,
+//     (b) estado de spawn sin asentar, o (c) objeto que el juego real no mata.
+//  2. GUARD DE MUERTE FANTASMA: tras un baseline que muere, se programa
+//     g_physicsSerialTick + pasos + 3; si ese serialTick llega con el jugador real
+//     vivo y sin edges nuevos de input, el baseline era falso: se registra
+//     PHANTOM-DEATH y las predicciones quedan en pausa (fail open, input crudo) hasta
+//     que un baseline vuelva a coincidir con la realidad (NO-IMMEDIATE-DEATH) o el
+//     jugador muera de verdad dentro de la ventana prevista.
+//  3. GUARD DE SPAWN: si el baseline muere en <=2 pasos con g_tick<=1, se devuelve
+//     UNKNOWN("baseline-death-at-spawn-state") sin buscar: el estado de spawn del
+//     clon no es de confianza. Esto elimina los 36 falsos NO-SOLUTION.
+//  4. El veredicto UNKNOWN por objeto unmodeled ahora pega el ID/tipo del objeto en
+//     la misma linea (antes habia que buscar la linea "sim step" anterior).
+//  Siguen fail-closed a proposito: pads (35/67/140/1332), orbes y teletransporte
+//  (747): son interacciones fisicas que la simulacion estatica no puede certificar.
+//
+// CAMBIOS v1.6.2 (el guard de v1.6.1 tapaba la causa; ahora valida el modelo contra la realidad):
+//  v1.6.1 detectaba la muerte fantasma y se negaba a actuar, pero (1) bloqueaba tambien
+//  muertes REALES en spawn (startpos pegada a un pico), (2) la pausa era global y pegajosa
+//  (bloqueaba saves reales a mitad de intento), (3) un SAVED sobre un baseline falso nunca
+//  se verificaba, (4) los gates g_tick<=1 eran demasiado estrechos y (5) STAGE 1 (limite 2)
+//  hace casi imposible un SAVED en wave. v1.6.2 reemplaza el guard de muerte fantasma por
+//  un CHEQUEO DE REALIDAD que valida TODO el modelo, no solo las muertes:
+//  1. TRAYECTORIA: cada baseline Safe (KEPT) y cada SAVED arma un chequeo con la posicion
+//     final del clon (endX/endY/steps); cuando el serialTick llega, la posicion del jugador
+//     real debe coincidir (+-kRealityPositionTolerance). Si difiere (o muere), el modelo
+//     diverge: MODEL-DIVERGENCE, pausa y log con posiciones esperadas vs reales. Esto
+//     detecta fantasmas en tick 2/3, SAVED falsos y falsos NO-IMMEDIATE-DEATH.
+//  2. MUERTE PREVISTA: los baselines que mueren siguen programando su muerte esperada;
+//     si el jugador real muere dentro de la ventana, el baseline acerto (se libera la
+//     pausa y, si steps<=2, g_spawnDeathsReal=true DESACTIVA el guard de spawn: una
+//     startpos pegada a un pico deja de dar UNKNOWN en cada intento). Si el jugador
+//     sigue vivo: PHANTOM-DEATH confirmada, pausa.
+//  3. PAUSA ACOTADA: la pausa solo bloquea clics con g_tick<=3 (ventana de spawn). Los
+//     clics a mitad de intento buscan normalmente aunque el modelo este pausado, y si
+//     su trayectoria coincide con la realidad, la pausa se libera.
+//  4. GATES AMPLIADOS: el dump CLONE-DEATH y el guard de spawn cubren g_tick<=3, no solo
+//     tick 0/1.
+//  5. STAGE INICIAL 3 (8/8): el limite 2 de STAGE 1 casi nunca deja ventana de 3 clears
+//     en wave. F6 sigue ciclando 2/2 -> 4/4 -> 8/8 -> 16/8 -> OFF.
+//  6. BANDA Y DEL VETO TEMPRANO: en wave la excursion vertical por tick es |dx| (~1.3),
+//     no el suelo 3.5 de los otros modos; con el suelo se inflaba la banda y vetaba
+//     triggers inalcanzables. Floor 96 -> 48 (el veto exacto post-candidato sigue de
+//     respaldo fail-closed).
+//
+// CAMBIOS v1.6.3 (revision del chequeo de realidad: el v1.6.2 era solo observacional):
+//  1. OFF-BY-ONE DEL DEADLINE: el clon hace steps-1 updates reales (el ultimo paso
+//     solo chequea colision y sale antes del update), pero el deadline sumaba steps
+//     completos: el jugador real se comparaba con un update de ventaja. En wave el
+//     desfase (~1.3) cabia en la tolerancia, pero en cubo/ball cayendo supera 3 y daba
+//     MODEL-DIVERGENCE falsos. Ahora el deadline es serial + max(1, steps - 1).
+//  2. TRAYECTORIA POR PASO: casi ningun chequeo llegaba a resolverse en wave (cualquier
+//     edge nuevo lo cancelaba, y en wave los edges llegan cada pocos ticks). Ahora
+//     simulate() guarda la posicion del clon en CADA paso y, cuando llega el siguiente
+//     edge real, se compara la posicion del jugador real contra el paso correspondiente:
+//     el chequeo se resuelve (match o divergencia) aunque el edge llegue mucho antes
+//     del deadline. La pausa tambien se libera con un match en el edge.
+//  3. GATE DE SAVED: la validacion v1.6.2 era solo observacional: si el modelo divergia
+//     a mitad de intento, el mod seguia autorizando retrasos. Ahora un SAVED exige
+//     kMinTrajectoryMatchesForSave coincidencias de trayectoria consecutivas y que no
+//     haya una divergencia en los ultimos kDivergenceSaveCooldownTicks serial ticks.
+//     Mientras el modelo no este validado, los clics con baseline mortal devuelven
+//     UNKNOWN("save-authorization-unvalidated-model") y pasan crudos (fail open).
+//     Un baseline Safe (KEPT) sigue funcionando y acumula las coincidencias que
+//     desbloquean los SAVED.
+// CAMBIOS v1.6.4 (cuatro bugs del v1.6.3 que iban a seguir fallando):
+//  1. ANTIVENENO DEL GATE: cada PHANTOM-DEATH al reaparecer (una por clic de spawn en
+//     el escenario del log 20.22.21) ponia g_trajectoryMatches=0 y arrancaba el
+//     cooldown de 120 ticks: con intentos de ~160 ticks el gate casi nunca se abria.
+//     Ahora el chequeo recuerda si se armo dentro de la ventana de spawn
+//     (armedInSpawnWindow, g_tick<=3) y un PHANTOM-DEATH de spawn NO envenena la
+//     validacion acumulada: las muertes fantasma del estado de spawn son un problema
+//     ya conocido y aislado, no evidencia contra el modelo a mitad de nivel.
+//  2. DEADLOCK DEL ESCAPE DE SPAWN: una muerte real que coincide con la prevista no
+//     sumaba evidencia. Con una startpos pegada a un pico el primer clic ya es el
+//     mortal, nunca hay KEPT previo y el gate no se abria jamas. Ahora la muerte
+//     confirmada (++g_trajectoryMatches) tambien valida el modelo.
+//  3. TRAYECTORIA DEL SAVED VACIA: "out = {SimResult::Safe, step+1}" reasignaba TODO
+//     el SimOut y borra out.traj: chosenTraj llegaba vacio y la validacion por edge
+//     de los SAVED se descartaba sin evidencia. Ahora se asignan solo result/steps.
+//  4. TOLERANCIA ESTRICTA: el clon ejecuta el mismo PlayerObject::update desde el
+//     mismo estado, asi que la coincidencia deberia ser casi exacta; con 3.0 un error
+//     de fase de un update entero en wave (~1.3) pasaba por match. Bajada a 0.5:
+//     si el log muestra divergencias falsas, subir gradualmente.
+//  5. IDENTIDAD DEL OBJETO DE MUERTE: m_objectID es el TIPO, no la instancia (dos
+//     picos cualquiera "coincidian"). Ahora se compara el puntero del GameObject y
+//     se guarda en RealityCheck.
+//  6. BINDING: getCurrentXVelocity() (el que ya usa simulate()) en vez de m_xVelocity.
+//  4. ESCAPE DE SPAWN VERIFICADO: g_spawnDeathsReal se podia activar por casualidad
+//     (morir de verdad en los ~4 ticks siguientes por cualquier causa desactivaba el
+//     guard para TODO el nivel). Ahora la muerte real debe coincidir con la prevista:
+//     mismo objectID y deathX dentro de kRealityDeathXTolerance; si no, no hay escape.
+//  5. BANDA Y TRAS RESET: g_lastDx es 0 justo despues de un reset y el floor 0.5 de
+//     wave subestimaba la excursion. Fallback: |m_xVelocity| * g_stepDt (velocidad
+//     nativa medida del jugador real).
+//  6. Los UNKNOWN por pads/orbes/teletransporte (35/67/140/1332/747) siguen ahi A
+//     PROPOSITO: fisica que la simulacion estatica no puede certificar (fail closed).
 //
 // Tecnicas tomadas de xdBot (ZiLko/xdBot):
 //  - jugador falso creado con PlayerObject::create y anadido a m_objectLayer
@@ -172,7 +281,10 @@ namespace ac {
     constexpr float kMinConservativeHalfWidth = 20.0f; // covers normal-size and rotating hitboxes
     constexpr bool kLogVerdicts = true; // veredicto por clic -> log de Geode (NO consola)
 
-    int g_stage = 0; // empieza en STAGE 1
+    // v1.6.2: empieza en STAGE 3 (8/8). STAGE 1 (limite 2) casi nunca deja una ventana
+    // de 3 clears consecutivos en wave, asi que todo clic daba NO SAFE CLEARANCE por
+    // diseño, no por bug. F6 sigue ciclando todos los stages.
+    int g_stage = 2; // empieza en STAGE 3
 
     std::string stageText(int i) {
         auto const& s = kStages[i];
@@ -196,11 +308,11 @@ namespace ac {
         if (shown || !ac_console::init()) return;
         shown = true;
 
-        auto const& s = kStages[0];
+        auto const& s = kStages[g_stage];
         ac_console::line("===================================================");
-        ac_console::line("[InputBuffer] v1.6.0 LOADED (form portals modeled; 1-sample edge calibration)");
+        ac_console::line("[InputBuffer] v1.6.4 LOADED (spawn-safe validation; strict trajectory tolerance)");
         ac_console::line(fmt::format(
-            "[InputBuffer] Starting Mode: STAGE 1 ({} All / {} Wave)", s.all, s.wave
+            "[InputBuffer] Starting Mode: STAGE {} ({} All / {} Wave)", g_stage + 1, s.all, s.wave
         ));
         ac_console::line("[InputBuffer] F6: 2/2 -> 4/4 -> 8/8 -> 16/8 -> OFF");
         ac_console::line("[InputBuffer] Tick-based only; disable CBF / Click Between Steps / Click Between Ticks");
@@ -244,15 +356,125 @@ namespace ac {
     bool g_warnedFallbackX = false, g_warnedDualMode = false, g_warnedDeathQueue = false;
     long long g_lastPredictionMicros = 0;
 
+    // ---- v1.6.2/v1.6.3: chequeo de realidad (valida TODO el modelo contra el mundo real) ----
+    // Dos modos:
+    //  - expectDeath=true: el baseline predijo que el jugador real muere en ~steps pasos.
+    //    Si llega el deadline vivo -> PHANTOM-DEATH (muerte fantasma del clon).
+    //  - expectDeath=false: el baseline fue Safe (KEPT) o se autorizo un SAVED; el clon
+    //    recorrio la trayectoria guardada (traj, posicion por paso). El jugador real debe
+    //    seguirla: en el deadline (paso steps-1) o, si llega antes un edge nuevo, en el
+    //    paso correspondiente al edge. Si difiere -> MODEL-DIVERGENCE.
+    // v1.6.3: el deadline corrige el off-by-one (el clon hace steps-1 updates reales) y el
+    // edge resuelve el chequeo contra el paso correspondiente en vez de cancelarlo a ciegas.
+    constexpr float kRealityPositionTolerance = 0.5f; // v1.6.4: era 3.0; un desfase de un update entero pasaba por match
+    // Tolerancia holgada para confirmar una MUERTE prevista: la fase subtick puede
+    // desplazar el X de la muerte real en ~1 paso respecto del clon.
+    constexpr float kRealityDeathXTolerance = 8.0f;
+    // Gate de SAVED (v1.6.3): no se autoriza ningun retraso hasta que el modelo haya
+    // demostrado N coincidencias de trayectoria seguidas, y nunca con una divergencia
+    // reciente (cooldown en serial ticks).
+    constexpr int kMinTrajectoryMatchesForSave = 2;
+    constexpr int kDivergenceSaveCooldownTicks = 120;
+    struct RealityCheck {
+        bool active = false;
+        bool expectDeath = false;
+        int steps = 0;
+        float expectX = 0.0f;
+        float expectY = 0.0f;
+        // Solo para expectDeath (v1.6.3): la muerte real debe coincidir con la prevista.
+        float expectDeathX = 0.0f;
+        int expectDeathObjectID = -1;
+        // v1.6.4: identidad de INSTANCIA (m_objectID es el tipo, no el objeto).
+        GameObject* expectDeathObject = nullptr;
+        // v1.6.4: true si el chequeo se armo dentro de la ventana de spawn (g_tick<=3).
+        // Un PHANTOM-DEATH de spawn no envenena la validacion acumulada del nivel.
+        bool armedInSpawnWindow = false;
+        bool down = false;
+        int button = 1;
+        std::int64_t armSerialTick = 0;
+        std::int64_t deadlineSerialTick = 0;
+        // Posicion del clon en cada paso (indice = pasos desde el arme). v1.6.3.
+        std::vector<std::pair<float, float>> traj;
+    };
+    RealityCheck g_realityCheck;
+    int g_phantomDeaths = 0;      // muertes fantasma confirmadas (baseline decia muerte, real vivo)
+    int g_modelDivergences = 0;   // trayectorias que no coincidieron con la realidad
+    bool g_predictionsPaused = false;
+    // v1.6.2: escape del guard de spawn. Si una muerte del jugador real en <=2 pasos
+    // llega dentro de la ventana prevista, la muerte en spawn era REAL (startpos pegada
+    // a un pico): dejar de tratar el estado de spawn como no confiable. Por nivel.
+    // v1.6.3: solo si la muerte real coincide con la prevista (mismo objeto y deathX).
+    bool g_spawnDeathsReal = false;
+    // v1.6.3: validacion del modelo acumulada en ESTE nivel. Coincidencias de
+    // trayectoria consecutivas (cualquier divergencia las pone a 0) y serial tick de la
+    // ultima divergencia. Un SAVED exige matches >= kMinTrajectoryMatchesForSave y
+    // ninguna divergencia en los ultimos kDivergenceSaveCooldownTicks.
+    int g_trajectoryMatches = 0;
+    std::int64_t g_lastDivergenceSerial = -1000000;
+
+    // v1.6.3: el modelo solo puede autorizar SAVEDs cuando ha demostrado coincidencias
+    // de trayectoria y no ha divergido recientemente. Validacion acumulada POR NIVEL.
+    bool saveAuthorizationValidated() {
+        return g_trajectoryMatches >= kMinTrajectoryMatchesForSave &&
+            (g_physicsSerialTick - g_lastDivergenceSerial) > kDivergenceSaveCooldownTicks;
+    }
+
+    // v1.6.3: resuelve un chequeo de trayectoria (!expectDeath) contra el paso en el que
+    // llego el edge. En wave los edges llegan cada pocos ticks: casi ningun chequeo
+    // llegaba al deadline. Ahora cada edge real valida el paso correspondiente y el
+    // chequeo se resuelve con evidencia (match o divergencia) en vez de cancelarse.
+    // Devuelve true si el chequeo estaba activo y se resolvio aqui.
+    bool resolveRealityCheckAtEdge() {
+        if (!g_realityCheck.active || g_realityCheck.expectDeath) return false;
+        auto* player = g_layer ? g_layer->m_player1 : nullptr;
+        if (!player || g_realityCheck.traj.empty()) return false;
+        const auto sinceArm = g_physicsSerialTick - g_realityCheck.armSerialTick;
+        if (sinceArm < 1) return false; // sin updates nuevos no hay evidencia
+        const size_t idx = static_cast<size_t>(std::min<std::int64_t>(
+            sinceArm, static_cast<std::int64_t>(g_realityCheck.traj.size()) - 1));
+        const auto& [expX, expY] = g_realityCheck.traj[idx];
+        const bool matches = !player->m_isDead &&
+            std::abs(player->getPositionX() - expX) <= kRealityPositionTolerance &&
+            std::abs(player->getPositionY() - expY) <= kRealityPositionTolerance;
+        if (matches) {
+            ++g_trajectoryMatches;
+            if (g_predictionsPaused) {
+                g_predictionsPaused = false;
+                log::warn("[IB] PHANTOM-GUARD released at tick {} (edge match, step {}): "
+                          "real=({:.2f},{:.2f}) expect=({:.2f},{:.2f})",
+                    g_tick, idx, player->getPositionX(), player->getPositionY(), expX, expY);
+            }
+            else {
+                log::debug("[IB] reality trajectory match at step {} (real=({:.2f},{:.2f}) "
+                           "expect=({:.2f},{:.2f}); matches={})",
+                    idx, player->getPositionX(), player->getPositionY(), expX, expY, g_trajectoryMatches);
+            }
+        }
+        else {
+            g_trajectoryMatches = 0;
+            g_lastDivergenceSerial = g_physicsSerialTick;
+            ++g_modelDivergences;
+            g_predictionsPaused = true;
+            log::warn("[IB] MODEL-DIVERGENCE at edge (step {}): real=({:.2f},{:.2f}) dead={} "
+                      "but model expected ({:.2f},{:.2f}); matches reset, predictions paused",
+                idx, player->getPositionX(), player->getPositionY(),
+                player->m_isDead ? 1 : 0, expX, expY);
+        }
+        return true;
+    }
+
     bool g_loggedFirstUpdate = false;
 
     std::string statusLine(const char* tag) {
         return fmt::format(
             "[IB] {} stage={} ghost={} tick={} dtStable={} clicks={} predicted={} kept={} saved={} "
-            "nosol={} unknown={} lastUnknown={} predictUs={} | skipped: off={} early={} dead={} noGhost={} other={}",
+            "nosol={} unknown={} lastUnknown={} predictUs={} | skipped: off={} early={} dead={} noGhost={} other={} "
+            "| phantom: deaths={} divergences={} paused={} spawnReal={} matches={}",
             tag, g_stage + 1, g_ghost ? "ok" : "NULL", g_tick, g_dtStable, g_clicksSeen,
             g_clicksPredicted, g_statKept, g_statSaved, g_statNoSolution, g_statUnknown,
-            g_unknownReason, g_lastPredictionMicros, g_skipOff, g_skipEarly, g_skipDead, g_skipNoGhost, g_skipOther
+            g_unknownReason, g_lastPredictionMicros, g_skipOff, g_skipEarly, g_skipDead, g_skipNoGhost, g_skipOther,
+            g_phantomDeaths, g_modelDivergences, g_predictionsPaused ? 1 : 0, g_spawnDeathsReal ? 1 : 0,
+            g_trajectoryMatches
         );
     }
 
@@ -273,6 +495,10 @@ namespace ac {
         GameObject* deathObject = nullptr;
         float endX = 0.0f;
         float endY = 0.0f;
+        // v1.6.3: posicion del clon en cada paso (indice = paso; traj[0] = posicion
+        // inicial). Usada por el chequeo de realidad para comparar el paso exacto en el
+        // que llega un edge nuevo. Solo se llena en simulaciones que completan pasos.
+        std::vector<std::pair<float, float>> traj;
         // Recorrido vertical del clon durante la simulacion (para la banda Y del corredor).
         float minY = 0.0f;
         float maxY = 0.0f;
@@ -362,6 +588,14 @@ namespace ac {
             return true;
         }
         if (profile.lastDown == down) return false; // duplicate edge, not a timing sample
+        // v1.6.3: un edge real cambia el futuro del input. Un chequeo de MUERTE prevista
+        // ya no es comparable y se cancela. Un chequeo de TRAYECTORIA no se descarta:
+        // se resuelve contra el paso correspondiente (en wave los edges llegan cada
+        // pocos ticks y casi ningun chequeo llegaba al deadline) y luego se desactiva.
+        if (g_realityCheck.active) {
+            resolveRealityCheckAtEdge(); // valida el paso del edge; el futuro ya cambio
+        }
+        g_realityCheck.active = false;
         if (down) {
             if (profile.releaseTick >= 0) {
                 const auto gap = g_physicsSerialTick - profile.releaseTick;
@@ -499,6 +733,10 @@ namespace ac {
         g_cloneDied = false;
         g_unmodeled = false;
         g_applyingQueuedInput = false;
+        // v1.6.2: el intento termino; un chequeo de realidad pendiente ya no
+        // puede resolverse contra este intento. La pausa NO se toca: describe la
+        // confianza del modelo en el estado de spawn, que se repite en cada intento.
+        g_realityCheck.active = false;
     }
 
     void clearStats() {
@@ -510,6 +748,8 @@ namespace ac {
         g_warnedX = g_warnedSeed = g_warnedWorld = false;
         g_warnedFallbackX = g_warnedDualMode = g_warnedDeathQueue = false;
         g_lastPredictionMicros = 0;
+        g_phantomDeaths = 0;
+        g_modelDivergences = 0;
     }
 
     // ========================================================================
@@ -1141,6 +1381,11 @@ namespace ac {
                 };
 
                 for (int step = 0; step < totalSteps; ++step) {
+                    // v1.6.3: posicion del clon en este paso (antes de la pasada de
+                    // colisiones). traj[step] = posicion tras `step` updates.
+                    if (out.traj.size() < 256) {
+                        out.traj.emplace_back(g_ghost->getPositionX(), g_ghost->getPositionY());
+                    }
                     if (SteadyClock::now() >= deadline) {
                         out = unknown("prediction-wall-budget-exhausted");
                         out.steps = step;
@@ -1182,7 +1427,11 @@ namespace ac {
                         const bool oppositeEdgeSettled = oppositeEdgeAfterCandidateTicks == 0 ||
                             (oppositeEdgeApplied && step - oppositeEdgeStep >= kPostClearanceSteps);
                         if (step - targetCrossStep >= kPostClearanceSteps && oppositeEdgeSettled) {
-                            out = {SimResult::Safe, step + 1};
+                            // v1.6.4: "out = {SimResult::Safe, step+1}" reasignaba el SimOut
+                            // entero y BORRABA out.traj: chosenTraj llegaba vacio y la
+                            // validacion por edge de los SAVED se descartaba sin evidencia.
+                            out.result = SimResult::Safe;
+                            out.steps = step + 1;
                             clearedTarget = true;
                             break;
                         }
@@ -1270,6 +1519,16 @@ namespace ac {
         }
     };
 
+    // v1.6.1: el veredicto UNKNOWN por objeto/trigger no modelado pega el ID en la
+    // misma linea del veredicto (antes habia que buscar la linea "sim step" anterior).
+    // g_unmodeledObjectID se resetea en cada SimulationScope, y cualquier sim que lo
+    // marca termina rompiendo la busqueda como Unknown, asi que aqui es del clic actual.
+    std::string unmodeledSuffix() {
+        return g_unmodeledObjectID >= 0
+            ? fmt::format(" [unmodeledID={} type={}]", g_unmodeledObjectID, g_unmodeledObjectType)
+            : std::string();
+    }
+
     int predictDelay(PlayLayer* layer, PlayerObject* player, bool down, int button,
         int inheritedPressDelay = 0) {
         const int safeFallbackDelay = std::max(0, inheritedPressDelay);
@@ -1352,6 +1611,26 @@ namespace ac {
         int chosenDue = immediateDue;
 
         if (base.result == SimResult::Safe) {
+            // v1.6.2: NO se libera la pausa aqui. "El baseline no murio de inmediato" es
+            // evidencia debil (mira solo el horizonte corto); la pausa se libera cuando
+            // la TRAYECTORIA del jugador real coincide con la del clon. Se arma el chequeo
+            // con la trayectoria por paso: si el mundo real diverge, MODEL-DIVERGENCE.
+            // v1.6.3: deadline con off-by-one corregido (el clon hace steps-1 updates
+            // reales; el ultimo paso solo chequea colision y sale antes del update).
+            g_realityCheck.active = true;
+            g_realityCheck.expectDeath = false;
+            g_realityCheck.steps = base.steps;
+            g_realityCheck.expectX = base.endX;
+            g_realityCheck.expectY = base.endY;
+            g_realityCheck.expectDeathX = 0.0f;
+            g_realityCheck.expectDeathObjectID = -1;
+            g_realityCheck.expectDeathObject = nullptr;
+            g_realityCheck.armedInSpawnWindow = (g_tick <= 3);
+            g_realityCheck.down = down;
+            g_realityCheck.button = button;
+            g_realityCheck.armSerialTick = g_physicsSerialTick;
+            g_realityCheck.deadlineSerialTick = g_physicsSerialTick + std::max(1, base.steps - 1);
+            g_realityCheck.traj = base.traj;
             ++g_statKept;
             if constexpr (kLogVerdicts) {
                 log::debug("[IB] {} tick {} -> NO-IMMEDIATE-DEATH (lookahead={} steps; {} budget steps left)",
@@ -1361,8 +1640,8 @@ namespace ac {
         else if (base.result == SimResult::Unknown) {
             ++g_statUnknown;
             if constexpr (kLogVerdicts) {
-                log::debug("[IB] {} tick {} -> UNKNOWN ({})",
-                    down ? "PRESS" : "RELEASE", g_tick, g_unknownReason);
+                log::debug("[IB] {} tick {} -> UNKNOWN ({}){}",
+                    down ? "PRESS" : "RELEASE", g_tick, g_unknownReason, unmodeledSuffix());
             }
         }
         else {
@@ -1384,6 +1663,77 @@ namespace ac {
                 g_unknownReason = "nondeterministic-baseline-death";
                 log::warn("[IB] tick {} rejected: baseline death did not reproduce ({} vs {})",
                     g_tick, base.steps, baselineConfirm.steps);
+                return safeFallbackDelay;
+            }
+
+            // ---- v1.6.2: chequeo de realidad (modo muerte prevista) ----
+            // Esta muerte de referencia solo deberia verse en la realidad si el input
+            // pasa tal cual (fail open). Programa el chequeo: si el serialTick de la
+            // muerte prevista llega con el jugador real vivo y sin edges nuevos, el
+            // baseline era una muerte fantasma del modelo, no del mundo.
+            // v1.6.3: se guarda el objeto y el X previstos: la muerte real solo cuenta
+            // como "baseline acerto" (y como escape de spawn) si coincide con ellos.
+            g_realityCheck.active = true;
+            g_realityCheck.expectDeath = true;
+            g_realityCheck.steps = base.steps;
+            g_realityCheck.expectX = 0.0f;
+            g_realityCheck.expectY = 0.0f;
+            g_realityCheck.expectDeathX = base.deathX;
+            g_realityCheck.expectDeathObjectID = base.deathObject ? base.deathObject->m_objectID : -1;
+            g_realityCheck.expectDeathObject = base.deathObject;
+            g_realityCheck.armedInSpawnWindow = (g_tick <= 3);
+            g_realityCheck.down = down;
+            g_realityCheck.button = button;
+            g_realityCheck.armSerialTick = g_physicsSerialTick;
+            g_realityCheck.deadlineSerialTick = g_physicsSerialTick + base.steps + 3;
+            g_realityCheck.traj.clear();
+
+            // v1.6.2: muerte del clon en <=2 pasos con el intento recien arrancado
+            // (g_tick<=3). El respawn asienta colisiones en el jugador real que el clon
+            // recien sembrado no replica (el log 20.22.21 muestra 36 muertes asi contra
+            // un objeto con objectRight=3.00 mientras el jugador real vive ~160 ticks).
+            // No se busca retraso contra una muerte en la que no se confia. ESCAPE: si
+            // el jugador real muere de verdad en <=2 pasos dentro de la ventana prevista
+            // (startpos pegada a un pico), g_spawnDeathsReal lo desactiva para siempre
+            // en este nivel: la muerte de spawn era real.
+            if (base.steps <= 2 && g_tick <= 3 && !g_spawnDeathsReal) {
+                g_predictionsPaused = true;
+                ++g_statUnknown;
+                g_unknownReason = "baseline-death-at-spawn-state";
+                log::debug("[IB] {} tick {} -> UNKNOWN ({}; cloneDiedStep={} objectRight={:.2f} deathX={:.2f} dart={} y={:.2f})",
+                    down ? "PRESS" : "RELEASE", g_tick, g_unknownReason, base.steps,
+                    base.deathObjectRight, base.deathX,
+                    player->m_isDart, player->getPositionY());
+                return safeFallbackDelay;
+            }
+
+            // v1.6.2: el modelo esta en pausa y seguimos en la ventana de spawn
+            // (g_tick<=3): el estado de arranque todavia no coincide con la realidad, no
+            // gastes la busqueda. A mitad de intento (g_tick>3) se busca NORMAL aunque
+            // haya pausa: el estado ya no es el de spawn y bloquear ahi impide saves
+            // reales. Si ese clic a mitad de intento encuentra solucion, su chequeo de
+            // trayectoria valida el modelo y libera la pausa si coincide.
+            if (g_predictionsPaused && g_tick <= 3) {
+                ++g_statUnknown;
+                g_unknownReason = "phantom-guard-paused";
+                log::debug("[IB] {} tick {} -> UNKNOWN ({}; phantomDeaths={})",
+                    down ? "PRESS" : "RELEASE", g_tick, g_unknownReason, g_phantomDeaths);
+                return safeFallbackDelay;
+            }
+
+            // ---- v1.6.3: gate de autorizacion de SAVEDs ----
+            // La validacion del modelo debe ser un requisito, no solo un diagnostico:
+            // si nunca se ha confirmado la trayectoria (o divergio hace poco), autorizar
+            // retrasos seria confiar el input a un modelo sin respaldo. Fail open: el
+            // clic pasa crudo, sin retraso. Los KEPTs siguen armando chequeos; cada
+            // coincidencia de trayectoria (deadline o edge) acumula evidencia y, con
+            // kMinTrajectoryMatchesForSave, desbloquea los SAVEDs.
+            if (!saveAuthorizationValidated()) {
+                ++g_statUnknown;
+                g_unknownReason = "save-authorization-unvalidated-model";
+                log::debug("[IB] {} tick {} -> UNKNOWN ({}; matches={} lastDivergenceSerial={} now={})",
+                    down ? "PRESS" : "RELEASE", g_tick, g_unknownReason, g_trajectoryMatches,
+                    g_lastDivergenceSerial, g_physicsSerialTick);
                 return safeFallbackDelay;
             }
 
@@ -1444,10 +1794,21 @@ namespace ac {
             //  - whitelist: triggers puramente visuales/audio nunca vetan.
             int maxEdgeOffset = 0;
             for (int n : calibratedEdgeOffsets) maxEdgeOffset = std::max(maxEdgeOffset, n);
-            // Cota de |dy| por subpaso: la onda es diagonal (|dy| = |dx|); el resto de modos
-            // puede caer mas rapido que su dx, asi que se usa un suelo conservador.
-            const float dyPerTickGuess = std::max(std::abs(g_lastDx), 3.5f);
-            const float coarseExcursion = std::max(96.0f,
+            // Cota de |dy| por subpaso: la onda es diagonal (|dy| = |dx| ~ 1.3 en 1x);
+            // usar el suelo 3.5 en wave infla la banda y veta triggers inalcanzables.
+            // El resto de modos puede caer mas rapido que su dx: suelo conservador.
+            // v1.6.3: justo despues de un reset g_lastDx es 0 y el floor 0.5 subestimaba
+            // la excursion. Fallback con la velocidad nativa medida del jugador real.
+            float dxPerTickGuess = std::abs(g_lastDx);
+            if (!(dxPerTickGuess > 0.0f) || !std::isfinite(dxPerTickGuess)) {
+                dxPerTickGuess = std::abs(static_cast<float>(player->getCurrentXVelocity()) * g_stepDt);
+            }
+            const float dyPerTickGuess = (player->m_isDart)
+                ? std::max(dxPerTickGuess, 0.5f)
+                : std::max(dxPerTickGuess, 3.5f);
+            // v1.6.2: floor 96 -> 48: la banda era mas ancha que cualquier salto de
+            // corredor; el veto exacto post-candidato sigue de respaldo fail-closed.
+            const float coarseExcursion = std::max(48.0f,
                 (static_cast<float>(maxEdgeOffset) + static_cast<float>(kHorizon) +
                  static_cast<float>(limit) + 8.0f) * dyPerTickGuess);
             const float coarseMinY = std::min(base.minY, player->getPositionY()) - coarseExcursion;
@@ -1473,6 +1834,9 @@ namespace ac {
             int bestDelay = 0;
             int chosenClearSteps = 0;
             int chosenEdgeBranches = 0;
+            float chosenEndX = 0.0f;
+            float chosenEndY = 0.0f;
+            std::vector<std::pair<float, float>> chosenTraj;
 
             int lastDueChecked = immediateDue;
             for (int totalDelay = baselineDelay + 1; totalDelay <= limit; ++totalDelay) {
@@ -1669,6 +2033,9 @@ namespace ac {
                     chosenDue = centerDue;
                     chosenClearSteps = centerConfirm.steps;
                     chosenEdgeBranches = inputEdgeBranchesPassed;
+                    chosenEndX = centerConfirm.endX;
+                    chosenEndY = centerConfirm.endY;
+                    chosenTraj = centerConfirm.traj;
                     found = true;
                     break; // center of a three-tick clear window, replayed and sensitivity-checked
                 }
@@ -1693,10 +2060,32 @@ namespace ac {
             if (unstable) {
                 ++g_statUnknown;
                 if (!g_unknownReason || g_unknownReason[0] == '\0') g_unknownReason = "candidate-simulation-unknown";
-                log::debug("[IB] {} tick {} -> UNKNOWN ({}, testedStepsLeft={})",
-                    down ? "PRESS" : "RELEASE", g_tick, g_unknownReason, remainingSteps);
+                log::debug("[IB] {} tick {} -> UNKNOWN ({}, testedStepsLeft={}){}",
+                    down ? "PRESS" : "RELEASE", g_tick, g_unknownReason, remainingSteps, unmodeledSuffix());
             }
             else if (found) {
+                // v1.6.2: el retraso autorizado cambia el futuro respecto al baseline, asi
+                // que se arma un NUEVO chequeo de realidad con la trayectoria que el clon
+                // siguio con el input retrasado (centerConfirm). El jugador real recorrera
+                // esa misma trayectoria (el input encolado se aplica en el mismo due); si
+                // su posicion en el deadline no coincide, el SAVED era falso:
+                // MODEL-DIVERGENCE + pausa. Asi se verifican los SAVED a posteriori.
+                // v1.6.3: deadline con off-by-one corregido y trayectoria por paso para
+                // que un edge temprano tambien valide el SAVED.
+                g_realityCheck.active = true;
+                g_realityCheck.expectDeath = false;
+                g_realityCheck.steps = chosenClearSteps;
+                g_realityCheck.expectX = chosenEndX;
+                g_realityCheck.expectY = chosenEndY;
+                g_realityCheck.expectDeathX = 0.0f;
+                g_realityCheck.expectDeathObjectID = -1;
+                g_realityCheck.expectDeathObject = nullptr;
+                g_realityCheck.armedInSpawnWindow = (g_tick <= 3);
+                g_realityCheck.down = down;
+                g_realityCheck.button = button;
+                g_realityCheck.armSerialTick = g_physicsSerialTick;
+                g_realityCheck.deadlineSerialTick = g_physicsSerialTick + std::max(1, chosenClearSteps - 1);
+                g_realityCheck.traj = chosenTraj;
                 ++g_statSaved;
                 const int actualDelay = chosenDue - baselineTick;
                 const float nominalFrames = actualDelay * g_stepDt * 60.0f;
@@ -1869,6 +2258,16 @@ class $modify(IBPlayLayer, PlayLayer) {
             log::info("{}", ac::statusLine("QUIT"));
         }
         ac::clearState(false, false);
+        // v1.6.1: al salir del nivel el estado de spawn cambia por completo; la pausa
+        // del guard de muertes fantasma describe la confianza en ESTE nivel.
+        ac::g_predictionsPaused = false;
+        // v1.6.2: el escape del guard de spawn (muerte real en spawn confirmada) tambien
+        // es por nivel: en el siguiente nivel hay que volver a detectarla desde cero.
+        ac::g_spawnDeathsReal = false;
+        // v1.6.3: la validacion del modelo (matches/divergencias) es por nivel: el estado
+        // de spawn y la fisica del siguiente nivel no heredan evidencia.
+        ac::g_trajectoryMatches = 0;
+        ac::g_lastDivergenceSerial = -1000000;
         ac::destroyGhost();
         ac::g_layer = nullptr;
         PlayLayer::onQuit();
@@ -1876,6 +2275,46 @@ class $modify(IBPlayLayer, PlayLayer) {
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
         if (ac::g_simulating && player == ac::g_ghost) {
+            // v1.6.1: diagnostico de la muerte fantasma en estado de spawn. El log
+            // 20.22.21 registra 36 muertes del clon en el paso 1 contra un objeto con
+            // objectRight=3.00 siempre en tick 0, mientras el jugador real vive ~160
+            // ticks. Rects y posiciones del clon vs jugador real + rect/id/tipo del
+            // objeto revelan la causa exacta: (a) rect del clon != real -> hitbox del
+            // clon distinta; (b) rects iguales y el objeto solapa a ambos -> objeto
+            // que el juego real no cuenta como muerte; (c) posiciones distintas ->
+            // estado de spawn sin asentar en el clon.
+            // v1.6.2: gate ampliado a g_tick<=3 (v1.6.1 solo cubria tick 0/1).
+            if (ac::g_tick <= 3) {
+                const auto gr = player->GameObject::getObjectRect();
+                auto* realPlayer = this->m_player1;
+                if (realPlayer) {
+                    const auto rr = realPlayer->GameObject::getObjectRect();
+                    log::debug("[IB] CLONE-DEATH ghost=({:.2f},{:.2f}) rect=({:.2f},{:.2f},{:.2f},{:.2f}) | "
+                               "real=({:.2f},{:.2f}) rect=({:.2f},{:.2f},{:.2f},{:.2f}) | "
+                               "obj id={} type={} rect=({:.2f},{:.2f},{:.2f},{:.2f})",
+                        player->getPositionX(), player->getPositionY(),
+                        gr.getMinX(), gr.getMinY(), gr.getMaxX(), gr.getMaxY(),
+                        realPlayer->getPositionX(), realPlayer->getPositionY(),
+                        rr.getMinX(), rr.getMinY(), rr.getMaxX(), rr.getMaxY(),
+                        object ? object->m_objectID : -1,
+                        object ? static_cast<int>(object->m_objectType) : -1,
+                        object ? object->getObjectRect().getMinX() : 0.0f,
+                        object ? object->getObjectRect().getMinY() : 0.0f,
+                        object ? object->getObjectRect().getMaxX() : 0.0f,
+                        object ? object->getObjectRect().getMaxY() : 0.0f);
+                } else {
+                    log::debug("[IB] CLONE-DEATH ghost=({:.2f},{:.2f}) rect=({:.2f},{:.2f},{:.2f},{:.2f}) | "
+                               "real=NULL | obj id={} type={} rect=({:.2f},{:.2f},{:.2f},{:.2f})",
+                        player->getPositionX(), player->getPositionY(),
+                        gr.getMinX(), gr.getMinY(), gr.getMaxX(), gr.getMaxY(),
+                        object ? object->m_objectID : -1,
+                        object ? static_cast<int>(object->m_objectType) : -1,
+                        object ? object->getObjectRect().getMinX() : 0.0f,
+                        object ? object->getObjectRect().getMinY() : 0.0f,
+                        object ? object->getObjectRect().getMaxX() : 0.0f,
+                        object ? object->getObjectRect().getMaxY() : 0.0f);
+                }
+            }
             ac::g_cloneDied = true;
             ac::g_cloneDeathX = player ? player->getPositionX() : 0.0f;
             ac::g_cloneDeathObjectKnown = false;
@@ -1921,6 +2360,64 @@ class $modify(IBPlayLayer, PlayLayer) {
         if (!ac::g_simulating) {
             auto* liveLayer = PlayLayer::get();
             if (liveLayer && player == liveLayer->m_player1) {
+                // v1.6.3: resolucion del chequeo de realidad cuando el jugador real muere.
+                if (ac::g_realityCheck.active) {
+                    if (ac::g_realityCheck.expectDeath &&
+                        ac::g_physicsSerialTick <= ac::g_realityCheck.deadlineSerialTick) {
+                        // v1.6.3: la muerte real solo confirma el baseline si COINCIDE con
+                        // la muerte prevista. v1.6.4: la identidad es la INSTANCIA
+                        // (puntero), no m_objectID (el tipo: dos picos cualquiera
+                        // "coincidian"). v1.6.4: una muerte confirmada tambien valida el
+                        // modelo: sin esto, una startpos pegada a un pico jamas abria el
+                        // gate (el primer clic ya es el mortal, nunca hay KEPT previo).
+                        const bool sameObject = object &&
+                            object == ac::g_realityCheck.expectDeathObject;
+                        const bool sameX = object && std::abs(
+                            player->getPositionX() - ac::g_realityCheck.expectDeathX) <=
+                            ac::kRealityDeathXTolerance;
+                        if (sameObject && sameX) {
+                            ac::g_predictionsPaused = false;
+                            ++ac::g_trajectoryMatches;
+                            if (ac::g_realityCheck.steps <= 2 && !ac::g_spawnDeathsReal) {
+                                ac::g_spawnDeathsReal = true;
+                                log::debug("[IB] real spawn death confirmed (steps={} <= 2, objectID={}): "
+                                           "spawn guard disabled for this level",
+                                    ac::g_realityCheck.steps, ac::g_realityCheck.expectDeathObjectID);
+                            }
+                            log::debug("[IB] real death matches the predicted one (serialTick={} <= {}, "
+                                       "objectID={}, deathX={:.2f} vs {:.2f}): baseline matched reality",
+                                ac::g_physicsSerialTick, ac::g_realityCheck.deadlineSerialTick,
+                                ac::g_realityCheck.expectDeathObjectID,
+                                player->getPositionX(), ac::g_realityCheck.expectDeathX);
+                        }
+                        else {
+                            log::debug("[IB] real death within the predicted window but NOT the predicted "
+                                       "death (objectID={} vs {}, deathX={:.2f} vs {:.2f}): no validation, "
+                                       "no spawn escape",
+                                object ? object->m_objectID : -1, ac::g_realityCheck.expectDeathObjectID,
+                                player ? player->getPositionX() : 0.0f, ac::g_realityCheck.expectDeathX);
+                        }
+                    }
+                    else if (!ac::g_realityCheck.expectDeath) {
+                        // El modelo decia que la trayectoria era segura (KEPT) o que el
+                        // retraso la evitaba (SAVED) y el jugador real murio dentro del
+                        // horizonte del chequeo: divergencia del modelo, pausa.
+                        ++ac::g_modelDivergences;
+                        ac::g_predictionsPaused = true;
+                        ac::g_trajectoryMatches = 0;
+                        ac::g_lastDivergenceSerial = ac::g_physicsSerialTick;
+                        log::warn("[IB] MODEL-DIVERGENCE: el modelo preveia trayectoria segura "
+                                  "(expect=({:.2f},{:.2f}) steps={} button={} down={}) pero el jugador real "
+                                  "murio en serialTick {}; predicciones en pausa",
+                            ac::g_realityCheck.expectX, ac::g_realityCheck.expectY,
+                            ac::g_realityCheck.steps, ac::g_realityCheck.button,
+                            ac::g_realityCheck.down, ac::g_physicsSerialTick);
+                    }
+                    // Si expectDeath pero serialTick > deadline: la muerte llego tarde;
+                    // el chequeo de realidad ya expiro (la posicion se valida por
+                    // trayectoria en PlayerObject::update o el intento termino).
+                }
+                ac::g_realityCheck.active = false;
                 const auto discarded = ac::g_queue.size();
                 ac::clearInputs();
                 if (discarded > 0) log::warn("[IB] cancelled {} pending edge(s) on player death", discarded);
@@ -2147,6 +2644,74 @@ class $modify(IBPlayerObject, PlayerObject) {
             if (!ac::g_loggedFirstUpdate) {
                 ac::g_loggedFirstUpdate = true;
                 log::info("[IB] first real update dt={} dx={}", dt, ac::g_lastDx);
+            }
+
+            // ---- v1.6.2: resolucion del chequeo de realidad ----
+            // El serialTick del deadline ya paso y no llego ningun edge nuevo (eso
+            // cancela el chequeo en observeRawInputEdge). Dos modos:
+            //  - expectDeath: el baseline predijo muerte; jugador real vivo ->
+            //    PHANTOM-DEATH confirmada, pausa. (Si murio, lo maneja destroyPlayer.)
+            //  - !expectDeath: KEPT o SAVED; la posicion real debe coincidir con la del
+            //    clon (+-kRealityPositionTolerance). Divergencia (o muerte) ->
+            //    MODEL-DIVERGENCE, pausa. Coincidencia -> el modelo describe la
+            //    realidad: liberar la pausa si estaba activa.
+            if (ac::g_realityCheck.active &&
+                ac::g_physicsSerialTick >= ac::g_realityCheck.deadlineSerialTick) {
+                const bool posMatches =
+                    !this->m_isDead &&
+                    std::abs(getPositionX() - ac::g_realityCheck.expectX) <= ac::kRealityPositionTolerance &&
+                    std::abs(getPositionY() - ac::g_realityCheck.expectY) <= ac::kRealityPositionTolerance;
+                if (ac::g_realityCheck.expectDeath) {
+                    if (!this->m_isDead) {
+                        ac::g_realityCheck.active = false;
+                        ++ac::g_phantomDeaths;
+                        ac::g_predictionsPaused = true;
+                        // v1.6.4: un PHANTOM-DEATH del estado de spawn (chequeo armado con
+                        // g_tick<=3) NO envenena la validacion del nivel: en el escenario
+                        // del log hay un fantasma por cada clic al reaparecer y el gate de
+                        // SAVED casi nunca llegaba a abrirse. El spawn es un problema ya
+                        // aislado (guard propio); el modelo a mitad de nivel se valida aparte.
+                        if (!ac::g_realityCheck.armedInSpawnWindow) {
+                            ac::g_trajectoryMatches = 0;
+                            ac::g_lastDivergenceSerial = ac::g_physicsSerialTick;
+                        }
+                        log::warn("[IB] PHANTOM-DEATH: el baseline predijo muerte del clon en {} pasos "
+                                  "(button={} down={} spawnArmed={}) pero el jugador real sigue vivo en el "
+                                  "serialTick {}; predicciones en pausa hasta que el modelo vuelva a coincidir "
+                                  "con la realidad",
+                            ac::g_realityCheck.steps, ac::g_realityCheck.button, ac::g_realityCheck.down,
+                            ac::g_realityCheck.armedInSpawnWindow ? 1 : 0,
+                            ac::g_physicsSerialTick);
+                    }
+                    // Si m_isDead: la muerte la resuelve destroyPlayer (libera pausa /
+                    // marca spawnDeathsReal si coincide). El chequeo se desactiva alli.
+                }
+                else {
+                    ac::g_realityCheck.active = false;
+                    if (posMatches) {
+                        ++ac::g_trajectoryMatches;
+                        if (ac::g_predictionsPaused) {
+                            ac::g_predictionsPaused = false;
+                            log::warn("[IB] PHANTOM-GUARD released at tick {}: trajectory matches reality "
+                                      "(real=({:.2f},{:.2f}) expect=({:.2f},{:.2f}); matches={})",
+                                ac::g_tick, getPositionX(), getPositionY(),
+                                ac::g_realityCheck.expectX, ac::g_realityCheck.expectY, ac::g_trajectoryMatches);
+                        }
+                    }
+                    else {
+                        ++ac::g_modelDivergences;
+                        ac::g_predictionsPaused = true;
+                        ac::g_trajectoryMatches = 0;
+                        ac::g_lastDivergenceSerial = ac::g_physicsSerialTick;
+                        log::warn("[IB] MODEL-DIVERGENCE: tras {} pasos el jugador real quedo en ({:.2f},{:.2f}) "
+                                  "pero el modelo preveia ({:.2f},{:.2f}) (button={} down={} dead={}); "
+                                  "predicciones en pausa hasta que el modelo vuelva a coincidir con la realidad",
+                            ac::g_realityCheck.steps, getPositionX(), getPositionY(),
+                            ac::g_realityCheck.expectX, ac::g_realityCheck.expectY,
+                            ac::g_realityCheck.button, ac::g_realityCheck.down,
+                            this->m_isDead ? 1 : 0);
+                    }
+                }
             }
         }
     }
