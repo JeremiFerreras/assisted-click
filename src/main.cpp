@@ -1,4 +1,4 @@
-// Assisted Click - src/main.cpp -- v1.7.2 (fix wave MINI: seed del clon pisa el tamaño real)
+// Assisted Click - src/main.cpp -- v1.7.4 (overlay de trayectoria del futuro + consejo de input optimo)
 //
 // Que hace: al recibir un clic (PRESS/RELEASE) simula un jugador nativo clonado en pasos
 // medidos de PlayerObject::update, usando PlayLayer::checkCollisions del propio juego. Solo
@@ -261,6 +261,56 @@
 //  3. El log del seed check ahora incluye "scale ghost=... real=..." para
 //     diagnosticar de un vistazo si el tamaño vuelve a divergir.
 //
+// CAMBIOS v1.7.3 (analisis completo del log 15.56.39: veredicto por cada bloqueo):
+//  A. FIX MINI NATIVO — el v1.7.2 NO surtio efecto (107 seed checks MISMATCH en el log,
+//     ghostRect 10x10 vs realRect 6x6 con scale ghost=real=0.600). Ni la copia
+//     requires-guardada de m_width/m_height ni updatePlayerScale() reproducen el tamaño
+//     mini del clon: el binding no expone esos campos como asignables (el requires salta
+//     en silencio) y updatePlayerScale() recalcula desde un estado mini que nunca llego
+//     al clon. El camino NATIVO del juego para mini es togglePlayerScale(isMini, true) +
+//     updatePlayerScale() — el MISMO que ya usa el handler de portales del mod (case
+//     101/99) — y es el unico que recalcula la hitbox completa. Ahora seedGhost lo
+//     ejecuta tras copiar los flags de modo; las copias de respaldo quedan despues.
+//  B. VEREDICTO DEL ESCENARIO DE SPAWN: el "NO SAFE CLEARANCE" era CORRECTO. El log
+//     demuestra que el spawn (0,105) esta DENTRO del rect del pico id=8 (-3,99,3,111):
+//     el nucleo 3x3 del jugador ya lo solapa en X e Y en la siembra, y el jugador REAL
+//     muere al tick 1 tanto PRESIONANDO (y=106.30) como SOLTANDO (y=103.70, muerte real
+//     confirmada contra el mismo pico). La onda 1x solo se mueve +-1.3/tick en Y y
+//     necesita 7.5 unidades para salir de la franja 99..111 del pico, pero X despeja el
+//     pico recien al tick 4: TODA temporizacion (delays 1..8) muere al paso 1. El
+//     simulador TS que "validaba" delays >=3 usaba una zona mortal equivocada (solo la
+//     franja superior del pico); el juego real (checkCollisions nativo + muertes reales
+//     confirmadas) mata con el rect completo. Ese nivel de prueba NO tiene solucion POR
+//     DISENO: el mod esta funcionando y el modelo coincide con la realidad (matches
+//     acumulando, 0 divergencias, 0 phantom deaths).
+//  C. DIAGNOSTICO "IMPOSSIBLE SPAWN": cuando todos los candidatos mueren al mismo paso
+//     que el baseline en la ventana de spawn y el nucleo ya solapa la hitbox del objeto
+//     mortal en la siembra, el mod lo declara en consola y en el log: ese clic NO es
+//     salvable retrasandolo; hay que probar con un spawn FUERA de la hitbox del hazard.
+//  D. La compuerta save-authorization se abre sola con 2 muertes confirmadas (visto en
+//     el log: matches=1 -> 2 y la busqueda arranco); no se cambia.
+//
+// CAMBIOS v1.7.4 (overlay visual: el mod ahora DIBUJA el futuro y aconseja):
+//  A. OVERLAY DE TRAYECTORIA (F8, ON por defecto): cada 4 ticks de fisica se siembra el
+//     clon desde el jugador real y se simulan DOS futuros nativos de hasta
+//     kTrajHorizon pasos: (A) continuar con el input tal cual (sin nuevo edge, los
+//     edges encolados incluidos) y (B) invertir el input AHORA. El mejor de los dos se
+//     dibuja sobre el nivel en color llamativo (magenta = conviene cambiar el input,
+//     verde-cian = mantener, rojo = muerte prevista con X en el punto exacto), con
+//     puntos cada 8 pasos como regla de ticks, y una etiqueta encima del jugador dice
+//     el movimiento optimo: "MANTENER"/"NO PULSAR" (seguir tal cual), "SUELTA AHORA"/
+//     "PULSA AHORA" (invertir el input salva), o "MUERTE EN ~N T" (ambos mueren: el
+//     retraso fino lo sigue decidiendo la busqueda por clic).
+//  B. simulate() gana applyCandidateEvent=false (lookahead puro, sin evento candidato)
+//     y lookaheadSteps (horizonte propio del overlay): sin ellos el plannedSteps
+//     caeria a kHorizon+1 y el overlay dibujaria 16 pasos en vez de ~96.
+//  C. Los sims del overlay corren con el mismo seedGhost/checkCollisions nativos y
+//     ActivationGuard que las predicciones: si el seed check falla (p.ej. mini antes
+//     del fix) el overlay no dibuja nada en vez de mentir.
+//  D. Estado del boton: g_button1Down se trackea en el hook de handleButton (solo
+//     edges reales del jugador 1) para saber si el futuro debe comparar mantener vs
+//     soltar o no-pulsar vs pulsar.
+//
 // Tecnicas tomadas de xdBot (ZiLko/xdBot):
 //  - jugador falso creado con PlayerObject::create y anadido a m_objectLayer
 //  - copia amplia del estado de PlayerObject mediante seedGhost/AC_COPY; no se asume completa
@@ -384,6 +434,11 @@ namespace ac {
     constexpr float kPostClearanceDistance = 24.0f; // inspect nearby chained hazards without an excessive fixed tail
     constexpr float kHazardClearancePadding = 8.0f;
     constexpr float kTriggerBandYPad = 8.0f; // margen de la banda Y del veto exacto de triggers
+    // v1.7.4: overlay de trayectoria. Refresco cada 4 ticks (coste ~2 sims cortas) y
+    // horizonte de 96 pasos (~1.5 pantallas en 1x). Puntos cada 8 pasos = regla visual.
+    constexpr int kTrajRefreshEvery = 4;
+    constexpr int kTrajHorizon = 96;
+    constexpr int kTrajDotEvery = 8;
     constexpr auto kPredictionWallBudget = std::chrono::milliseconds(6);
     constexpr int kEdgeProfileSamples = 4;
     // v1.6.0: antes 2. Con clics que mueren manteniendo el boton, el edge opuesto real llega
@@ -423,11 +478,12 @@ namespace ac {
 
         auto const& s = kStages[g_stage];
         ac_console::line("===================================================");
-        ac_console::line("[InputBuffer] v1.7.2 LOADED (order fix validated by log; mini-wave seed size fix)");
+        ac_console::line("[InputBuffer] v1.7.4 LOADED (trajectory overlay F8; native mini-size seed fix; impossible-spawn diagnostic)");
         ac_console::line(fmt::format(
             "[InputBuffer] Starting Mode: STAGE {} ({} All / {} Wave)", g_stage + 1, s.all, s.wave
         ));
-        ac_console::line("[InputBuffer] F6: 2/2 -> 4/4 -> 8/8 -> 16/8 -> OFF");
+        ac_console::line("[InputBuffer] F6: 2/2 -> 4/4 -> 8/8 -> 16/8 -> OFF | F7: status | F8: future overlay");
+        ac_console::line("[InputBuffer] Overlay: magenta=cambia el input, verde=mantener, rojo=muerte prevista");
         ac_console::line("[InputBuffer] Tick-based only; disable CBF / Click Between Steps / Click Between Ticks");
         ac_console::line("===================================================");
     }
@@ -451,6 +507,18 @@ namespace ac {
     PlayLayer* g_layer = nullptr;
     PlayerObject* g_ghost = nullptr;
     PlayLayer* g_ghostOwner = nullptr;
+
+    // ---- v1.7.4: overlay de trayectoria del futuro (dibuja el clon por delante y
+    // aconseja el input optimo). El nodo y la etiqueta viven en m_objectLayer (coordenadas
+    // de mundo, se desplazan con la camara igual que el clon). F8 los activa/desactiva.
+    bool g_trajOverlay = true;
+    cocos2d::CCDrawNode* g_trajNode = nullptr;
+    cocos2d::CCLabelBMFont* g_trajLabel = nullptr;
+    PlayLayer* g_trajOwner = nullptr;
+    // Estado logico crudo del boton 1 del jugador 1 (solo edges REALES: los del clon y
+    // los re-sends no lo tocan). El overlay lo usa para saber si el futuro compara
+    // "mantener vs soltar" o "no-pulsar vs pulsar".
+    bool g_button1Down = false;
 
     bool g_simulating = false;
     bool g_cloneDied = false;
@@ -1185,14 +1253,23 @@ namespace ac {
         // en el spawn.
         dst->updatePlayerScale();
 
-        // v1.7.2: fix MINI (log 15.36.03 fase 2: first seed check MISMATCH con
-        // ghostRect 10x10 vs realRect 6x6 en wave mini). updatePlayerScale() recalcula
-        // el tamaño del clon desde SU PROPIO estado; si m_vehicleSize no llego (el
-        // AC_COPY es requires-guardado y se salta en silencio si el binding no expone
-        // el campo) o el recalculo pisa m_width/m_height con el default full, el clon
-        // vuelve a tamaño grande. Orden correcto: recalcular con los flags de modo y
-        // DESPUES imponer el tamaño del jugador real — m_vehicleSize, dims de hitbox y
-        // escala del nodo — que es exactamente el estado que el seed check compara.
+        // v1.7.3: FIX MINI NATIVO (logs 15.36.03/15.56.39: 107 seed checks MISMATCH con
+        // ghostRect 10x10 vs realRect 6x6 y scale ghost=real=0.600 — el v1.7.2, que
+        // imponia m_vehicleSize/m_width/m_height despues de updatePlayerScale(), NO
+        // surtio efecto: el binding no expone esos campos como asignables y el requires
+        // salta en silencio). El camino que el juego nativo usa para entrar/salir de mini
+        // es togglePlayerScale(isMini, true): es el MISMO que ya usa el handler de
+        // portales del mod (case 101/99) sobre el clon durante las sims, y recalcula el
+        // estado completo del tamaño (m_vehicleSize + hitbox m_width/m_height + escala).
+        // Se aplica ANTES de las copias de respaldo para que estas solo rellenen lo que
+        // el binding exponga; el seed check del v1.6.5 confirma o refuta el resultado.
+        [[maybe_unused]] const bool srcMini = src->getScale() < 0.9f;
+        if constexpr (requires { dst->togglePlayerScale(srcMini, true); }) {
+            dst->togglePlayerScale(srcMini, true);
+            dst->updatePlayerScale();
+        }
+        // v1.7.2/v1.7.3: copias de respaldo (requires-guardadas; no hacen dano si el
+        // camino nativo ya dejo el estado correcto).
         if constexpr (requires { dst->m_vehicleSize = src->m_vehicleSize; }) {
             dst->m_vehicleSize = src->m_vehicleSize;
         }
@@ -1372,7 +1449,13 @@ namespace ac {
         bool candidateImmediate = false,
         SimPerturbation perturbation = {},
         int oppositeEdgeAfterCandidateTicks = 0,
-        SteadyClock::time_point deadline = SteadyClock::time_point::max()
+        SteadyClock::time_point deadline = SteadyClock::time_point::max(),
+        // v1.7.4: modo lookahead del overlay. applyCandidateEvent=false ejecuta el futuro
+        // SIN ningun edge candidato (el input queda tal cual, con los encolados incluidos);
+        // lookaheadSteps alarga el horizonte propio (sin el, plannedSteps caeria a
+        // kHorizon+1 porque no hay evento cuyo paso lo estire).
+        bool applyCandidateEvent = true,
+        int lookaheadSteps = 0
     ) {
         if (!layer || !real || !g_ghost) return unknown("no-ghost");
         if (g_dtStable < static_cast<int>(kDtCalibrationSamples)) return unknown("dt-window-not-calibrated");
@@ -1397,9 +1480,11 @@ namespace ac {
         // despues de updateInternalActions, antes del cuerpo nativo de update ->
         // beforeCollision=false. El orden (step, beforeCollision) del sort estable
         // garantiza que el while del loop consuma primero los beforeCollision.
-        const bool applyCandidateBeforeCollision = candidateImmediate && candidateDue == base;
+        const bool applyCandidateBeforeCollision = applyCandidateEvent && candidateImmediate && candidateDue == base;
         const int candidateStep = std::max(0, candidateDue - base);
-        events.push_back({candidateStep, down, button, true, applyCandidateBeforeCollision});
+        if (applyCandidateEvent) {
+            events.push_back({candidateStep, down, button, true, applyCandidateBeforeCollision});
+        }
         if (oppositeEdgeAfterCandidateTicks > 0) {
             // The actual future raw edge is not known when the current click is predicted.
             // Stress each possible opposite edge within the stage's timing envelope. This
@@ -1412,10 +1497,15 @@ namespace ac {
             return a.beforeCollision && !b.beforeCollision;
         });
 
-        const int latestEventStep = events.back().step;
+        const int latestEventStep = events.empty() ? 0 : events.back().step;
         if (latestEventStep >= kMaxSimSteps) return unknown("too-many-steps");
 
         int plannedSteps = latestEventStep + kHorizon + 1;
+        if (lookaheadSteps > 0) {
+            // v1.7.4: el overlay pide su propio horizonte; sin evento candidato nada
+            // estiraria plannedSteps y solo se dibujarian kHorizon+1 pasos.
+            plannedSteps = std::max(plannedSteps, std::min(lookaheadSteps, kMaxSimSteps));
+        }
         if (clearTargetX) {
             // A target whose distance cannot be estimated reliably is not a safe prediction.
             float dxPerTick = std::abs(g_lastDx);
@@ -2310,6 +2400,50 @@ namespace ac {
             }
             else {
                 ++g_statNoSolution;
+                // v1.7.3: diagnostico IMPOSSIBLE-SPAWN. Si TODOS los candidatos mueren al
+                // mismo paso (o antes) que el baseline en la ventana de spawn Y el nucleo
+                // del jugador ya solapa la hitbox del objeto mortal EN LA SIEMBRA, ningun
+                // retraso puede salvar: el jugador nace dentro del area mortal y no puede
+                // salir de su franja Y antes de que X despeje (log 15.56.39: spawn (0,105)
+                // DENTRO del pico id=8 (-3,99,3,111); delays 1..8 todos mueren al paso 1,
+                // y el jugador real confirmo muriendo igual presionando y soltando). No es
+                // un bug del mod: el escenario no tiene solucion y el veredicto correcto
+                // es NO SAFE CLEARANCE. Se declara en consola para que no se confunda con
+                // una busqueda fallida.
+                bool impossibleSpawn = false;
+                if (base.steps <= 2 && g_tick <= 3 && bestSurvive <= base.steps && base.deathObject) {
+                    const float coreW = std::abs(playerRect.size.width) * 0.3f;
+                    const float coreH = std::abs(playerRect.size.height) * 0.3f;
+                    const cocos2d::CCRect core(
+                        player->getPositionX() - coreW * 0.5f,
+                        player->getPositionY() - coreH * 0.5f,
+                        coreW, coreH
+                    );
+                    const cocos2d::CCRect hazardRect = base.deathObject->getObjectRect();
+                    impossibleSpawn = hazardRect.intersectsRect(core);
+                    if (impossibleSpawn) {
+                        ac_console::line(fmt::format(
+                            "[InputBuffer] *** NO-SOLUTION (IMPOSSIBLE SPAWN): hazard id={} "
+                            "rect=({:.1f},{:.1f},{:.1f},{:.1f}) CONTAINS the spawn core — no click "
+                            "timing can avoid this death. Move the spawn outside the hazard hitbox "
+                            "to test delays. ***",
+                            base.deathObject->m_objectID,
+                            hazardRect.getMinX(), hazardRect.getMinY(),
+                            hazardRect.getMaxX(), hazardRect.getMaxY()
+                        ));
+                        log::debug(
+                            "[IB] {} tick {} -> IMPOSSIBLE SPAWN: player core at ({:.1f},{:.1f}) "
+                            "overlaps death object id={} rect=({:.1f},{:.1f},{:.1f},{:.1f}); all "
+                            "delays die at step {} — this click cannot be saved by delaying",
+                            down ? "PRESS" : "RELEASE", g_tick,
+                            player->getPositionX(), player->getPositionY(),
+                            base.deathObject->m_objectID,
+                            hazardRect.getMinX(), hazardRect.getMinY(),
+                            hazardRect.getMaxX(), hazardRect.getMaxY(),
+                            base.steps
+                        );
+                    }
+                }
                 if constexpr (kLogVerdicts) {
                     log::debug(
                         "[IB] {} tick {} -> NO SAFE CLEARANCE beyond baseline +{} (limit {}) "
@@ -2324,6 +2458,120 @@ namespace ac {
         }
 
         return chosen;
+    }
+
+    // ========================================================================
+    // v1.7.4: Overlay de trayectoria del futuro
+    // ========================================================================
+    void destroyTrajectoryOverlay() {
+        auto* node = g_trajNode;
+        auto* label = g_trajLabel;
+        g_trajNode = nullptr;
+        g_trajLabel = nullptr;
+        g_trajOwner = nullptr;
+        if (node) node->removeFromParentAndCleanup(true);
+        if (label) label->removeFromParentAndCleanup(true);
+    }
+
+    bool ensureTrajectoryOverlay(PlayLayer* layer) {
+        if (!layer || !layer->m_objectLayer) return false;
+        if (g_trajNode && g_trajOwner == layer) return true;
+        destroyTrajectoryOverlay();
+        auto* node = cocos2d::CCDrawNode::create();
+        auto* label = cocos2d::CCLabelBMFont::create("FUTURO", "bigFont.fnt");
+        if (!node || !label) return false;
+        node->setZOrder(999);
+        label->setZOrder(1000);
+        label->setAnchorPoint({0.5f, 0.5f});
+        label->setScale(0.32f);
+        layer->m_objectLayer->addChild(node);
+        layer->m_objectLayer->addChild(label);
+        g_trajNode = node;
+        g_trajLabel = label;
+        g_trajOwner = layer;
+        return true;
+    }
+
+    void drawTrajectoryPoly(std::vector<std::pair<float, float>> const& traj,
+                            cocos2d::ccColor4F const& color) {
+        if (!g_trajNode || traj.size() < 2) return;
+        for (size_t i = 1; i < traj.size(); ++i) {
+            const cocos2d::CCPoint from{traj[i - 1].first, traj[i - 1].second};
+            const cocos2d::CCPoint to{traj[i].first, traj[i].second};
+            g_trajNode->drawSegment(from, to, 1.0f, color);
+        }
+        // Regla de ticks: un punto cada kTrajDotEvery pasos.
+        const cocos2d::ccColor4F dot{1.0f, 1.0f, 1.0f, 0.85f};
+        for (size_t i = 0; i < traj.size(); i += static_cast<size_t>(kTrajDotEvery)) {
+            g_trajNode->drawDot({traj[i].first, traj[i].second}, 1.4f, dot);
+        }
+    }
+
+    void drawDeathMark(float x, float y) {
+        if (!g_trajNode) return;
+        const cocos2d::ccColor4F red{1.0f, 0.15f, 0.15f, 1.0f};
+        g_trajNode->drawSegment({x - 3.0f, y - 3.0f}, {x + 3.0f, y + 3.0f}, 1.2f, red);
+        g_trajNode->drawSegment({x - 3.0f, y + 3.0f}, {x + 3.0f, y - 3.0f}, 1.2f, red);
+    }
+
+    // Se llama desde el hook de PlayerObject::update del jugador real cada
+    // kTrajRefreshEvery ticks. Siembra el clon, simula el futuro con el input tal cual
+    // (A) y con el input invertido ahora (B), dibuja el mejor y aconseja.
+    void updateTrajectoryOverlay(PlayLayer* layer, PlayerObject* player) {
+        if (!layer || !player || player->m_isDead) return;
+        if (!ensureTrajectoryOverlay(layer) || !g_trajNode || !g_trajLabel) return;
+        g_trajNode->clear();
+
+        const bool holding = g_button1Down;
+        const int baseTick = g_tick + 1;
+        ActivationGuard guard(layer);
+
+        // Futuro A: input tal cual, sin nuevo edge (los encolados ya vienen en g_queue).
+        SimOut a = simulate(layer, player, holding, 1, baseTick, std::nullopt,
+            kTrajHorizon, true, {}, 0, SteadyClock::time_point::max(), false, kTrajHorizon);
+        guard.restore();
+        if (a.result == SimResult::Unknown) {
+            // Seed check fallido o mundo no confiable (p.ej. mini antes del fix, pads,
+            // triggers): no dibujar nada en vez de mostrar un futuro falso.
+            g_trajLabel->setString("");
+            return;
+        }
+        // Futuro B: invertir el input AHORA (edge inmediato sintetico).
+        SimOut b = simulate(layer, player, !holding, 1, baseTick, std::nullopt,
+            kTrajHorizon, true, {}, 0, SteadyClock::time_point::max(), true, kTrajHorizon);
+        guard.restore();
+
+        const bool aSafe = a.result == SimResult::Safe;
+        const bool bSafe = b.result == SimResult::Safe;
+        const cocos2d::ccColor4F magenta{1.0f, 0.0f, 1.0f, 0.9f};
+        const cocos2d::ccColor4F neon{0.0f, 1.0f, 0.7f, 0.9f};
+        const cocos2d::ccColor4F red{1.0f, 0.25f, 0.25f, 0.95f};
+
+        std::string advice;
+        if (aSafe && bSafe) {
+            // Ambos futuros sobreviven el horizonte: quedarse como esta es lo optimo
+            // (menor numero de acciones). El toggle solo importaria mas adelante.
+            drawTrajectoryPoly(a.traj, neon);
+            advice = holding ? "MANTENER" : "NO PULSAR";
+        } else if (!aSafe && bSafe) {
+            // Invertir el input AHORA salva: dibuja el futuro alternativo en magenta.
+            drawTrajectoryPoly(b.traj, magenta);
+            advice = holding ? "SUELTA AHORA" : "PULSA AHORA";
+        } else if (aSafe && !bSafe) {
+            drawTrajectoryPoly(a.traj, neon);
+            advice = holding ? "MANTENER" : "NO PULSAR";
+        } else {
+            // Ambos mueren: dibuja el futuro actual en rojo con X en la muerte; el
+            // ajuste fino (retrasar N ticks) lo sigue decidiendo la busqueda por clic.
+            drawTrajectoryPoly(a.traj, red);
+            if (!a.traj.empty()) {
+                drawDeathMark(a.traj.back().first, a.traj.back().second);
+            }
+            advice = fmt::format("MUERTE EN ~{}T", a.steps);
+        }
+
+        g_trajLabel->setString(advice.c_str());
+        g_trajLabel->setPosition({player->getPositionX(), player->getPositionY() + 26.0f});
     }
 
     // ========================================================================
@@ -2423,6 +2671,13 @@ class $modify(IBKeyboard, CCKeyboardDispatcher) {
                 ac_console::line(status);
                 log::info("{}", status);
             }
+            else if (key == cocos2d::enumKeyCodes::KEY_F8 && PlayLayer::get()) {
+                ac::g_trajOverlay = !ac::g_trajOverlay;
+                if (!ac::g_trajOverlay) ac::destroyTrajectoryOverlay();
+                ac_console::line(ac::g_trajOverlay
+                    ? "[InputBuffer] F8: overlay de trayectoria ON (magenta=cambiar input, verde=mantener, rojo=muerte)"
+                    : "[InputBuffer] F8: overlay de trayectoria OFF");
+            }
         }
 
         return CCKeyboardDispatcher::dispatchKeyboardMSG(key, down, repeat, timestamp);
@@ -2474,6 +2729,8 @@ class $modify(IBPlayLayer, PlayLayer) {
         // de spawn y la fisica del siguiente nivel no heredan evidencia.
         ac::g_trajectoryMatches = 0;
         ac::g_lastDivergenceSerial = -1000000;
+        ac::destroyTrajectoryOverlay();
+        ac::g_button1Down = false;
         ac::destroyGhost();
         ac::g_layer = nullptr;
         PlayLayer::onQuit();
@@ -2670,6 +2927,12 @@ class $modify(IBBaseLayer, GJBaseGameLayer) {
             );
         }
 
+        // v1.7.4: estado logico del boton 1 para el overlay (todo edge que llega aqui es
+        // del jugador 1 real: los del clon vuelven antes, por g_simulating).
+        if (button == 1) {
+            ac::g_button1Down = down;
+        }
+
         int delay = 0;
         auto* player = layer->m_player1;
         const int key = ac::buttonKey(button, isPlayer1);
@@ -2848,6 +3111,16 @@ class $modify(IBPlayerObject, PlayerObject) {
             if (!ac::g_loggedFirstUpdate) {
                 ac::g_loggedFirstUpdate = true;
                 log::info("[IB] first real update dt={} dx={}", dt, ac::g_lastDx);
+            }
+
+            // ---- v1.7.4: overlay de trayectoria del futuro ----
+            // Refresco cada kTrajRefreshEvery ticks: dibuja el futuro del clon y el
+            // consejo de input optimo. Corre DESPUES del update real, asique el futuro
+            // arranca del estado ya avanzado de este tick (fase despreciable para una
+            // visual). Los sims usan el mismo camino nativo y fallan en silencio.
+            if (ac::g_trajOverlay && !this->m_isDead &&
+                (ac::g_tick % ac::kTrajRefreshEvery) == 0) {
+                ac::updateTrajectoryOverlay(layer, this);
             }
 
             // ---- v1.6.2: resolucion del chequeo de realidad ----
