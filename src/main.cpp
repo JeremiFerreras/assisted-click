@@ -1,4 +1,4 @@
-// Assisted Click - src/main.cpp -- v1.7.4 (overlay de trayectoria del futuro + consejo de input optimo)
+// Assisted Click - src/main.cpp -- v1.7.5 (fix hitbox mini: toggle nativo ANTES de copiar; aviso de spawn imposible en overlay)
 //
 // Que hace: al recibir un clic (PRESS/RELEASE) simula un jugador nativo clonado en pasos
 // medidos de PlayerObject::update, usando PlayLayer::checkCollisions del propio juego. Solo
@@ -290,6 +290,34 @@
 //  D. La compuerta save-authorization se abre sola con 2 muertes confirmadas (visto en
 //     el log: matches=1 -> 2 y la busqueda arranco); no se cambia.
 //
+// CAMBIOS v1.7.5 (fix DEFINITIVO del mismatch mini: por fin la causa raiz, verificada
+//                  en el decompile de 2.2081):
+//  A. CAUSA RAIZ CONFIRMADA (open-source-gd-project, PlayerObject::togglePlayerScale):
+//     el toggle setea m_playerScale Y los multiplicadores de hitbox
+//     m_spriteWidthScale/m_spriteHeightScale, PERO hace EARLY-RETURN si m_playerScale
+//     YA esta en el estado objetivo — y en ese caso NO toca los sprite scales. En
+//     v1.7.3 el toggle corria DESPUES de AC_COPY(m_vehicleSize) (= m_playerScale real,
+//     ver RENAMED_BINDINGS: "m_vehicleSize -> m_playerScale"): el clon llegaba al toggle
+//     con 0.6 ya puesto -> early-return -> sprite scales quedaban en 1.0 ->
+//     getObjectRect() = m_width*m_scaleX*1.0 = 30x30 mientras el real usa
+//     30*1.0*0.6 = 18x18. Por eso el fix de v1.7.3 "no funcionaba" con el MISMO
+//     binario: el orden lo neutralizaba.
+//  B. FIX: el togglePlayerScale(srcMini, true) nativo ahora corre AL PRINCIPIO de
+//     seedGhost, ANTES de cualquier copia de tamano, y AC_COPY(m_vehicleSize) se
+//     ELIMINA de la copia (copiarlo vuelve a dejar playerScale sin sincronizar con los
+//     sprite scales, que es exactamente el bug). La deteccion de mini lee
+//     src->m_vehicleSize (estado real del juego) y no getScale() (el nodo esta animado
+//     0.5s por CCScaleTo tras el portal; el estado ya es final).
+//  C. CINTURON Y TIRANTES: si los bindings exponen m_spriteWidthScale/m_spriteHeightScale
+//     (los multiplicadores que GameObject::getObjectRect() usa) se copian del real, y si
+//     exponen m_isObjectRectDirty (getObjectRect2 devuelve el rect CACHEADO si no esta
+//     sucio) se fuerza el recalculo. requires los salta en silencio si no existen; el
+//     toggle nativo ya hizo el trabajo de todos modos.
+//  D. OVERLAY: cuando el clon muere en <=2 pasos dentro de la ventana de spawn, la
+//     etiqueta dice "SPAWN MORTAL: IMPOSIBLE SALVAR AQUI" en vez de "MUERTE EN ~NT":
+//     el spawn esta DENTRO de la hitbox de un objeto mortal y NINGUN retraso puede
+//     salvar (log 16.46.19: 26/26 clics IMPOSSIBLE SPAWN, 0 SAVED, todos correctos).
+//
 // CAMBIOS v1.7.4 (overlay visual: el mod ahora DIBUJA el futuro y aconseja):
 //  A. OVERLAY DE TRAYECTORIA (F8, ON por defecto): cada 4 ticks de fisica se siembra el
 //     clon desde el jugador real y se simulan DOS futuros nativos de hasta
@@ -478,7 +506,7 @@ namespace ac {
 
         auto const& s = kStages[g_stage];
         ac_console::line("===================================================");
-        ac_console::line("[InputBuffer] v1.7.4 LOADED (trajectory overlay F8; native mini-size seed fix; impossible-spawn diagnostic)");
+        ac_console::line("[InputBuffer] v1.7.5 LOADED (mini hitbox fixed: native toggle BEFORE copies; on-screen impossible-spawn warning)");
         ac_console::line(fmt::format(
             "[InputBuffer] Starting Mode: STAGE {} ({} All / {} Wave)", g_stage + 1, s.all, s.wave
         ));
@@ -1174,6 +1202,26 @@ namespace ac {
         dst->setRotation(src->getRotation());
         dst->setScale(src->getScale());
 
+        // v1.7.5: FIX MINI DEFINITIVO — togglePlayerScale nativo ANTES de copiar nada.
+        // Causa raiz (decompile 2.2081): togglePlayerScale setea m_playerScale Y los
+        // multiplicadores de hitbox m_spriteWidthScale/m_spriteHeightScale, pero hace
+        // EARLY-RETURN (sin tocar los sprite scales) si m_playerScale ya esta en el
+        // estado objetivo. En v1.7.3 corria DESPUES de AC_COPY(m_vehicleSize)
+        // (= m_playerScale real): el clon llegaba con 0.6 puesto -> early-return ->
+        // sprite scales 1.0 -> rect 30x30 vs real 18x18 (seed MISMATCH de todos los
+        // logs). Corriendo aqui, el estado del clon solo coincide por un toggle previo
+        // (seed/sim), en cuyo caso los sprite scales ya estan correctos y el
+        // early-return es inocuo. La deteccion de mini lee el ESTADO (m_vehicleSize),
+        // no getScale() (nodo animado 0.5s por CCScaleTo tras el portal).
+        [[maybe_unused]] bool srcMini = src->getScale() < 0.9f;
+        if constexpr (requires { src->m_vehicleSize; }) {
+            srcMini = src->m_vehicleSize < 0.9f;
+        }
+        if constexpr (requires { dst->togglePlayerScale(srcMini, true); }) {
+            dst->togglePlayerScale(srcMini, true);
+            dst->updatePlayerScale();
+        }
+
         #define AC_COPY(F) \
             if constexpr (requires { dst->F = src->F; }) { dst->F = src->F; }
 
@@ -1218,7 +1266,10 @@ namespace ac {
         AC_COPY(m_isUpsideDown) AC_COPY(m_isOnGround) AC_COPY(m_isGoingLeft) AC_COPY(m_isSideways)
         AC_COPY(m_isSwing) AC_COPY(m_reverseRelated) AC_COPY(m_maybeReverseSpeed) AC_COPY(m_maybeReverseAcceleration)
         AC_COPY(m_xVelocityRelated2) AC_COPY(m_isDashing) AC_COPY(m_unk9e8) AC_COPY(m_groundObjectMaterial)
-        AC_COPY(m_vehicleSize) AC_COPY(m_playerSpeed) AC_COPY(m_shipRotation) AC_COPY(m_lastPortalPos)
+        // v1.7.5: m_vehicleSize YA NO SE COPIA: copiarlo desincroniza m_playerScale de
+        // los sprite scales de hitbox (causa raiz del mismatch 30x30 vs 18x18); el
+        // toggle nativo de arriba lo deja en el valor exacto del juego (0.6 o 1.0).
+        AC_COPY(m_playerSpeed) AC_COPY(m_shipRotation) AC_COPY(m_lastPortalPos)
         AC_COPY(m_unkUnused3) AC_COPY(m_isOnGround2) AC_COPY(m_lastLandTime) AC_COPY(m_platformerVelocityRelated)
         AC_COPY(m_maybeIsBoosted) AC_COPY(m_scaleXRelatedTime) AC_COPY(m_decreaseBoostSlide) AC_COPY(m_unkA29)
         AC_COPY(m_isLocked) AC_COPY(m_controlsDisabled) AC_COPY(m_lastGroundedPos) AC_COPY(m_lastActivatedPortal)
@@ -1245,38 +1296,36 @@ namespace ac {
 
         #undef AC_COPY
 
-        // v1.6.5: recalcular el rect desde los flags de modo copiados. Esta es la misma
-        // funcion que el juego nativo ejecuta al cruzar un portal de forma (y que el
-        // handler de portales del mod ya usa): aplica m_isDart/m_isShip/m_vehicleSize al
-        // tamaño/hitbox del PlayerObject. Sin esto el rect del clon seguia siendo el de
-        // cubo hasta el primer update, y la pasada de colision del paso 0 mataba al clon
-        // en el spawn.
+        // v1.6.5: recalcular el rect desde los flags de modo copiados. El toggle nativo
+        // de v1.7.5 ya corrio ARRIBA (antes de las copias); esto asienta la escala del
+        // nodo y la hitbox de modo (m_isDart/m_isShip -> m_width/m_height).
         dst->updatePlayerScale();
 
-        // v1.7.3: FIX MINI NATIVO (logs 15.36.03/15.56.39: 107 seed checks MISMATCH con
-        // ghostRect 10x10 vs realRect 6x6 y scale ghost=real=0.600 — el v1.7.2, que
-        // imponia m_vehicleSize/m_width/m_height despues de updatePlayerScale(), NO
-        // surtio efecto: el binding no expone esos campos como asignables y el requires
-        // salta en silencio). El camino que el juego nativo usa para entrar/salir de mini
-        // es togglePlayerScale(isMini, true): es el MISMO que ya usa el handler de
-        // portales del mod (case 101/99) sobre el clon durante las sims, y recalcula el
-        // estado completo del tamaño (m_vehicleSize + hitbox m_width/m_height + escala).
-        // Se aplica ANTES de las copias de respaldo para que estas solo rellenen lo que
-        // el binding exponga; el seed check del v1.6.5 confirma o refuta el resultado.
-        [[maybe_unused]] const bool srcMini = src->getScale() < 0.9f;
-        if constexpr (requires { dst->togglePlayerScale(srcMini, true); }) {
-            dst->togglePlayerScale(srcMini, true);
-            dst->updatePlayerScale();
+        // v1.7.5: cinturon y tirantes sobre los factores de hitbox que el toggle nativo
+        // ya dejo correctos. Si los bindings exponen m_spriteWidthScale/m_spriteHeightScale
+        // (los multiplicadores que GameObject::getObjectRect() usa: rect =
+        // m_width * m_scaleX * m_spriteWidthScale) se imponen directamente desde el
+        // real; y si exponen m_isObjectRectDirty (getObjectRect2 devuelve el rect
+        // CACHEADO mientras no este sucio) se fuerza el recalculo para que el seed
+        // check compare el rect nuevo. Si el binding no expone alguno, requires lo
+        // salta en silencio y el toggle nativo de arriba ya hizo el trabajo.
+        if constexpr (requires { dst->m_spriteWidthScale = src->m_spriteWidthScale; }) {
+            dst->m_spriteWidthScale = src->m_spriteWidthScale;
+            dst->m_spriteHeightScale = src->m_spriteHeightScale;
         }
-        // v1.7.2/v1.7.3: copias de respaldo (requires-guardadas; no hacen dano si el
-        // camino nativo ya dejo el estado correcto).
-        if constexpr (requires { dst->m_vehicleSize = src->m_vehicleSize; }) {
-            dst->m_vehicleSize = src->m_vehicleSize;
+        if constexpr (requires { dst->m_isObjectRectDirty = true; }) {
+            dst->m_isObjectRectDirty = true;
         }
+        // v1.7.2: hitbox base por modo (wave 10x10, cubo 30x30). El factor mini (0.6)
+        // ya vive en los sprite scales: estos campos NO lo tocan.
         if constexpr (requires { dst->m_width = src->m_width; }) {
             dst->m_width = src->m_width;
             dst->m_height = src->m_height;
         }
+        // La escala del NODO se copia tal cual del real: durante los 0.5s de animacion
+        // elastica tras el portal el real TAMBIEN tiene la hitbox escalada (el CCScaleTo
+        // anima m_scaleX/m_scaleY, que getObjectRect multiplica), asi que copiar
+        // getScale() replica incluso ese estado transitorio.
         dst->setScale(src->getScale());
 
         dst->m_isDead = false;
@@ -2568,6 +2617,14 @@ namespace ac {
                 drawDeathMark(a.traj.back().first, a.traj.back().second);
             }
             advice = fmt::format("MUERTE EN ~{}T", a.steps);
+            // v1.7.5: muerte inmediata en la ventana de spawn = el nucleo del jugador
+            // esta DENTRO de la hitbox de un objeto mortal (IMPOSSIBLE SPAWN, ver la
+            // busqueda por clic): ningun retraso puede salvar ahi y el veredicto
+            // correcto es no tocar el input. Se avisa EN PANTALLA para que no se
+            // confunda con una busqueda fallida (log 16.46.19: 26/26 clics asi, 0 SAVED).
+            if (a.steps <= 2 && g_tick <= 3) {
+                advice = "SPAWN MORTAL: IMPOSIBLE SALVAR AQUI";
+            }
         }
 
         g_trajLabel->setString(advice.c_str());
