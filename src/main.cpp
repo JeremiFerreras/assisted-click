@@ -1,4 +1,4 @@
-// Assisted Click - src/main.cpp -- v1.6.5 (CAUSA RAIZ ENCONTRADA: hitbox del clon; fix de siembra)
+// Assisted Click - src/main.cpp -- v1.7.1 (fisica nativa auditada contra el decompile; sub-fase exacta de inputs)
 //
 // Que hace: al recibir un clic (PRESS/RELEASE) simula un jugador nativo clonado en pasos
 // medidos de PlayerObject::update, usando PlayLayer::checkCollisions del propio juego. Solo
@@ -175,10 +175,74 @@
 //  6. Los UNKNOWN por pads/orbes/teletransporte (35/67/140/1332/747) siguen ahi A
 //     PROPOSITO: fisica que la simulacion estatica no puede certificar (fail closed).
 //
+// CAMBIOS v1.7.0 (CAUSA RAIZ #2, confirmada por el log 21.44.12 con v1.6.5):
+//    first seed check: OK | ghostRect=(-5,100,5,110) realRect=(-5,100,5,110)
+//    CLONE-DEATH ghost=(0.00,105.00) ... obj id=8 rect=(-3,99,3,111)
+//  El fix de hitbox del v1.6.5 FUNCIONO (clon 10x10 = real 10x10) y el clon SIGUIO
+//  muriendo en (0,105) al paso 0/1... mientras el jugador real muere en x=1.30 (tras
+//  UN update) o sobrevive. El clon moria en la POSICION DE SIEMBRA sin haberse
+//  movido jamas. El loop de simulacion ejecutaba checkCollisions ANTES del update de
+//  cada paso; el juego real hace lo contrario (GJBaseGameLayer::update decompilado,
+//  camila314/gdp): por cada paso de fisica el orden es resetCollisionLog ->
+//  updateInternalActions -> PlayerObject::update -> checkCollisions -> updateSpecial
+//  -> updateRotation. El jugador real NUNCA es chequeado en la posicion del spawn:
+//  siempre se mueve primero. El clon, con el orden invertido, era chequeado contra
+//  el pico del spawn con el rect 10x10 solapandolo y moria al paso 0 — por eso TODA
+//  simulacion en ese nivel daba baseDeathStep=1 / NO SAFE CLEARANCE.
+//  FIX:
+//  1. Orden nativo por paso: aplicar inputs vencidos -> reset de logs ->
+//     updateInternalActions(dt/60) -> update(dt) -> checkCollisions -> cruce ->
+//     updateSpecial(dt/60) -> updateRotation(dt). El clon hace exactamente `steps`
+//     updates hasta morir/cruzar, igual que el jugador real.
+//  2. dt del juego verificado en el decompile: update recibe physicsSecond (0.25,
+//     lo que ya midamos); updateInternalActions/updateSpecial reciben physicsDelta
+//     (= dt/60); updateRotation recibe dt. Todo requiere-guardado por si el binding
+//     no expone la funcion.
+//  3. Inputs: se aplican dentro del paso de su tick (antes del update). NOTA v1.7.1:
+//     la sub-fase exacta SI importa; el split beforeCollision se restaura en v1.7.1
+//     (inmediatos antes de updateInternalActions, encolados entre
+//     updateInternalActions y update, como dispatchPending en el juego real).
+//  4. DEADLINES SIN OFF-BY-ONE: con el orden nativo el clon ejecuta `steps` updates
+//     (antes steps-1); los deadlines del chequeo de realidad pasan a serial+steps
+//     sin compensaciones.
+//  5. traj[k] = posicion tras `k` updates incluyendo el paso final (muerte/cruce):
+//     el chequeo por edge compara el paso exacto y el ultimo punto ya no falta.
+//  6. Se elimina updatePlayerScale() por paso (el juego no lo llama por paso; los
+//     portales ya lo hacen via handlePortal).
+//
+// CAMBIOS v1.7.1 (auditoria contra el decompile camila314/gdp rama 2.2):
+//  GJBaseGameLayer::update, por jugador y por paso de fisica: resetTouchedRings ->
+//  resetCollisionLog -> updateInternalActions(physicsDelta) -> update(physicsSecond)
+//  -> checkCollisions(p, physicsSecond, ...) -> updateSpecial(physicsDelta) ->
+//  updateRotation(physicsDelta*60). Hallazgos y correcciones:
+//  1. ORDEN DE RESETS: el juego llama resetTouchedRings ANTES de resetCollisionLog
+//     (v1.7.0 lo hacia al reves). Corregido al orden nativo.
+//  2. SPLIT DE INPUTS RESTAURADO (el punto 3 del v1.7.0 era impreciso): el input
+//     inmediato (handleButton sincrono, entre pasos) ocurre ANTES de los resets y de
+//     updateInternalActions; los encolados los inyecta dispatchPending desde el hook
+//     de PlayerObject::update, o sea DESPUES de updateInternalActions y ANTES del
+//     cuerpo nativo de update. El loop aplica los eventos beforeCollision antes de
+//     updateInternalActions y el resto justo antes de update. Los flags de SimEvent
+//     ya llevaban esta informacion (los encolados nacen con beforeCollision=false).
+//  3. VERIFICADO en PlayerObject_collidedWithObjectInternal: la hitbox mortal de
+//     hazards es getObjectRect(0.3, 0.3) (nucleo del jugador escalado a 30%). Como el
+//     mod delega en checkCollisions nativo, esa semantica es exacta sin re-implementar
+//     nada; con el orden nativo del paso el clon es chequeado donde el real lo seria
+//     (el wave real con nucleo 3x3 pasa raspando el pico id=8 y sobrevive).
+//  4. VERIFICADO: la muerte del clon llega via
+//     GameManager->m_playLayer->destroyPlayer(this, nullptr) desde
+//     collidedWithObjectInternal; el hook del mod la intercepta (g_simulating) y
+//     retorna sin efectos secundarios, tal como muestran los logs CLONE-DEATH.
+//  5. VERIFICADO: updateRotation recibe physicsDelta*60 = physicsSecond = dt, igual
+//     que la llamada updateRotation(dt) del loop; m_didReset del clon permanece false
+//     durante la simulacion (checkCollisions corre como en el juego).
+//
 // Tecnicas tomadas de xdBot (ZiLko/xdBot):
 //  - jugador falso creado con PlayerObject::create y anadido a m_objectLayer
 //  - copia amplia del estado de PlayerObject mediante seedGhost/AC_COPY; no se asume completa
-//  - por paso: limpiar logs -> checkCollisions -> aplicar entrada -> update -> rotacion/escala
+//  - por paso: input inmediato -> resets -> updateInternalActions -> inputs encolados
+//    -> update -> checkCollisions -> updateSpecial -> updateRotation (orden nativo
+//    auditado contra el decompile, v1.7.1)
 //  - mientras se simula se bloquean TODOS los efectos secundarios (sfx, triggers, aros,
 //    particulas, estela, animacion de fin de nivel...) y los objetos no modelados se
 //    desactivan solo durante la llamada de colisiones (collisionCheckObjects).
@@ -335,7 +399,7 @@ namespace ac {
 
         auto const& s = kStages[g_stage];
         ac_console::line("===================================================");
-        ac_console::line("[InputBuffer] v1.6.5 LOADED (clone hitbox seed fix; seed rect check)");
+        ac_console::line("[InputBuffer] v1.7.1 LOADED (native step order audited vs decompile; exact input sub-phase split)");
         ac_console::line(fmt::format(
             "[InputBuffer] Starting Mode: STAGE {} ({} All / {} Wave)", g_stage + 1, s.all, s.wave
         ));
@@ -387,10 +451,10 @@ namespace ac {
     //    Si llega el deadline vivo -> PHANTOM-DEATH (muerte fantasma del clon).
     //  - expectDeath=false: el baseline fue Safe (KEPT) o se autorizo un SAVED; el clon
     //    recorrio la trayectoria guardada (traj, posicion por paso). El jugador real debe
-    //    seguirla: en el deadline (paso steps-1) o, si llega antes un edge nuevo, en el
-    //    paso correspondiente al edge. Si difiere -> MODEL-DIVERGENCE.
-    // v1.6.3: el deadline corrige el off-by-one (el clon hace steps-1 updates reales) y el
-    // edge resuelve el chequeo contra el paso correspondiente en vez de cancelarlo a ciegas.
+    //    seguirla: en el deadline (paso steps, tras `steps` updates) o, si llega antes un
+    //    edge nuevo, en el paso correspondiente al edge. Si difiere -> MODEL-DIVERGENCE.
+    // v1.7.0: con el orden update->checkCollisions el clon ejecuta exactamente `steps`
+    // updates; el deadline es serial+steps sin compensaciones de off-by-one.
     constexpr float kRealityPositionTolerance = 0.5f; // v1.6.4: era 3.0; un desfase de un update entero pasaba por match
     // Tolerancia holgada para confirmar una MUERTE prevista: la fase subtick puede
     // desplazar el X de la muerte real en ~1 paso respecto del clon.
@@ -1285,10 +1349,13 @@ namespace ac {
         for (auto const& q : g_queue) {
             events.push_back({std::max(0, q.tick - base), q.down, q.button, false, false});
         }
-        // The actual immediate path calls handleButton synchronously, before the next
-        // collision pass. Delayed/queued inputs are dispatched from PlayerObject::update,
-        // after that tick's collision pass. Treating both paths identically creates a
-        // one-collision-phase error precisely at tight frame-perfect gaps.
+        // v1.7.1: split EXACTO de los dos caminos de input (auditoria del decompile).
+        // El input inmediato (delay 0) se aplica por handleButton sincrono ENTRE pasos:
+        // antes de los resets y de updateInternalActions -> beforeCollision=true. Los
+        // encolados los inyecta dispatchPending desde el hook de PlayerObject::update:
+        // despues de updateInternalActions, antes del cuerpo nativo de update ->
+        // beforeCollision=false. El orden (step, beforeCollision) del sort estable
+        // garantiza que el while del loop consuma primero los beforeCollision.
         const bool applyCandidateBeforeCollision = candidateImmediate && candidateDue == base;
         const int candidateStep = std::max(0, candidateDue - base);
         events.push_back({candidateStep, down, button, true, applyCandidateBeforeCollision});
@@ -1433,29 +1500,94 @@ namespace ac {
                     }
                 };
 
+                // v1.7.0: traj[k] = posicion tras `k` updates (traj[0] = siembra, ya con
+                // las perturbaciones aplicadas). Se registra despues del update de cada paso
+                // para que el paso final (muerte o cruce) tambien tenga su entrada exacta.
+                if (out.traj.size() < 256) {
+                    out.traj.emplace_back(g_ghost->getPositionX(), g_ghost->getPositionY());
+                }
+                // v1.7.0: el juego pasa physicsSecond (0.25, lo que medimos como g_stepDt) a
+                // PlayerObject::update, y physicsDelta (= physicsSecond/60) a
+                // updateInternalActions y updateSpecial (GJBaseGameLayer::update decompilado,
+                // camila314/gdp).
+                const float subDt = dt / 60.0f;
+
                 for (int step = 0; step < totalSteps; ++step) {
-                    // v1.6.3: posicion del clon en este paso (antes de la pasada de
-                    // colisiones). traj[step] = posicion tras `step` updates.
-                    if (out.traj.size() < 256) {
-                        out.traj.emplace_back(g_ghost->getPositionX(), g_ghost->getPositionY());
-                    }
                     if (SteadyClock::now() >= deadline) {
                         out = unknown("prediction-wall-budget-exhausted");
                         out.steps = step;
                         break;
                     }
-                    // Direct inputs are already active before the next collision pass. Inputs
-                    // held in the queue are applied after the due tick's collision pass, matching
-                    // dispatchPending() from the PlayerObject::update hook.
+                    // v1.7.1: primera mitad del split de inputs. El input INMEDIATO llega
+                    // por handleButton sincrono (entre pasos, antes de todo el paso de
+                    // fisica siguiente): se aplica antes de los resets y de
+                    // updateInternalActions. Los eventos estan ordenados por
+                    // (step, beforeCollision), asi que este while consume solo los
+                    // beforeCollision de este paso y deja los encolados para despues.
                     while (next < events.size() && events[next].step <= step &&
                            events[next].beforeCollision) {
                         applySimEvent(events[next++]);
                     }
 
-                    g_ghost->m_collisionLogTop->removeAllObjects();
-                    g_ghost->m_collisionLogBottom->removeAllObjects();
-                    g_ghost->m_collisionLogLeft->removeAllObjects();
-                    g_ghost->m_collisionLogRight->removeAllObjects();
+                    // Fase pre-jugador del paso: el juego llama resetTouchedRings y
+                    // resetCollisionLog (en ese orden) al inicio de cada paso de fisica.
+                    if constexpr (requires { g_ghost->resetTouchedRings(false); }) {
+                        g_ghost->resetTouchedRings(false);
+                    }
+                    if constexpr (requires { g_ghost->resetCollisionLog(false); }) {
+                        g_ghost->resetCollisionLog(false);
+                    } else {
+                        g_ghost->m_collisionLogTop->removeAllObjects();
+                        g_ghost->m_collisionLogBottom->removeAllObjects();
+                        g_ghost->m_collisionLogLeft->removeAllObjects();
+                        g_ghost->m_collisionLogRight->removeAllObjects();
+                    }
+
+                    // v1.7.0/1.7.1: ORDEN EXACTO del loop de fisica del juego
+                    // (GJBaseGameLayer::update decompilado, camila314/gdp): resets ->
+                    // updateInternalActions -> update -> checkCollisions -> updateSpecial
+                    // -> updateRotation. v1.6.x ejecutaba la pasada de colisiones ANTES del
+                    // update: el clon era chequeado en la posicion de siembra y moria al
+                    // paso 0 (log 21.44.12: CLONE-DEATH en (0,105)) mientras el jugador
+                    // real siempre es chequeado tras moverse (muertes reales en x=1.30,
+                    // baseline que "sobrevive" al soltar). Ese orden invertido era la
+                    // causa raiz de TODAS las muertes fantasma en la ventana de spawn y
+                    // del NO SAFE CLEARANCE sistematico.
+                    if constexpr (requires { g_ghost->updateInternalActions(0.0f); }) {
+                        g_ghost->updateInternalActions(subDt);
+                    }
+
+                    // v1.7.1: segunda mitad del split de inputs. Los ENCOLADOS vencidos se
+                    // aplican aqui, exactamente donde dispatchPending los inyecta en el
+                    // juego real: inicio del hook de PlayerObject::update, o sea despues
+                    // de updateInternalActions y antes del cuerpo nativo de update.
+                    while (next < events.size() && events[next].step <= step) {
+                        applySimEvent(events[next++]);
+                    }
+
+                    const float beforeX = g_ghost->getPositionX();
+                    g_ghost->update(dt);
+                    const float movedX = g_ghost->getPositionX() - beforeX;
+                    const float afterY = g_ghost->getPositionY();
+                    if (afterY < trajMinY) trajMinY = afterY;
+                    if (afterY > trajMaxY) trajMaxY = afterY;
+                    if (out.traj.size() < 256) {
+                        out.traj.emplace_back(g_ghost->getPositionX(), g_ghost->getPositionY());
+                    }
+
+                    // Do not synthesize horizontal movement. The clone must advance through
+                    // PlayerObject::update like xdBot's native trajectory. If this state does
+                    // not move X naturally, fail closed instead of making a path by hand.
+                    if (std::abs(movedX) < 0.0001f) {
+                        if (!g_warnedX) {
+                            g_warnedX = true;
+                            log::warn("[IB] native clone X did not advance; refusing prediction");
+                        }
+                        out = unknown("ghost-x-did-not-advance-natively");
+                        out.steps = step + 1;
+                        break;
+                    }
+
                     layer->checkCollisions(g_ghost, dt, false);
 
                     if (g_unmodeled) {
@@ -1466,6 +1598,8 @@ namespace ac {
                         break;
                     }
                     if (g_cloneDied || g_ghost->m_isDead) {
+                        // Muerte tras `step+1` updates: exactamente los mismos updates que
+                        // ejecutaria el jugador real hasta morir (v1.6.x: solo `step`).
                         out = {SimResult::Died, step + 1};
                         out.deathX = g_cloneDeathX;
                         out.deathObjectRight = g_cloneDeathObjectRight;
@@ -1490,36 +1624,10 @@ namespace ac {
                         }
                     }
 
-                    while (next < events.size() && events[next].step <= step) {
-                        // beforeCollision events were consumed above. Because equal-step events
-                        // are sorted with those first, all remaining events belong after collision.
-                        applySimEvent(events[next++]);
+                    if constexpr (requires { g_ghost->updateSpecial(0.0f); }) {
+                        g_ghost->updateSpecial(subDt);
                     }
-
-                    if (step + 1 >= totalSteps) break;
-
-                    const float beforeX = g_ghost->getPositionX();
-                    g_ghost->update(dt);
-                    const float movedX = g_ghost->getPositionX() - beforeX;
-                    const float afterY = g_ghost->getPositionY();
-                    if (afterY < trajMinY) trajMinY = afterY;
-                    if (afterY > trajMaxY) trajMaxY = afterY;
-
-                    // Do not synthesize horizontal movement. The clone must advance through
-                    // PlayerObject::update like xdBot's native trajectory. If this state does not
-                    // move X naturally, fail closed instead of making a path by hand.
-                    if (std::abs(movedX) < 0.0001f) {
-                        if (!g_warnedX) {
-                            g_warnedX = true;
-                            log::warn("[IB] native clone X did not advance; refusing prediction");
-                        }
-                        out = unknown("ghost-x-did-not-advance-natively");
-                        out.steps = step + 1;
-                        break;
-                    }
-
                     g_ghost->updateRotation(dt);
-                    g_ghost->updatePlayerScale();
                 }
             }
         }
@@ -1668,8 +1776,9 @@ namespace ac {
             // evidencia debil (mira solo el horizonte corto); la pausa se libera cuando
             // la TRAYECTORIA del jugador real coincide con la del clon. Se arma el chequeo
             // con la trayectoria por paso: si el mundo real diverge, MODEL-DIVERGENCE.
-            // v1.6.3: deadline con off-by-one corregido (el clon hace steps-1 updates
-            // reales; el ultimo paso solo chequea colision y sale antes del update).
+            // v1.6.3: deadline con off-by-one corregido (el clon hacia steps-1 updates).
+            // v1.7.0: el orden update->checkCollisions hace que el clon ejecute exactamente
+            // `steps` updates; el jugador real alcanza expectX/expectY en serial+steps.
             g_realityCheck.active = true;
             g_realityCheck.expectDeath = false;
             g_realityCheck.steps = base.steps;
@@ -1682,7 +1791,7 @@ namespace ac {
             g_realityCheck.down = down;
             g_realityCheck.button = button;
             g_realityCheck.armSerialTick = g_physicsSerialTick;
-            g_realityCheck.deadlineSerialTick = g_physicsSerialTick + std::max(1, base.steps - 1);
+            g_realityCheck.deadlineSerialTick = g_physicsSerialTick + std::max(1, base.steps);
             g_realityCheck.traj = base.traj;
             ++g_statKept;
             if constexpr (kLogVerdicts) {
@@ -2125,6 +2234,8 @@ namespace ac {
                 // MODEL-DIVERGENCE + pausa. Asi se verifican los SAVED a posteriori.
                 // v1.6.3: deadline con off-by-one corregido y trayectoria por paso para
                 // que un edge temprano tambien valide el SAVED.
+                // v1.7.0: orden update->checkCollisions => el cruce ocurre tras exactamente
+                // chosenClearSteps updates; deadline serial+steps sin compensacion.
                 g_realityCheck.active = true;
                 g_realityCheck.expectDeath = false;
                 g_realityCheck.steps = chosenClearSteps;
@@ -2137,7 +2248,7 @@ namespace ac {
                 g_realityCheck.down = down;
                 g_realityCheck.button = button;
                 g_realityCheck.armSerialTick = g_physicsSerialTick;
-                g_realityCheck.deadlineSerialTick = g_physicsSerialTick + std::max(1, chosenClearSteps - 1);
+                g_realityCheck.deadlineSerialTick = g_physicsSerialTick + std::max(1, chosenClearSteps);
                 g_realityCheck.traj = chosenTraj;
                 ++g_statSaved;
                 const int actualDelay = chosenDue - baselineTick;
