@@ -43,9 +43,7 @@ This is a prediction tool, not a guarantee that every death can be prevented. So
 A successful unit-test run validates the tested scheduling logic; it does **not** prove that collision prediction is always correct in live gameplay. Test changes carefully in Geometry Dash.
 
 ## Credits
-
-The prediction and input-scheduling code is based on **Input Buffer by AlQuerez23**, using the source archive supplied for this private adaptation. Upstream implementation details and historical changelog material may remain in the project. This fork does not claim authorship of the original engine.
-
+To the me and the IA
 ## Build
 
 Use the repository's GitHub Actions workflow to compile the source with the configured Geode SDK. See `README.md` for the build steps and test limitations.
