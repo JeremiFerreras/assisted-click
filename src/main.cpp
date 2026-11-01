@@ -7507,8 +7507,58 @@ public:
             }
         }
 
-        // 2a. Orb Assist: deterministic physics, exact per-tick search, and
-        // fail-closed isolation. No learned profile is required for first use.
+        // Orb Assist is a candidate, not an early override. Compare its fully
+        // simulated result with the normal Assisted Click result before scheduling.
+        bool orbPlanFound = false;
+        RingObject* orbPlanTarget = nullptr;
+        int orbPlanDelay = -1;
+        int orbPlanContactHi = -1;
+        int orbPlanSafeLo = -1;
+        int orbPlanSafeHi = -1;
+        int orbPlanTested = 0;
+        float orbPlanClearance = -std::numeric_limits<float>::infinity();
+
+        auto scheduleOrbPlan = [&]() -> bool {
+            if (!orbPlanFound || !orbPlanTarget || orbPlanDelay <= 0 || orbPlanSafeHi < orbPlanDelay)
+                return false;
+            double const gridStart = m_gameTime - static_cast<double>(tickPhase()) * dt;
+            auto at = [&](double ticks) { return gridStart + ticks * dt; };
+
+            m_planTrust = false;
+            m_liveSpotHold = false;
+            m_liveRescue = false;
+            m_orbHelpHold = true;
+            m_orbHelpRing = orbPlanTarget;
+            m_routeHold = false;
+            m_queue.start(true, m_gameTime, std::max(0.0, at(orbPlanDelay) - m_gameTime));
+
+            // The selected delay is fixed. The live step only gates delivery on
+            // Geometry Dash confirming the exact target contact in the safe run.
+            m_live = true;
+            m_liveState.startClick(m_gameTime, dt, at(orbPlanDelay),
+                                   at(orbPlanContactHi + 1) + TIME_EPS,
+                                   at(orbPlanSafeHi) + TIME_EPS);
+            m_liveArrive = m_gameTime;
+            m_livePlanTicks = orbPlanDelay;
+            m_liveWaited = false;
+            m_liveWaitWhy = 0;
+            for (int& v : m_refuse) v = 0;
+            m_refuseHave = false;
+            m_last.liveTicks = -1;
+            m_last.liveReason = ibcore::FireReason::None;
+            m_trackPending = false;
+
+            ClickNote n = base;
+            n.d = Decision::Buffered;
+            n.delay = orbPlanDelay;
+            n.orbHelp = true;
+            n.orbSafeLo = orbPlanSafeLo;
+            note(c, mode, dt, n);
+            pushLog(fmt::format("Orb Assist: {} ticks planned (safe run {}..{}, {} exact tests)",
+                                orbPlanDelay, orbPlanSafeLo, orbPlanSafeHi, orbPlanTested), COL_GREEN, true);
+            return true;
+        };
+
         if (push && c.orbHelper && !touchingOrb(p1)) {
             Ctx ox;
             if (makeCtx(pl, true, c, ox)) {
@@ -7631,39 +7681,14 @@ public:
                 m_deadline = oldDeadline;
 
                 if (chosen > 0 && target) {
-                    double const gridStart = m_gameTime - static_cast<double>(tickPhase()) * dt;
-                    auto at = [&](double ticks) { return gridStart + ticks * dt; };
-                    m_planTrust = false;
-                    m_liveSpotHold = false;
-                    m_liveRescue = false;
-                    m_orbHelpHold = true;
-                    m_orbHelpRing = target;
-                    m_routeHold = false;
-                    m_queue.start(true, m_gameTime, std::max(0.0, at(chosen) - m_gameTime));
-                    // Every candidate tick was exhaustively simulated from the
-                    // Level Scan PlayerSnap. Fire on that exact game-time tick;
-                    // do not run the generic live re-planner, which can move a
-                    // frame-perfect input away from the verified tick.
-                    m_live = false;
-                    m_liveState = ibcore::LiveState{};
-                    m_liveArrive = m_gameTime;
-                    m_livePlanTicks = chosen;
-                    m_liveWaited = false;
-                    m_liveWaitWhy = 0;
-                    for (int& v : m_refuse) v = 0;
-                    m_refuseHave = false;
-                    m_last.liveTicks = -1;
-                    m_last.liveReason = ibcore::FireReason::None;
-                    m_trackPending = false;
-                    ClickNote n = base;
-                    n.d = Decision::Buffered;
-                    n.delay = chosen;
-                    n.orbHelp = true;
-                    n.orbSafeLo = pick.runLo;
-                    note(c, mode, dt, n);
-                    pushLog(fmt::format("Orb Assist: {} ticks verified (safe window {}..{}, {} exact tests)",
-                                        chosen, pick.runLo, pick.runHi, pick.tested), COL_GREEN, true);
-                    return false;
+                    orbPlanFound = true;
+                    orbPlanTarget = target;
+                    orbPlanDelay = chosen;
+                    orbPlanContactHi = contactHi;
+                    orbPlanSafeLo = pick.runLo;
+                    orbPlanSafeHi = pick.runHi;
+                    orbPlanTested = pick.tested;
+                    orbPlanClearance = pick.clearance;
                 }
                 // Rejection is intentionally silent: the click remains raw (or
                 // goes through the normal buffer when the main stage is on).
@@ -7671,9 +7696,12 @@ public:
             }
         }
 
-        // When the main stage is OFF, do not fall through into the ordinary
-        // Assisted Click predictor after the independent Orb Assist check.
-        if (!m_enabled) return pass(Decision::PassModeOff);
+        // Stage Off disables ordinary Assisted Click, but not an independently
+        // verified Orb Assist plan.
+        if (!m_enabled) {
+            if (scheduleOrbPlan()) return false;
+            return pass(Decision::PassModeOff);
+        }
 
         // 2b. Wave spam: keep ONE steady shift for the whole stream. Jitter came
         //     from every input being judged on its own - one delayed 3 ticks,
@@ -7736,7 +7764,10 @@ public:
         }
 
         // 4. Window shorter than one physics tick (e.g. 0.5f at 60 TPS): nothing to do.
-        if (windowTicks <= 0) return pass(Decision::PassNoWindow);
+        if (windowTicks <= 0) {
+            if (scheduleOrbPlan()) return false;
+            return pass(Decision::PassNoWindow);
+        }
         int maxDelay = windowTicks;
         // Wave / ship (2.1): never hold an input longer than most of the gesture
         // it starts (your usual hold / gap) - see HOLD_DELAY_FRAC.
@@ -7811,6 +7842,8 @@ public:
         }
 
         // How good is the click if delayed by d ticks? (shared by the search and the probe)
+        std::map<int, std::pair<SimResult, ibcore::Verdict>> normalTests;
+        bool normalSearchComplete = false;
         auto eval = [&](int d) -> ibcore::Verdict {
             SimResult rd = sim(d);
             if (rd.end == SimEnd::OutOfBudget && !cheap) {
@@ -7824,6 +7857,8 @@ public:
                 enterCheap();
                 v = verdictFor(x, d, rd, r0.ticks, budgetHit, -1);
             }
+            if (rd.end != SimEnd::OutOfBudget && v != ibcore::Verdict::Budget)
+                normalTests[d] = {rd, v};
             return v;
         };
 
@@ -7842,6 +7877,7 @@ public:
             sp.aim      = (c.extreme && !holdBased) ? c.extremeAim : 0.f;
             ibcore::SearchResult sr = ibcore::searchDelay(sp, eval);
             evals = sr.evals;
+            normalSearchComplete = sr.full && !sr.budget && sr.delay > 0;
             if (sr.budget) budgetHit = true;
             if (sr.delay == 0 && sr.budget) {
                 // ran out before finding anything: cube-type -> decide live; ship / wave -> raw
@@ -7978,6 +8014,47 @@ public:
             sim(bestDelay);
             viaOrb = c.orbPredict && m_simOrbUsed;
             if (m_recordPath) pathB = m_path;
+        }
+
+        if (orbPlanFound) {
+            bool const normalImmediateSafe = dec == Decision::PassSafe && r0.end == SimEnd::Survived;
+            bool normalDelayedSafe = false;
+            float normalClearance = r0.clear;
+            int normalRunLo = bestDelay;
+            int normalRunHi = bestDelay;
+
+            if (!normalImmediateSafe && dec == Decision::Buffered && bestDelay > 0 &&
+                normalSearchComplete && !liveFallback && !rescue && spotNote == 0) {
+                auto const selected = normalTests.find(bestDelay);
+                if (selected != normalTests.end() &&
+                    selected->second.first.end == SimEnd::Survived &&
+                    selected->second.second == ibcore::Verdict::Good) {
+                    normalDelayedSafe = true;
+                    normalClearance = selected->second.first.clear;
+                    auto normalSafeAt = [&](int d) {
+                        if (d == 0) return r0.end == SimEnd::Survived;
+                        auto const it = normalTests.find(d);
+                        return it != normalTests.end() &&
+                               it->second.first.end == SimEnd::Survived &&
+                               it->second.second == ibcore::Verdict::Good;
+                    };
+                    while (normalRunLo > 1 && normalSafeAt(normalRunLo - 1)) --normalRunLo;
+                    while (normalRunHi < maxDelay && normalSafeAt(normalRunHi + 1)) ++normalRunHi;
+                }
+            }
+
+            int const normalRunWidth = normalDelayedSafe ? normalRunHi - normalRunLo + 1 : 0;
+            int const orbRunWidth = orbPlanSafeHi - orbPlanSafeLo + 1;
+            bool preferOrb = !normalImmediateSafe && !normalDelayedSafe;
+            if (!normalImmediateSafe && normalDelayedSafe) {
+                preferOrb = orbRunWidth > normalRunWidth ||
+                    (orbRunWidth == normalRunWidth && orbPlanClearance > normalClearance + 0.5f) ||
+                    (orbRunWidth >= normalRunWidth && orbPlanDelay < bestDelay &&
+                     orbPlanClearance + 0.5f >= normalClearance);
+            }
+            // Previously successful / failed spots are direct real-run evidence.
+            if (spotNote != 0) preferOrb = false;
+            if (preferOrb && scheduleOrbPlan()) return false;
         }
 
         ClickNote n = base;
@@ -11011,6 +11088,4 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         }
         GJBaseGameLayer::playerTouchedRing(player, ring);
     }
-};
-
 };
