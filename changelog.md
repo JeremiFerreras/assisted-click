@@ -1,3 +1,19 @@
+e# 1.2.0
+
+1.2 — Deterministic, fail-closed Orb Assist
+
+- Replaced the Orb Assist calibration dependency with deterministic 2.2081 physics profiles for Yellow, Pink, Red, Black/Drop, Blue/Gravity, and Green orbs. The first encounter no longer depends on a previous successful activation or machine learning.
+- Corrected mode-specific physics: Ship, UFO, Ball, Robot, Spider, Swing, Wave, mini scaling, inverted gravity, Blue/Green flip order, and the post-impulse 0.70 Ball/Spider and 0.60 Swing modifiers. The simulation also mirrors the relevant `ringJump` state flags (jump-used, jump-tick, jumping, last-grounded position, auto-jump eligibility, and uncapped velocity) and resets those flags from the real player before each candidate so probes cannot contaminate one another.
+- Kept the new deterministic physics behind the Orb Assist simulation flag. The legacy Assisted Click predictor and `src/BufferCore.hpp` remain unchanged.
+- Reworked Orb Assist to derive the contact interval from Geometry Dash's exact `m_touchingRings` callback, then test every candidate physics tick. Broadphase rectangles are not accepted as proof of contact.
+- The planner selects the widest contiguous safe interval and its midpoint. A one-tick / frame-perfect solution is supported; incomplete simulations and CPU-budget exhaustion invalidate the whole search rather than returning a partial result.
+- Orb Assist never forces a click just because its last candidate tick arrived. If GD has not confirmed the exact target orb, Orb Assist cancels its own plan and hands the still-pending input back to the regular Assisted Click safety check.
+- Increased the look-ahead to 48 base ticks. The exact contact window is exhaustively searched up to 64 ticks; wider windows are rejected rather than coarsely sampled.
+- Added 60 Hz real-game samples for nearby orbs and hazards while Orb Assist is enabled. The target orb must be confirmed stationary; moving or stale/unclassified orbs are rejected because GD's exact collision callback uses the live transform. Known move / effect triggers that the simulator suppresses also mark the candidate incomplete.
+- Added an isolated C++ test suite for per-vehicle orb physics, gravity order, mini scaling, one-tick safe windows across the full 64-tick search, competing safe windows, missing exact contact, incomplete simulations, and CPU-budget aborts.
+
+Verification note: the isolated Orb Assist suite and the existing core unit suite can be run without the Geode SDK. They verify deterministic formulas and planner behavior, not the complete Geometry Dash runtime. A successful Geode build and in-game validation are still required before calling the mod game-tested. Dash, Gravity Dash, Spider, Teleport, and custom orbs remain outside this first deterministic model and are never treated as supported Orb Assist targets.
+
 # 1.1.0
 
 1.1 — Calibrated orb-click assist
