@@ -6,11 +6,11 @@
 		"android": "2.2081",
 		"ios": "2.2081"
 	},
-	"version": "v4.6.0",
+	"version": "v4.6.1",
 	"id": "geodepredictive.inputbuffer",
 	"name": "Geode Predictive Input Buffer",
 	"developer": "Custom fork",
-	"description": "Trajectory-prediction input buffer with video-style Windows console; based on Input Buffer's simulation engine.",
+	"description": "Trajectory-prediction input buffer with calibrated orb-click assistance and a video-style Windows console.",
 	"resources": {
 		"sprites": [
 			"resources/*.png"
@@ -62,6 +62,13 @@
 			"name": "Use Scanned Route (Experimental)",
 			"description": "Let early inputs match the route found by automatic scanning. Off by default because a scan can be imperfect on portal-heavy or otherwise unsupported levels.",
 			"default": false
+		},
+		"orb-helper": {
+			"type": "bool",
+			"name": "Assist Orb Clicks",
+			"description": "Delay early orb presses to a tick whose simulated post-orb path is safe. Uses learned orb impulses for the current vehicle; unlearned orb/vehicle combinations are not assisted.",
+			"default": true,
+			"category": "gameplay"
 		}
 	}
 }
