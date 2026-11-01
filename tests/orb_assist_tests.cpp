@@ -205,6 +205,21 @@ void testNativeActivationGate() {
     check(!canActivate(s), "already touched teleport orb blocks a second teleport orb");
 }
 
+void testPlanSelection() {
+    check(!preferOrbPlan(true, false, 0, 0.0f, 5, 100.0f),
+          "normal click wins when immediately safe");
+    check(preferOrbPlan(false, false, 0, 0.0f, 5, 1.0f),
+          "Orb Assist wins when normal route has no confirmed safe delay");
+    check(preferOrbPlan(false, true, 8, 5.0f, 6, 5.0f),
+          "equally clear Orb plan wins when it fires earlier");
+    check(preferOrbPlan(false, true, 5, 4.0f, 7, 5.0f),
+          "Orb plan wins when it has measurably greater clearance");
+    check(!preferOrbPlan(false, true, 5, 6.0f, 7, 5.0f),
+          "normal plan remains when it has better clearance");
+    check(!preferOrbPlan(false, true, 5, 5.0f, 5, 5.0f),
+          "normal plan wins when timing and clearance are equal");
+}
+
 void testExhaustiveTickPlanner() {
     // At 240 physics ticks per second, each candidate is one exact tick.
     // Every single-tick safe window is found at every position in the
@@ -276,6 +291,7 @@ int main() {
     testPhysicsProfiles();
     testExactTickDelayScheduling();
     testNativeActivationGate();
+    testPlanSelection();
     testExhaustiveTickPlanner();
     std::printf("Orb Assist isolated tests: %d checks, %d failures\n", checks, failures);
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
