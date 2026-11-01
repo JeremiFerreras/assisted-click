@@ -226,6 +226,7 @@ struct TickPlan {
     int runHi = -1;
     int tested = 0;
     int safeTicks = 0;
+    float clearance = -std::numeric_limits<float>::infinity();
 };
 
 // Every tick in the contact interval is simulated. A partial result is never
@@ -292,6 +293,7 @@ TickPlan chooseSafeTick(int lo, int hi, int maxWindowTicks, int maxTests, Probe&
     plan.runLo = bestLo;
     plan.runHi = bestHi;
     plan.best = bestLo + (bestHi - bestLo) / 2;
+    plan.clearance = bestMargin;
     return plan;
 }
 
