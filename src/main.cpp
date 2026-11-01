@@ -1178,9 +1178,12 @@ constexpr int    SHIP_JUDGE_BASE         = 24;
 // whole zig-zag: a +18t mini-wave press, then its release 18t late, death.
 constexpr float  HOLD_DELAY_FRAC         = 0.75f;
 constexpr int    HOLD_DELAY_MIN_BASE     = 6;
-// Orb helper (2.1): how far ahead (base ticks, 83 ms) an early click looks for
-// the next orb to wait for.
+// Orb helper: look ahead for an approaching orb, then test every physics tick
+// in its contact interval. The interval is capped at 48 ticks so the search can
+// inspect it exhaustively under the 64-probe ceiling.
 constexpr int    ORB_HELP_BASE           = 20;
+constexpr int    ORB_HELP_OVERLAP_TICKS  = 48;
+constexpr int    ORB_HELP_MAX_TESTS      = 64;
 // Level scan (2.1): see scanSlice().
 constexpr int    SCAN_STEP_BASE          = 2;     // a version may switch every 2 ticks (240 TPS)
 constexpr float  SCAN_STEP_WAVE          = 1.f;   // wave: every tick - mini wave gaps are tight
@@ -1327,7 +1330,7 @@ struct Config {
     float autoWindowMax = 4.0f;
     bool  calibReset   = false;
     bool  overlay      = false;
-    bool  orbHelper    = false; // Tools tab (2.1): an early click waits for the next orb
+    bool  orbHelper    = true;  // delay early orb clicks to a verified safe tick
     bool  clickGuide   = false; // Tools tab (2.1): dots where the level scan's inputs go
     bool  routeSnap    = false; // Tools tab (2.1): early clicks snap to the scanned inputs (off by default)
     bool  scanView     = true;  // Tools tab (2.1): draw the scan's versions while it runs
@@ -1375,7 +1378,7 @@ struct Config {
         c.hud        = false;
         c.hudVerbose = false;
         c.overlay    = false;
-        c.orbHelper  = false;
+        c.orbHelper  = mod->getSettingValue<bool>("orb-helper");
         c.clickGuide = false;
         c.routeSnap  = mod->getSettingValue<bool>("route-snap");
         c.scanView   = false;
@@ -1823,7 +1826,11 @@ struct SimResult {
     bool      killMover = false; // killed by a moving hazard at its predicted position
     float     killDy = 0.f;   // height at death relative to the start (px)
     bool      orbUsed = false; // the test used a predicted orb
+    bool      exactOrbContact = false; // GD's collision hook confirmed the orb touch
+    RingObject* usedRing = nullptr; // exact orb consumed by this test, if any
+    int       usedRingKey = -1; // calibrated profile actually applied at activation
     RingObject* firstRing = nullptr; // first unused orb you touch in this test (GD's contact)
+    int       firstRingKey = -1; // orb type + vehicle + size + gravity at contact
     int       firstRingTick = -1;    // ...on this step (from the start, incl. the delay)
     int       firstRingLast = -1;    // last step of that contact (in a row)
     int       nextRingTick = -1;     // first step you overlap ANOTHER orb after using one
@@ -1968,7 +1975,11 @@ struct ClickNote {
     bool      stream      = false; // wave spam: kept the stream's steady shift
     bool      rescue      = false; // no safe moment found by the quick search: held, checked every tick
     bool      portal      = false; // held until past a gamemode / size portal (its own log line)
-    bool      orbHelp     = false; // held by the orb helper until the next orb (2.1)
+    bool      orbHelp     = false; // held by the orb helper until a safe orb tick
+    int       orbSafeLo   = -1;    // first verified safe tick after this click
+    int       orbSafeHi   = -1;    // last verified safe tick after this click
+    int       orbContactHi = -1;   // last simulated tick of orb contact
+    std::string orbName;           // human-readable target orb type
     bool      route       = false; // held until a scanned input's window starts (2.1)
 };
 
@@ -2090,7 +2101,7 @@ struct LogConsole {
             if (HMENU m = GetSystemMenu(w, FALSE)) DeleteMenu(m, SC_CLOSE, MF_BYCOMMAND);
         }
         s_on = true;
-        write("[InputBuffer] v4.6 LOADED (Wave Spikes/Saws Trajectory Fix)", {255, 255, 255});
+        write("[InputBuffer] v4.6.1 LOADED (Calibrated Orb Click Assist)", {255, 255, 255});
         int const stage = stageFromSetting(Mod::get()->getSettingValue<std::string>("stage"));
         if (stage == 0) {
             write("[InputBuffer] Starting Mode: OFF (100% Raw Input)", {255, 255, 255});
@@ -2214,6 +2225,8 @@ class TrajectoryBufferSim {
     RingObject* m_prevRing[2] = {nullptr, nullptr}; // orb each sim player touched last step (or the real one now)
     bool  m_gdRings = false;     // GD reports orb contact for sim players (exact orbs on)
     GameObject* m_simOrbObj = nullptr; // ... this one (ignored for the rest of the test)
+    int   m_simUsedRingKey = -1; // profile applied to the orb actually consumed
+    int   m_simFirstRingKey = -1; // calibrated profile at first-ring contact
     std::vector<std::pair<GameObject*, bool>> m_objRestore; // activation flags to put back
     std::vector<GameObject*> m_simUsed;  // pads / portals already applied in this test
     bool  m_padPredict  = false;         // this click may model pads and speed / gravity portals
@@ -4716,10 +4729,9 @@ private:
         if (isModelledOrb(type) && player == m_simPlayer1.data() && orbOverlap && !realUsedOrb(obj) &&
             obj != m_simOrbObj) {
             if (auto* ring = typeinfo_cast<RingObject*>(obj)) {
-                // the next orb after the one this test used (orb chains)
-                if (m_simOrbUsed && m_simNextRingTick < 0) m_simNextRingTick = m_simTick;
                 if (!m_simFirstRing) {
                     m_simFirstRing = ring;
+                    m_simFirstRingKey = orbKey(ring, player);
                     m_simFirstRingTick = m_simTick;
                     m_simFirstRingLast = m_simTick;
                 } else if (ring == m_simFirstRing && m_simTick > m_simFirstRingLast && m_simTick <= m_simFirstRingLast + 1) {
@@ -4859,8 +4871,10 @@ private:
         m_simTick = 0;
         m_simOrbUsed = false;
         m_simOrbObj = nullptr;
+        m_simUsedRingKey = -1;
         m_simPressTick = -1; // a hold from before the test isn't a fresh click
         m_simFirstRing = nullptr;
+        m_simFirstRingKey = -1;
         m_simFirstRingTick = -1;
         m_simFirstRingLast = -1;
         m_simNextRingTick = -1;
@@ -5016,7 +5030,11 @@ private:
         out.killMover = m_simKillMover;
         out.killDy = m_simKillDy;
         out.orbUsed = m_simOrbUsed;
+        out.exactOrbContact = m_gdRings;
+        out.usedRing = typeinfo_cast<RingObject*>(m_simOrbObj);
+        out.usedRingKey = m_simUsedRingKey;
         out.firstRing = m_simFirstRing;
+        out.firstRingKey = m_simFirstRingKey;
         out.firstRingTick = m_simFirstRingTick;
         out.firstRingLast = m_simFirstRingLast;
         out.nextRingTick = m_simNextRingTick;
@@ -5069,7 +5087,9 @@ private:
                 }
                 if (n.orbHelp) {
                     tag = "ORB";
-                    text = fmt::format("press waits for the orb (+{}t){}", n.delay, mode);
+                    text = fmt::format("press +{}t for {}; safe +{}..+{}t (last chance +{}t){}",
+                                       n.delay, n.orbName.empty() ? "orb" : n.orbName,
+                                       n.orbSafeLo, n.orbSafeHi, n.orbSafeHi, mode);
                     return true;
                 }
                 if (n.stream && !c.hudVerbose) return false; // spam: one line per stream is enough
@@ -5634,11 +5654,24 @@ public:
         for (auto const& [k, f] : m_orbTable) v += fmt::format("{}:{:.4f}:{}:{};", k, f.vySum, f.n, f.flips);
         Mod::get()->setSavedValue<std::string>("orb-table-v1", v);
     }
+    // Orb assist is deliberately stricter than ordinary prediction: the target
+    // must have a real-game impulse sample for this vehicle. Reuse is limited to
+    // the same orb and vehicle, with only mini/gravity mirroring as a fallback.
+    bool orbModelAvailable(int key) {
+        if (key < 0) return false;
+        orbModelLoad();
+        for (int alt : {0, 2, 1, 3}) {
+            auto it = m_orbTable.find(key ^ alt);
+            if (it != m_orbTable.end() && it->second.n > 0) return true;
+        }
+        return false;
+    }
     // Every orb a sim player uses goes through here: GD's own argument, the
     // learned y-speed correction, and a record for the orb check.
     void simRingJump(PlayerObject* p, RingObject* r) {
         double const before = p->m_yVelocity;
         int const key = orbKey(r, p);
+        if (p == m_simPlayer1.data()) m_simUsedRingKey = key;
         bool const udBefore = p->m_isUpsideDown;
         // No GD ringJump for sim players (1.26.2): it drew the orb's circle effect
         // where the prediction was (a ghost "random orb" next to the real one),
@@ -5867,8 +5900,15 @@ public:
     void simRingTouched(PlayerObject* player, RingObject* ring) {
         int const idx = (player == m_simPlayer2.data()) ? 1 : 0;
         m_gdRings = true;
+        if (idx == 0 && m_simOrbUsed && m_simNextRingTick < 0 &&
+            static_cast<GameObject*>(ring) != m_simOrbObj && !realUsedOrb(ring) && isModelledOrb(ring->m_objectType)) {
+            // Orb chains only end a probe after GD confirms the NEXT orb was
+            // actually touched; the 6px broadphase margin is not enough proof.
+            m_simNextRingTick = m_simTick;
+        }
         if (idx == 0 && !m_simFirstRing && !realUsedOrb(ring) && isModelledOrb(ring->m_objectType)) {
             m_simFirstRing = ring;
+            m_simFirstRingKey = orbKey(ring, player);
             m_simFirstRingTick = m_simTick;
             m_simFirstRingLast = m_simTick;
         } else if (idx == 0 && ring == m_simFirstRing && m_simTick == m_simFirstRingLast + 1) {
@@ -6858,7 +6898,7 @@ public:
     }
 
     long long   m_simSizeSwitches = 0;   // size portals passed inside predictions
-    int         m_simChainStop = 0;      // > 0: a test ends (alive) this many ticks after reaching the next orb (unused since 1.25.9)
+    int         m_simChainStop = 0;      // > 0: end an orb-chain probe after a real next-orb touch + margin
 
     SimResult runSim(Ctx const& x, int delay, FollowUp const& f = FollowUp{}, int h = -1) {
         int const hz = (h > 0) ? std::min(h, x.horizon) : x.horizon;
@@ -7218,48 +7258,109 @@ public:
             }
         }
 
-        // 2a. Orb helper (2.1, Tools tab): a press made a little before an orb
-        //     waits for the orb and goes in the tick you touch it - for orb
-        //     double-clicks and UFO / swing orbs that need a fresh click. Only
-        //     when not pressing until then is safe, and the orb press is too.
-        if (push && c.orbHelper && !mode.wave && !touchingOrb(p1)) {
+        // 2a. Orb helper: find the complete contact interval, then test each
+        //     possible activation tick. A tick is accepted only when the sim
+        //     actually uses THIS orb with a learned vehicle-specific impulse
+        //     and the resulting path survives (or is demonstrably escapable).
+        if (push && c.orbHelper && !touchingOrb(p1)) {
             Ctx ox;
             if (makeCtx(pl, true, c, ox)) {
-                int const look = scaleTicks(ORB_HELP_BASE, s);
+                int const lead = scaleTicks(ORB_HELP_BASE, s);
+                int const scanTicks = lead + ORB_HELP_OVERLAP_TICKS;
                 int const budget = clickBudgetUs(c);
+                bool const oldDeadlineOn = m_hasDeadline;
+                auto const oldDeadline = m_deadline;
                 m_hasDeadline = budget > 0;
                 if (m_hasDeadline) m_deadline = Clock::now() + std::chrono::microseconds(budget);
                 bool const rec = m_recordPath;
+                bool const oldScanSim = m_scanSim;
+                int const oldChainStop = m_simChainStop;
+                int const oldScanModeSwitches = m_scanModeSwitches;
+                int const oldScanPortalTraces = m_scanPortalTraces;
                 m_recordPath = false;
-                int k = -1;
-                RingObject* ring = nullptr;
-                SimResult const idle = runSim(ox, look + 1, FollowUp{}, 1); // no press within `look`
-                if (idle.end != SimEnd::OutOfBudget && idle.firstRing && idle.firstRingTick >= 1 &&
-                    idle.firstRingTick <= look &&
-                    !(idle.end == SimEnd::Died && idle.deathStep >= 0 && idle.deathStep <= idle.firstRingTick)) {
-                    k = idle.firstRingTick;
-                    ring = idle.firstRing;
-                    SimResult const atOrb = runSim(ox, k);
-                    bool bh = false;
-                    ibcore::Verdict const v = verdictFor(ox, k, atOrb, -1000000, bh);
-                    if (!(v == ibcore::Verdict::Good || v == ibcore::Verdict::Partial)) k = -1;
+                // Reuse the Level Scan's portal/size/speed/gravity handling so
+                // an orb just beyond a supported portal is profiled in the mode
+                // that will really reach it. No noclip is enabled here.
+                m_scanSim = true;
+                // An orb after the target is the next user decision. Require the
+                // tested path to reach that next orb and remain alive for a margin.
+                m_simChainStop = scaleTicks(ORB_CHAIN_SPARE_BASE, s);
+
+                int chosen = -1;
+                RingObject* target = nullptr;
+                ibcore::AimPick pick;
+                SimResult idle = runSim(ox, scanTicks + 1, FollowUp{}, 1);
+                int contactLo = idle.firstRingTick;
+                int contactHi = idle.firstRingLast;
+                bool const diedBeforeOrb = idle.end == SimEnd::Died && idle.deathStep >= 0 &&
+                                           (contactLo < 0 || idle.deathStep <= contactLo);
+                bool const contactComplete = contactHi >= contactLo && contactHi < scanTicks &&
+                                             contactHi - contactLo + 1 <= ORB_HELP_OVERLAP_TICKS;
+                if (idle.end != SimEnd::OutOfBudget && idle.firstRing &&
+                    contactLo >= 1 && contactLo <= lead && contactComplete && !diedBeforeOrb &&
+                    orbModelAvailable(idle.firstRingKey)) {
+                    target = idle.firstRing;
+                    // The interval is deliberately bounded to 48 physics ticks;
+                    // every tick in it is probed, so runHi is a real last-safe tick.
+                    auto probe = [&](int delay) -> std::optional<ibcore::AimProbe> {
+                        if (budgetExpired()) return std::nullopt;
+                        FollowUp release;
+                        if (!ox.tapModel) {
+                            WinIdx const w = primaryWin(ox.mode, true);
+                            int const held = std::max(scaleTicks(1, s), static_cast<int>(std::lround(
+                                rhythm(m_holdLen[w], DEFAULT_TAP_FRAMES) / ox.dt)));
+                            release.at[0] = delay + held;
+                            release.held[0] = false;
+                        }
+                        SimResult const candidate = runSim(ox, delay, release);
+                        if (candidate.end == SimEnd::OutOfBudget || budgetExpired()) return std::nullopt;
+                        ibcore::AimProbe result;
+                        result.orb = candidate.orbUsed && candidate.exactOrbContact &&
+                                     candidate.usedRing == target && orbModelAvailable(candidate.usedRingKey);
+                        result.dies = candidate.end == SimEnd::Died && candidate.deathStep >= 0
+                                          ? candidate.deathStep - delay : -1;
+                        if (result.orb && candidate.end != SimEnd::Truncated) {
+                            bool escapeBudget = false;
+                            result.ok = verdictFor(ox, delay, candidate, -1000000, escapeBudget, 1) ==
+                                        ibcore::Verdict::Good;
+                            if (escapeBudget || budgetExpired()) return std::nullopt;
+                        }
+                        return result;
+                    };
+                    pick = ibcore::pickOrbTick(contactLo, contactHi, ORB_HELP_OVERLAP_TICKS,
+                                               ORB_HELP_MAX_TESTS, probe);
+                    if (!pick.outOfTime && pick.best >= 1 && pick.runLo >= contactLo &&
+                        pick.runHi <= contactHi && pick.runHi >= pick.runLo) {
+                        chosen = pick.best;
+                    }
                 }
+
+                m_simChainStop = oldChainStop;
+                m_scanModeSwitches = oldScanModeSwitches;
+                m_scanPortalTraces = oldScanPortalTraces;
+                m_scanSim = oldScanSim;
                 m_recordPath = rec;
-                m_hasDeadline = false;
-                if (k > 0 && ring) {
+                m_hasDeadline = oldDeadlineOn;
+                m_deadline = oldDeadline;
+
+                if (chosen > 0 && target) {
                     double const gridStart = m_gameTime - static_cast<double>(tickPhase()) * dt;
                     auto at = [&](double ticks) { return gridStart + ticks * dt; };
                     m_planTrust = false;
                     m_liveSpotHold = false;
                     m_liveRescue = false;
                     m_orbHelpHold = true;
-                    m_orbHelpRing = ring;
+                    m_orbHelpRing = target;
                     m_routeHold = false;
-                    m_queue.start(true, m_gameTime, std::max(0.0, at(k) - m_gameTime));
+                    m_queue.start(true, m_gameTime, std::max(0.0, at(chosen) - m_gameTime));
                     m_live = true;
-                    m_liveState.startClick(m_gameTime, dt, at(k), at(k + scaleTicks(2, s)) + TIME_EPS, at(k) + TIME_EPS);
+                    // Wait until the chosen safe interval begins; keep checking
+                    // the real ring hitbox and force the click no later than its
+                    // last fully simulated safe tick.
+                    m_liveState.startClick(m_gameTime, dt, at(chosen),
+                                           at(pick.runHi + 1) + TIME_EPS, at(pick.runHi) + TIME_EPS);
                     m_liveArrive = m_gameTime;
-                    m_livePlanTicks = k;
+                    m_livePlanTicks = chosen;
                     m_liveWaited = false;
                     m_liveWaitWhy = 0;
                     for (int& v : m_refuse) v = 0;
@@ -7269,9 +7370,16 @@ public:
                     m_trackPending = false;
                     ClickNote n = base;
                     n.d = Decision::Buffered;
-                    n.delay = k;
+                    n.delay = chosen;
                     n.orbHelp = true;
+                    n.orbSafeLo = pick.runLo;
+                    n.orbSafeHi = pick.runHi;
+                    n.orbContactHi = contactHi;
+                    n.orbName = objectName(target->m_objectType);
                     note(c, mode, dt, n);
+                    pushLog(fmt::format("orb helper: {} contact +{}..+{}t; verified safe +{}..+{}t; last safe tick +{}t; firing +{}t",
+                                        n.orbName, contactLo, contactHi, pick.runLo, pick.runHi, pick.runHi, chosen),
+                            COL_GREEN, false);
                     return false;
                 }
             }
@@ -7750,9 +7858,12 @@ public:
                 if ((px - m_spotTargetX) * m_spotTargetDir >= -spotTol().x) return ibcore::LiveVerdict::Proven;
                 return ibcore::LiveVerdict::Unsafe;
             }
-            // Orb helper (2.1): fire the moment you touch the orb (or on the
-            // predicted tick through m_liveState.latest).
+            // Orb helper: never fire on an earlier contact tick than the one
+            // whose post-orb trajectory was tested. From that tick onward the
+            // exact live hitbox can release it; latest is the verified last-safe
+            // tick stored in LiveState.
             if (head && push && m_orbHelpHold) {
+                if (now + TIME_EPS < m_liveState.planned) return ibcore::LiveVerdict::Unsafe;
                 if (m_orbHelpRing && overlapsNow(pl->m_player1, m_orbHelpRing)) return ibcore::LiveVerdict::Proven;
                 return ibcore::LiveVerdict::Unsafe;
             }
