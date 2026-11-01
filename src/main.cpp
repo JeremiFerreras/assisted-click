@@ -5696,17 +5696,43 @@ public:
         for (auto const& [k, f] : m_orbTable) v += fmt::format("{}:{:.4f}:{}:{};", k, f.vySum, f.n, f.flips);
         Mod::get()->setSavedValue<std::string>("orb-table-v1", v);
     }
+    // Native 2.2081 ringJump preconditions, read from GD's own PlayerObject
+    // state instead of approximating eligibility from our click model.
+    static bool orbAssistCanActivate(PlayerObject* p, RingObject* r) {
+        if (!p || !r) return false;
+        auto const alreadyActivated = p->m_touchedRings.find(r->m_uniqueID) != p->m_touchedRings.end();
+        orbassist::ActivationState state;
+        state.alive = !p->m_isDead;
+        state.canRingJump = p->m_stateRingJump2; // binding alias: m_canRingJump
+        state.dashing = p->m_isDashing;
+        state.holdingJumpReleaseDelayed = p->m_stateJumpBuffered; // alias: m_holdingJumpReleaseDelayed
+        state.alreadyActivated = alreadyActivated;
+        state.touchedRing = p->m_touchedRing;
+        state.touchedCustomRing = p->m_touchedCustomRing;
+        state.touchedTeleportRing = p->m_touchedGravityPortal; // alias: m_touchedTeleportRing
+        state.isJumpingRing = r->m_objectType != GameObjectType::CustomRing &&
+                              r->m_objectType != GameObjectType::TeleportOrb;
+        state.isCustomRing = r->m_objectType == GameObjectType::CustomRing;
+        state.isTeleportRing = r->m_objectType == GameObjectType::TeleportOrb;
+        return orbassist::canActivate(state);
+    }
+
     // Every orb activation goes through here. For ordinary Assisted Click
     // predictions the legacy learned profile is preserved. Orb Assist uses a
     // separate, deterministic 2.2081 profile and never waits for calibration.
-    void simRingJump(PlayerObject* p, RingObject* r) {
-        if (!p || !r) return;
+    bool simRingJump(PlayerObject* p, RingObject* r) {
+        if (!p || !r) return false;
         double const before = p->m_yVelocity;
         int const key = orbKey(r, p);
-        if (p == m_simPlayer1.data()) m_simUsedRingKey = key;
+        // Preserve the exact legacy bookkeeping; Orb Assist records this only
+        // after the native eligibility gate and model have both succeeded.
+        if (!m_orbAssistSimulation && p == m_simPlayer1.data()) m_simUsedRingKey = key;
         bool const udBefore = p->m_isUpsideDown;
 
         if (m_orbAssistSimulation) {
+            // Do not report a successful orb use unless GD's native eligibility
+            // flags agree. This gate is deliberately Orb Assist-only.
+            if (!orbAssistCanActivate(p, r)) return false;
             using orbassist::Orb;
             using orbassist::Vehicle;
             Vehicle vehicle = Vehicle::Cube;
@@ -5728,17 +5754,33 @@ public:
                 case GameObjectType::GreenRing: orb = Orb::Green; break;
                 default: break;
             }
-            bool const flying = p->m_isShip || p->m_isBird || p->m_isDart || p->m_isSwing;
+            // Use the values GD itself uses in ringJump: m_yStart, the exact
+            // player-scale comparison (1.0 vs any non-1.0 scale), current
+            // orientation, and the native per-mode flags above.
+            bool const flying = p->isFlying();
+            bool const mini = p->m_vehicleSize != 1.0f;
+            // Reverse rings invoke PlayerObject::reversePlayer() in GD's
+            // native ringJump path. The current isolated impulse model does
+            // not reproduce that direction reversal, so reject this target
+            // rather than presenting a normal-orb trajectory as valid.
+            if (r->m_isReverse) {
+                m_simOrbModelValid = false;
+                m_simTrunc.valid = true;
+                m_simTrunc.type = r->m_objectType;
+                m_simTrunc.gap = 0.f;
+                return false;
+            }
             orbassist::PhysicsEffect const effect = orbassist::modelPhysics({
-                vehicle, orb, p->m_yStart, p->m_vehicleSize < 0.99f, p->m_isUpsideDown, flying
+                vehicle, orb, p->m_yStart, mini, p->m_isUpsideDown, flying, p->flipMod()
             });
             if (!effect.valid) {
                 m_simOrbModelValid = false;
                 m_simTrunc.valid = true;
                 m_simTrunc.type = r->m_objectType;
                 m_simTrunc.gap = 0.f;
-                return; // never let an unsupported orb look like a safe path
+                return false; // never let an unsupported orb look like a safe path
             }
+            if (p == m_simPlayer1.data()) m_simUsedRingKey = key;
             if (effect.flipBeforeVelocity) p->flipGravity(!p->m_isUpsideDown, true);
             p->setYVelocity(effect.yVelocity, 0);
             // Ball / Spider / Swing apply this *after* setYVelocity's 3-decimal
@@ -5752,6 +5794,12 @@ public:
             // m_isVelocityUncapped respectively. Keep this inside the Orb
             // Assist-only branch so legacy Assisted Click is untouched.
             p->m_touchedRing = true;
+            // ringJump inserts the unique ID into activatedRingIDs and then
+            // removes the object from m_touchingRings. addToTouchedRings() is
+            // not equivalent here: it re-adds the object to m_touchingRings.
+            // Mirror both native bookkeeping operations directly.
+            p->m_touchedRings.insert(r->m_uniqueID);
+            if (p->m_touchingRings) p->m_touchingRings->removeObject(r, true);
             p->m_stateRingJump = false; // m_isJumpUnused
             p->m_ringJumpRelated = true; // m_ringJumpingThisTick
             p->m_padRingRelated = true; // m_canDisableAutoJump
@@ -5771,6 +5819,12 @@ public:
                 p->m_jumpBuffered = false;
                 if (p == m_simPlayer1.data()) m_simHeld = false;
             }
+            if (p == m_simPlayer1.data() && m_simOrbStep < 0) {
+                m_simOrbStep = m_simTick;
+                m_simOrbVyBefore = before;
+                m_simOrbVy = p->m_yVelocity;
+            }
+            return true;
         } else {
             // Keep the previous learned behaviour untouched for the base
             // Assisted Click feature. Orb Assist does not read these samples.
@@ -5802,6 +5856,7 @@ public:
             m_simOrbVyBefore = before;
             m_simOrbVy = p->m_yVelocity;
         }
+        return true; // legacy Assisted Click path: preserve previous semantics
     }
     void noteRealOrb(PlayerObject* p, RingObject* r, bool arg, double before, double after, int key, bool flipped) {
         orbModelLoad();
@@ -6005,15 +6060,28 @@ public:
         if (realUsedOrb(r)) return false;     // you already used it this attempt
         if (!m_orbAssistSimulation && !overlapsNow(s1, r)) return false;
         // In Orb Assist, m_prevRing is populated only by an exact touchingRings
-        // entry / simRingTouched from GD's previous collision step.
+        // entry / simRingTouched from GD's previous collision step. Keep the
+        // legacy branch byte-for-byte in its original event order.
+        if (!m_orbAssistSimulation) {
+            m_objRestore.emplace_back(r, r->m_isActivated);
+            m_simOrbUsed = true;
+            m_simOrbObj = r;
+            m_simHeld = true; // the button is down, but the press went into the orb
+            m_simPressTick = m_simTick;
+            (void)simRingJump(s1, r);
+            if (s2 && m_prevRing[1] && m_prevRing[1] != r) (void)simRingJump(s2, m_prevRing[1]);
+            return true;
+        }
+
+        if (!orbAssistCanActivate(s1, r)) return false;
+        m_simHeld = true;
+        m_simPressTick = m_simTick;
+        if (!simRingJump(s1, r)) return false;
         m_objRestore.emplace_back(r, r->m_isActivated);
         m_simOrbUsed = true;
-        if (m_orbAssistSimulation) m_simUsedRingExact = true;
+        m_simUsedRingExact = true;
         m_simOrbObj = r;
-        m_simHeld = true;          // the button is down, but the press went into the orb
-        m_simPressTick = m_simTick;
-        simRingJump(s1, r);
-        if (s2 && m_prevRing[1] && m_prevRing[1] != r) simRingJump(s2, m_prevRing[1]);
+        if (s2 && m_prevRing[1] && m_prevRing[1] != r) (void)simRingJump(s2, m_prevRing[1]);
         return true;
     }
 
@@ -6050,11 +6118,22 @@ public:
         bool const pressed = clickOnly ? freshPress : (m_simHeld || player->m_jumpBuffered);
         int const since = m_simTick - m_simDelay;
         if (!pressed || since < 0 || since > m_orbIntent) return;
+        if (m_orbAssistSimulation) {
+            if (!orbAssistCanActivate(player, ring)) return;
+            if (!simRingJump(player, ring)) return;
+            m_objRestore.emplace_back(ring, ring->m_isActivated);
+            m_simOrbUsed = true;
+            m_simOrbObj = ring;
+            if (idx == 0) m_simUsedRingExact = true;
+            return;
+        }
+
+        // Unmodified legacy Assisted Click sequence: keep its ring bookkeeping
+        // and learned-profile path unchanged.
         m_objRestore.emplace_back(ring, ring->m_isActivated);
         m_simOrbUsed = true;
         m_simOrbObj = ring;
-        if (m_orbAssistSimulation && idx == 0) m_simUsedRingExact = true;
-        simRingJump(player, ring);
+        (void)simRingJump(player, ring);
     }
 
     bool isSimPlayer(PlayerObject* p) const {
