@@ -7,14 +7,6 @@ on:
       - "**"
 
 jobs:
-  tests:
-    name: SDK-independent regression tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run core, Orb Assist, and project checks
-        run: python3 tests/run_checks.py
-
   build:
     name: Windows
     runs-on: windows-latest

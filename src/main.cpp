@@ -3046,7 +3046,8 @@ public:
 #define IB_SNAP_DECL(f) std::remove_cvref_t<decltype(std::declval<PlayerObject&>().f)> f{};
         IB_SNAP_FIELDS(IB_SNAP_DECL)
 #undef IB_SNAP_DECL
-        std::vector<int> touchedRings; // gd::unordered_set: copied by hand (like syncSimPlayer does)
+        std::vector<int> touchedRings; // per-step contact bookkeeping used by resetTouchedRings()
+        std::vector<int> activatedRingIds; // m_ringRelatedSet: ringJump's already-activated ID set
         int     mode = 0;              // modeCode() - the scan passes gamemode portals
         CCPoint pos{};
         float   scale = 1.f;
@@ -3058,6 +3059,7 @@ public:
         IB_SNAP_FIELDS(IB_SNAP_GET)
 #undef IB_SNAP_GET
         for (int id : p->m_touchedRings) s.touchedRings.push_back(id);
+        for (int id : p->m_ringRelatedSet) s.activatedRingIds.push_back(id);
         s.mode = modeCode(p);
         s.pos = p->getPosition();
         s.scale = p->getScale();
@@ -3073,6 +3075,8 @@ public:
 #undef IB_SNAP_SET
         p->m_touchedRings.clear();
         for (int id : s.touchedRings) p->m_touchedRings.insert(id);
+        p->m_ringRelatedSet.clear();
+        for (int id : s.activatedRingIds) p->m_ringRelatedSet.insert(id);
     }
     PlayerSnap const* m_simSnap = nullptr; // set: tests start from this state (level scan)
     float m_scanClr = 1e9f;                // level scan: closest a test came to a hazard (every tick)
@@ -5721,7 +5725,9 @@ public:
     // state instead of approximating eligibility from our click model.
     static bool orbAssistCanActivate(PlayerObject* p, RingObject* r) {
         if (!p || !r) return false;
-        auto const alreadyActivated = p->m_touchedRings.find(r->m_uniqueID) != p->m_touchedRings.end();
+        // m_touchedRings is only the per-step contact list. ringJump checks
+        // activatedRingIDs, exposed by the 2.2081 bindings as m_ringRelatedSet.
+        auto const alreadyActivated = p->m_ringRelatedSet.find(r->m_uniqueID) != p->m_ringRelatedSet.end();
         orbassist::ActivationState state;
         state.alive = !p->m_isDead;
         state.canRingJump = p->m_stateRingJump2; // binding alias: m_canRingJump
@@ -5815,11 +5821,11 @@ public:
             // m_isVelocityUncapped respectively. Keep this inside the Orb
             // Assist-only branch so legacy Assisted Click is untouched.
             p->m_touchedRing = true;
-            // ringJump inserts the unique ID into activatedRingIDs and then
-            // removes the object from m_touchingRings. addToTouchedRings() is
-            // not equivalent here: it re-adds the object to m_touchingRings.
-            // Mirror both native bookkeeping operations directly.
-            p->m_touchedRings.insert(r->m_uniqueID);
+            // ringJump inserts the unique ID into activatedRingIDs
+            // (m_ringRelatedSet), then removes the object from m_touchingRings.
+            // m_touchedRings is a transient per-step marker and must not be
+            // mistaken for the activated-ID set.
+            p->m_ringRelatedSet.insert(r->m_uniqueID);
             if (p->m_touchingRings) p->m_touchingRings->removeObject(r, true);
             p->m_stateRingJump = false; // m_isJumpUnused
             p->m_ringJumpRelated = true; // m_ringJumpingThisTick
@@ -6056,6 +6062,64 @@ public:
         if (track.moving(m_gameTime, MOVER_FRESH, MOVER_MIN_SPEED)) return false;
         return std::fabs(track.vx) < MOVER_MIN_SPEED && std::fabs(track.vy) < MOVER_MIN_SPEED &&
                std::fabs(track.accx) <= 0.05f && std::fabs(track.accy) <= 0.05f;
+    }
+
+    // Probe the *upcoming* physics step with the current real PlayerSnap.
+    // touchingRings is only populated by collision processing after PlayerObject::update;
+    // checking it before update misses the first (often only) frame-perfect contact.
+    bool probeUpcomingOrbContact(PlayLayer* pl, RingObject* target) {
+        if (!pl || !pl->m_player1 || !target || !orbAvailableNow(target) || realUsedOrb(target))
+            return false;
+
+        Ctx probe;
+        Config const& c = cfg();
+        if (!makeCtx(pl, true, c, probe)) return false;
+
+        PlayerSnap const start = snapFrom(pl->m_player1);
+        PlayerSnap const* oldSnap = m_simSnap;
+        bool const oldScanSim = m_scanSim;
+        bool const oldOrbSimulation = m_orbAssistSimulation;
+        bool const oldDiscoveryOnly = m_orbAssistDiscoveryOnly;
+        bool const oldRecordPath = m_recordPath;
+        bool const oldDeadlineOn = m_hasDeadline;
+        auto const oldDeadline = m_deadline;
+        int const oldChainStop = m_simChainStop;
+        int const oldModeSwitches = m_scanModeSwitches;
+        int const oldPortalTraces = m_scanPortalTraces;
+        bool const oldOrbPredict = m_orbPredict;
+        bool const oldPadPredict = m_padPredict;
+
+        m_simSnap = &start;
+        m_scanSim = true;
+        m_orbAssistSimulation = true;
+        m_orbAssistDiscoveryOnly = false;
+        m_recordPath = false;
+        // Orb Delay has its own deterministic orb model; it must not inherit
+        // the optional legacy Assisted Click orb-prediction toggle.
+        m_orbPredict = true;
+        m_hasDeadline = false;
+        m_simChainStop = 0;
+
+        // Exactly one real physics tick: input down, native update, native
+        // collision broadphase, then the 2.2081 playerTouchedRing callback.
+        SimResult const next = runSim(probe, 0, FollowUp{}, 1);
+
+        m_simSnap = oldSnap;
+        m_scanSim = oldScanSim;
+        m_orbAssistSimulation = oldOrbSimulation;
+        m_orbAssistDiscoveryOnly = oldDiscoveryOnly;
+        m_recordPath = oldRecordPath;
+        m_hasDeadline = oldDeadlineOn;
+        m_deadline = oldDeadline;
+        m_simChainStop = oldChainStop;
+        m_scanModeSwitches = oldModeSwitches;
+        m_scanPortalTraces = oldPortalTraces;
+        m_orbPredict = oldOrbPredict;
+        m_padPredict = oldPadPredict;
+
+        return next.end != SimEnd::OutOfBudget && next.end != SimEnd::Truncated &&
+               next.orbAssistComplete && next.orbAssistModelValid &&
+               next.orbUsed && next.exactOrbContact && next.usedRing == target;
     }
 
     // The modelled orb a (real) player is touching right now, if any.
@@ -7507,8 +7571,59 @@ public:
             }
         }
 
-        // 2a. Orb Assist: deterministic physics, exact per-tick search, and
-        // fail-closed isolation. No learned profile is required for first use.
+        // Orb Assist is a candidate, not an early override. Compare its fully
+        // simulated result with the normal Assisted Click result before scheduling.
+        bool orbPlanFound = false;
+        RingObject* orbPlanTarget = nullptr;
+        int orbPlanDelay = -1;
+        int orbPlanContactHi = -1;
+        int orbPlanSafeLo = -1;
+        int orbPlanSafeHi = -1;
+        int orbPlanTested = 0;
+        float orbPlanClearance = -std::numeric_limits<float>::infinity();
+
+        auto scheduleOrbPlan = [&]() -> bool {
+            if (!orbPlanFound || !orbPlanTarget || orbPlanDelay <= 0 || orbPlanSafeHi < orbPlanDelay)
+                return false;
+            double const gridStart = m_gameTime - static_cast<double>(tickPhase()) * dt;
+            auto at = [&](double ticks) { return gridStart + ticks * dt; };
+
+            m_planTrust = false;
+            m_liveSpotHold = false;
+            m_liveRescue = false;
+            m_orbHelpHold = true;
+            m_orbHelpRing = orbPlanTarget;
+            m_routeHold = false;
+            m_queue.start(true, m_gameTime, std::max(0.0, at(orbPlanDelay) - m_gameTime));
+            if (mode.wave) m_streamShift = static_cast<double>(orbPlanDelay) * dt;
+
+            // The selected delay is fixed. The live step only gates delivery on
+            // Geometry Dash confirming the exact target contact in the safe run.
+            m_live = true;
+            m_liveState.startClick(m_gameTime, dt, at(orbPlanDelay),
+                                   at(orbPlanContactHi + 1) + TIME_EPS,
+                                   at(orbPlanSafeHi) + TIME_EPS);
+            m_liveArrive = m_gameTime;
+            m_livePlanTicks = orbPlanDelay;
+            m_liveWaited = false;
+            m_liveWaitWhy = 0;
+            for (int& v : m_refuse) v = 0;
+            m_refuseHave = false;
+            m_last.liveTicks = -1;
+            m_last.liveReason = ibcore::FireReason::None;
+            m_trackPending = false;
+
+            ClickNote n = base;
+            n.d = Decision::Buffered;
+            n.delay = orbPlanDelay;
+            n.orbHelp = true;
+            n.orbSafeLo = orbPlanSafeLo;
+            note(c, mode, dt, n);
+            pushLog(fmt::format("Orb Assist: {} ticks planned (safe run {}..{}, {} exact tests)",
+                                orbPlanDelay, orbPlanSafeLo, orbPlanSafeHi, orbPlanTested), COL_GREEN, true);
+            return true;
+        };
+
         if (push && c.orbHelper && !touchingOrb(p1)) {
             Ctx ox;
             if (makeCtx(pl, true, c, ox)) {
@@ -7529,11 +7644,14 @@ public:
                 int const oldScanPortalTraces = m_scanPortalTraces;
                 bool const oldAssistSimulation = m_orbAssistSimulation;
                 bool const oldRecordPath = m_recordPath;
+                bool const oldOrbPredict = m_orbPredict;
                 m_hasDeadline = true;
                 m_deadline = Clock::now() + std::chrono::microseconds(ORB_HELP_BUDGET_US);
                 m_recordPath = false;
                 m_scanSim = true; // reuse supported mode / size / speed / gravity portals
                 m_orbAssistSimulation = true;
+                // Orb Delay is independent of the legacy orb-prediction option.
+                m_orbPredict = true;
                 m_simChainStop = scaleTicks(ORB_CHAIN_SPARE_BASE, s);
 
                 std::string rejectReason;
@@ -7627,43 +7745,19 @@ public:
                 m_simSnap = oldSimSnap;
                 m_orbAssistSimulation = oldAssistSimulation;
                 m_recordPath = oldRecordPath;
+                m_orbPredict = oldOrbPredict;
                 m_hasDeadline = oldDeadlineOn;
                 m_deadline = oldDeadline;
 
                 if (chosen > 0 && target) {
-                    double const gridStart = m_gameTime - static_cast<double>(tickPhase()) * dt;
-                    auto at = [&](double ticks) { return gridStart + ticks * dt; };
-                    m_planTrust = false;
-                    m_liveSpotHold = false;
-                    m_liveRescue = false;
-                    m_orbHelpHold = true;
-                    m_orbHelpRing = target;
-                    m_routeHold = false;
-                    m_queue.start(true, m_gameTime, std::max(0.0, at(chosen) - m_gameTime));
-                    // Every candidate tick was exhaustively simulated from the
-                    // Level Scan PlayerSnap. Fire on that exact game-time tick;
-                    // do not run the generic live re-planner, which can move a
-                    // frame-perfect input away from the verified tick.
-                    m_live = false;
-                    m_liveState = ibcore::LiveState{};
-                    m_liveArrive = m_gameTime;
-                    m_livePlanTicks = chosen;
-                    m_liveWaited = false;
-                    m_liveWaitWhy = 0;
-                    for (int& v : m_refuse) v = 0;
-                    m_refuseHave = false;
-                    m_last.liveTicks = -1;
-                    m_last.liveReason = ibcore::FireReason::None;
-                    m_trackPending = false;
-                    ClickNote n = base;
-                    n.d = Decision::Buffered;
-                    n.delay = chosen;
-                    n.orbHelp = true;
-                    n.orbSafeLo = pick.runLo;
-                    note(c, mode, dt, n);
-                    pushLog(fmt::format("Orb Assist: {} ticks verified (safe window {}..{}, {} exact tests)",
-                                        chosen, pick.runLo, pick.runHi, pick.tested), COL_GREEN, true);
-                    return false;
+                    orbPlanFound = true;
+                    orbPlanTarget = target;
+                    orbPlanDelay = chosen;
+                    orbPlanContactHi = contactHi;
+                    orbPlanSafeLo = pick.runLo;
+                    orbPlanSafeHi = pick.runHi;
+                    orbPlanTested = pick.tested;
+                    orbPlanClearance = pick.clearance;
                 }
                 // Rejection is intentionally silent: the click remains raw (or
                 // goes through the normal buffer when the main stage is on).
@@ -7671,9 +7765,12 @@ public:
             }
         }
 
-        // When the main stage is OFF, do not fall through into the ordinary
-        // Assisted Click predictor after the independent Orb Assist check.
-        if (!m_enabled) return pass(Decision::PassModeOff);
+        // Stage Off disables ordinary Assisted Click, but not an independently
+        // verified Orb Assist plan.
+        if (!m_enabled) {
+            if (scheduleOrbPlan()) return false;
+            return pass(Decision::PassModeOff);
+        }
 
         // 2b. Wave spam: keep ONE steady shift for the whole stream. Jitter came
         //     from every input being judged on its own - one delayed 3 ticks,
@@ -7690,11 +7787,18 @@ public:
                 m_hasDeadline = budgetUs0 > 0;
                 if (m_hasDeadline) m_deadline = Clock::now() + std::chrono::microseconds(budgetUs0);
                 m_recordPath = false;
+                float streamPlanClearance = -std::numeric_limits<float>::infinity();
+                bool streamPlanConfirmed = false;
                 auto okAt = [&](int d) {
                     SimResult const r = runSim(sx, d);
                     bool bh = false;
                     ibcore::Verdict const v = verdictFor(sx, d, r, -1000000, bh);
-                    return v == ibcore::Verdict::Good || v == ibcore::Verdict::Partial;
+                    bool const acceptable = v == ibcore::Verdict::Good || v == ibcore::Verdict::Partial;
+                    if (acceptable) {
+                        streamPlanClearance = r.clear;
+                        streamPlanConfirmed = v == ibcore::Verdict::Good;
+                    }
+                    return acceptable;
                 };
                 // On time first (1.25.9): if this input is safe with no delay, the
                 // stream drops its shift right here - before, one delay stayed on
@@ -7708,6 +7812,16 @@ public:
                     return pass(Decision::PassSafe); // stream wound down to no shift
                 }
                 if (chosen > 0) {
+                    // Wave streams have an early fixed-shift path. Compare that
+                    // confirmed stream result with the Orb candidate here too,
+                    // before the stream's early return can bypass the selector.
+                    if (orbPlanFound) {
+                        bool const preferOrb = orbassist::preferOrbPlan(
+                            false, streamPlanConfirmed, chosen, streamPlanClearance,
+                            orbPlanDelay, orbPlanClearance
+                        );
+                        if (preferOrb && scheduleOrbPlan()) return false;
+                    }
                     m_streamShift = static_cast<double>(chosen) * dt;
                     double const gridStart = m_gameTime - static_cast<double>(tickPhase()) * dt;
                     m_queue.start(push, m_gameTime, std::max(0.0, gridStart + static_cast<double>(chosen) * dt - m_gameTime));
@@ -7736,7 +7850,10 @@ public:
         }
 
         // 4. Window shorter than one physics tick (e.g. 0.5f at 60 TPS): nothing to do.
-        if (windowTicks <= 0) return pass(Decision::PassNoWindow);
+        if (windowTicks <= 0) {
+            if (scheduleOrbPlan()) return false;
+            return pass(Decision::PassNoWindow);
+        }
         int maxDelay = windowTicks;
         // Wave / ship (2.1): never hold an input longer than most of the gesture
         // it starts (your usual hold / gap) - see HOLD_DELAY_FRAC.
@@ -7811,6 +7928,8 @@ public:
         }
 
         // How good is the click if delayed by d ticks? (shared by the search and the probe)
+        std::map<int, std::pair<SimResult, ibcore::Verdict>> normalTests;
+        bool normalSearchComplete = false;
         auto eval = [&](int d) -> ibcore::Verdict {
             SimResult rd = sim(d);
             if (rd.end == SimEnd::OutOfBudget && !cheap) {
@@ -7824,6 +7943,8 @@ public:
                 enterCheap();
                 v = verdictFor(x, d, rd, r0.ticks, budgetHit, -1);
             }
+            if (rd.end != SimEnd::OutOfBudget && v != ibcore::Verdict::Budget)
+                normalTests[d] = {rd, v};
             return v;
         };
 
@@ -7842,6 +7963,7 @@ public:
             sp.aim      = (c.extreme && !holdBased) ? c.extremeAim : 0.f;
             ibcore::SearchResult sr = ibcore::searchDelay(sp, eval);
             evals = sr.evals;
+            normalSearchComplete = sr.full && !sr.budget && sr.delay > 0;
             if (sr.budget) budgetHit = true;
             if (sr.delay == 0 && sr.budget) {
                 // ran out before finding anything: cube-type -> decide live; ship / wave -> raw
@@ -7980,6 +8102,36 @@ public:
             if (m_recordPath) pathB = m_path;
         }
 
+        if (orbPlanFound) {
+            // A route accepted by the ordinary planner must not be stolen by the
+            // orb path. PassEscapable is also left alone: it relies on the player's
+            // next physical input, not an orb interception.
+            bool const normalImmediateSafe = dec == Decision::PassSafe || dec == Decision::PassEscapable;
+            bool normalDelayedSafe = false;
+            float normalClearance = r0.clear;
+            if (!normalImmediateSafe && dec == Decision::Buffered && bestDelay > 0 &&
+                normalSearchComplete && !liveFallback && !rescue && spotNote == 0) {
+                auto const selected = normalTests.find(bestDelay);
+                if (selected != normalTests.end() &&
+                    selected->second.first.end == SimEnd::Survived &&
+                    selected->second.second == ibcore::Verdict::Good) {
+                    normalDelayedSafe = true;
+                    normalClearance = selected->second.first.clear;
+                }
+            }
+
+            // The normal search deliberately samples a sparse tick set; its
+            // interval width is not known. Compare only confirmed results:
+            // Orb wins over a delayed normal route only with a clearly larger
+            // clearance, or an equally safe margin at an earlier tick.
+            bool preferOrb = orbassist::preferOrbPlan(
+                normalImmediateSafe, normalDelayedSafe, bestDelay, normalClearance,
+                orbPlanDelay, orbPlanClearance
+            );
+            if (spotNote != 0) preferOrb = false;
+            if (preferOrb && scheduleOrbPlan()) return false;
+        }
+
         ClickNote n = base;
         n.d = dec;
         n.us = usedUs;
@@ -8116,6 +8268,16 @@ public:
         bool waveMode = false;
         SimEnd testedEnd = SimEnd::Survived;
 
+        // Check the collision that will happen after this PlayerObject::update.
+        // The previous-step m_touchingRings list is too late for a one-tick orb.
+        bool orbContactOnUpcomingStep = false;
+        if (wasFirst && m_orbHelpHold && m_liveState.planned >= 0.0 &&
+            now + TIME_EPS >= m_liveState.planned) {
+            RingObject* const target = m_orbHelpRing;
+            if (orbAvailableNow(target) && !realUsedOrb(target))
+                orbContactOnUpcomingStep = probeUpcomingOrbContact(pl, target);
+        }
+
         // "Is firing it now safe?" - one test from the real current state.
         //  * The click you made (head = first) gets everything: learned spots,
         //    near-miss waits, waiting for a spot that worked before.
@@ -8154,9 +8316,8 @@ public:
             // tick stored in LiveState.
             if (head && push && m_orbHelpHold) {
                 if (now + TIME_EPS < m_liveState.planned) return ibcore::LiveVerdict::Unsafe;
-                if (orbAvailableNow(m_orbHelpRing) && !realUsedOrb(m_orbHelpRing) &&
-                    touchingOrbObj(pl->m_player1, m_orbHelpRing)) return ibcore::LiveVerdict::Proven;
-                return ibcore::LiveVerdict::Unsafe;
+                return orbContactOnUpcomingStep ? ibcore::LiveVerdict::Proven
+                                                : ibcore::LiveVerdict::Unsafe;
             }
             // Held for a learned spot: fire exactly when you reach it (no
             // prediction - it may be blind there), else keep waiting.
@@ -8313,9 +8474,9 @@ public:
         // Assisted Click safety check from the current live state.
         if (wasFirst && m_orbHelpHold) {
             bool const activeTarget = orbAvailableNow(m_orbHelpRing) && !realUsedOrb(m_orbHelpRing);
-            bool const exactNow = activeTarget && touchingOrbObj(pl ? pl->m_player1 : nullptr, m_orbHelpRing);
+            bool const exactUpcoming = activeTarget && orbContactOnUpcomingStep;
             bool const expired = m_liveState.latest >= 0.0 && now + TIME_EPS >= m_liveState.latest;
-            if (!exactNow && (!activeTarget || expired)) {
+            if (!exactUpcoming && (!activeTarget || expired)) {
                 m_orbHelpHold = false;
                 m_orbHelpRing = nullptr;
                 m_liveState.latest = -1.0; // remove the generic forced-plan path for Orb Assist
@@ -8449,23 +8610,47 @@ public:
         if ((m_tick & 3) == 0) updatePreview(pl);
 
         if (!m_enabled) {
-            // Stage "Off" disables ordinary Assisted Click, but an Orb Assist
-            // press already accepted above must remain scheduled.
+            // Stage Off keeps Orb Assist independent, but must still require
+            // Geometry Dash's exact contact callback before delivering the click.
             if (m_orbHelpHold && m_queue.pending()) {
-                if (m_orbHelpRing && (!orbAvailableNow(m_orbHelpRing) || realUsedOrb(m_orbHelpRing))) {
-                    // Do not lose the user's press if its target is disabled or
-                    // consumed while waiting; bring the queued press forward.
-                    m_queue.shiftAll(m_gameTime - m_queue.nextAt(), m_gameTime);
-                }
-                if (auto due = m_queue.poll(m_gameTime, TIME_EPS)) {
+                if (m_orbHelpRing) {
+                    bool const active = orbAvailableNow(m_orbHelpRing) && !realUsedOrb(m_orbHelpRing);
+                    bool const planned = m_liveState.planned >= 0.0 &&
+                                         m_gameTime + TIME_EPS >= m_liveState.planned;
+                    bool const exact = active && planned &&
+                                       probeUpcomingOrbContact(pl, m_orbHelpRing);
+                    // A one-tick safe run has planned == latest. Accept exact
+                    // contact at equality, but pass through immediately if that
+                    // final safe tick arrives without contact.
+                    bool const withinSafeRun = m_liveState.latest < 0.0 ||
+                                               m_gameTime <= m_liveState.latest + TIME_EPS;
+                    bool const windowEnded = m_liveState.latest >= 0.0 &&
+                                             m_gameTime + TIME_EPS >= m_liveState.latest;
+                    if (exact && planned && withinSafeRun) {
+                        if (auto due = m_queue.poll(m_gameTime, TIME_EPS)) fireButton(pl, *due);
+                        else return;
+                        m_orbHelpRing = nullptr;
+                        if (!m_queue.pending()) m_orbHelpHold = false;
+                    } else if (!active || windowEnded) {
+                        // Missed the verified contact window: do not eat the input.
+                        m_queue.shiftAll(m_gameTime - m_queue.nextAt(), m_gameTime);
+                        if (auto due = m_queue.poll(m_gameTime, TIME_EPS)) fireButton(pl, *due);
+                        m_orbHelpRing = nullptr;
+                        if (!m_queue.pending()) m_orbHelpHold = false;
+                        pushLog("Orb Assist cancelled: exact contact missed; click passed through", COL_ORANGE, true);
+                    } else {
+                        return;
+                    }
+                } else if (auto due = m_queue.poll(m_gameTime, TIME_EPS)) {
                     fireButton(pl, *due);
-                    m_orbHelpRing = nullptr;
                     if (!m_queue.pending()) m_orbHelpHold = false;
                 }
-                if (m_orbHelpHold) return; // keep the Orb Assist queue's rhythm intact
+                if (m_orbHelpHold) return;
             } else {
                 clearBuffer();
             }
+            m_live = false;
+            m_liveState = ibcore::LiveState{};
             reconcile(pl);
             return;
         }
@@ -11011,6 +11196,4 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         }
         GJBaseGameLayer::playerTouchedRing(player, ring);
     }
-};
-
 };

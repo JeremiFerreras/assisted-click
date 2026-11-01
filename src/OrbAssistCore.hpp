@@ -226,7 +226,23 @@ struct TickPlan {
     int runHi = -1;
     int tested = 0;
     int safeTicks = 0;
+    float clearance = -std::numeric_limits<float>::infinity();
 };
+
+// Compare confirmed candidate plans. The normal route wins if it is already
+// safe now. For a delayed normal route, Orb Assist must improve measured
+// clearance or reach an equally safe solution earlier; unmeasured window width
+// is never guessed from sparse samples.
+inline bool preferOrbPlan(bool normalImmediateSafe, bool normalDelayedSafe,
+                          int normalDelay, float normalClearance,
+                          int orbDelay, float orbClearance,
+                          float clearanceMargin = 0.5f) {
+    if (normalImmediateSafe || orbDelay <= 0) return false;
+    if (!normalDelayedSafe) return true;
+    if (orbClearance > normalClearance + clearanceMargin) return true;
+    return std::fabs(orbClearance - normalClearance) <= clearanceMargin &&
+           normalDelay > 0 && orbDelay < normalDelay;
+}
 
 // Every tick in the contact interval is simulated. A partial result is never
 // accepted: timeouts or incomplete physics invalidate the whole candidate set.
@@ -292,6 +308,7 @@ TickPlan chooseSafeTick(int lo, int hi, int maxWindowTicks, int maxTests, Probe&
     plan.runLo = bestLo;
     plan.runHi = bestHi;
     plan.best = bestLo + (bestHi - bestLo) / 2;
+    plan.clearance = bestMargin;
     return plan;
 }
 
