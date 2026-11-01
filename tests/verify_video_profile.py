@@ -1,4 +1,4 @@
-"""Static consistency checks for the video-style Geode fork.
+ """Static consistency checks for the video-style Geode fork.
 
 Run with: python verify_video_profile.py
 These tests inspect project configuration only. They do not emulate Geometry Dash.
@@ -18,7 +18,7 @@ MOD = json.loads((ROOT / "mod.json").read_text(encoding="utf-8"))
 class VideoProfileTests(unittest.TestCase):
     def test_geode_metadata_and_settings(self):
         self.assertEqual(MOD["id"], "geodepredictive.inputbuffer")
-        self.assertEqual(MOD["version"], "v4.6.0")
+        self.assertEqual(MOD["version"], "v4.6.1")
         self.assertEqual(MOD["settings"]["stage"]["default"], "Stage 1")
         self.assertEqual(
             MOD["settings"]["stage"]["one-of"],
@@ -26,6 +26,7 @@ class VideoProfileTests(unittest.TestCase):
         )
         self.assertTrue(MOD["settings"]["auto-scan"]["default"])
         self.assertFalse(MOD["settings"]["route-snap"]["default"])
+        self.assertTrue(MOD["settings"]["orb-helper"]["default"])
 
     def test_expected_stage_windows_are_encoded(self):
         expected = {
@@ -47,7 +48,7 @@ class VideoProfileTests(unittest.TestCase):
     def test_console_matches_video_profile(self):
         for required in (
             "Geode Predictive Input Buffer - Live Console",
-            "[InputBuffer] v4.6 LOADED (Wave Spikes/Saws Trajectory Fix)",
+            "[InputBuffer] v4.6.1 LOADED (Calibrated Orb Click Assist)",
             "[InputBuffer] Starting Mode: STAGE 1 (2 All / 2 Wave)",
             "2/2 -> 4/4 -> 8/8 -> 16/8 -> OFF",
             "SAVED +{} TICKS",
@@ -62,7 +63,6 @@ class VideoProfileTests(unittest.TestCase):
             "c.hud        = false;",
             "c.hudVerbose = false;",
             "c.overlay    = false;",
-            "c.orbHelper  = false;",
             "c.scanView   = false;",
             "c.showBadge  = false;",
             "c.accuracy   = false;",
@@ -70,6 +70,7 @@ class VideoProfileTests(unittest.TestCase):
             self.assertIn(required, SOURCE)
         self.assertIn("Deliberately do not create the Input Buffer window", SOURCE)
         self.assertIn("no Input Buffer button", SOURCE)
+        self.assertIn('c.orbHelper  = mod->getSettingValue<bool>("orb-helper");', SOURCE)
 
     def test_automatic_paused_scan_is_bounded_and_console_only(self):
         self.assertIn("constexpr int    SCAN_SLICE_US           = 2000", SOURCE)
@@ -85,6 +86,18 @@ class VideoProfileTests(unittest.TestCase):
         # The scan finisher must not create an in-game notification in this profile.
         finish = SOURCE[SOURCE.index("void finishScan("):SOURCE.index("// Called once per frame by the scan runner.")]
         self.assertNotIn("Notification::create", finish)
+
+    def test_orb_helper_checks_calibrated_full_safe_window(self):
+        self.assertIn("orb-helper", MOD["settings"])
+        self.assertIn("m_simFirstRingKey = orbKey(ring, player);", SOURCE)
+        self.assertIn("orbModelAvailable(idle.firstRingKey)", SOURCE)
+        self.assertIn("ibcore::pickOrbTick(contactLo, contactHi", SOURCE)
+        self.assertIn("candidate.exactOrbContact", SOURCE)
+        self.assertIn("candidate.usedRing == target", SOURCE)
+        self.assertIn("orbModelAvailable(candidate.usedRingKey)", SOURCE)
+        self.assertIn("contactHi - contactLo + 1 <= ORB_HELP_OVERLAP_TICKS", SOURCE)
+        self.assertIn("at(pick.runHi) + TIME_EPS", SOURCE)
+        self.assertIn("m_liveState.planned", SOURCE)
 
     def test_f6_cycles_five_modes_then_wraps(self):
         self.assertIn("int const next = (cur == STAGE_COUNT - 1) ? 0 : cur + 1;", SOURCE)
