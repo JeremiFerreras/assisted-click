@@ -1,6 +1,6 @@
-# Orb Assist-only patch for v4.6.2
+# Orb Assist-only patch for v4.7.0
 
-This patch is based on the supplied `assisted-click-orb-assist-v4.6.2.zip`.
+This patch is based on the supplied `assisted-click-orb-assist-v4.7.0.zip`.
 It is intentionally limited to Orb Assist behavior and its isolated tests.
 
 ## Changes
@@ -15,7 +15,7 @@ It is intentionally limited to Orb Assist behavior and its isolated tests.
 
 ## Assisted Click isolation
 
-- `src/BufferCore.hpp` is unchanged byte-for-byte from the supplied v4.6.2 project.
+- `src/BufferCore.hpp` is unchanged byte-for-byte from the supplied v4.7.0 project.
 - The existing learned-orb path remains the non-Orb-Assist branch of `simRingJump()`.
 - `orbPress()` and `applyGdRing()` preserve the previous event/bookkeeping order when `m_orbAssistSimulation` is false.
 - No normal Assisted Click timing, settings, planner, or queue implementation was changed.
@@ -29,3 +29,11 @@ It is intentionally limited to Orb Assist behavior and its isolated tests.
 - Video/profile static checks: 8 passed, 0 failed.
 
 These checks do not substitute for compiling against the target Geode SDK or testing in Geometry Dash. The native-state mapping and ring behavior are based on the 2.2081 implementation; validate the compiled build in the matching game/Geode environment before relying on it in live levels.
+
+## v4.7.0 Level Scan contact discovery
+
+- Level Scan's full `PlayerSnap` seeds all Orb Assist probes.
+- A fast discovery-only pass maps a candidate orb contact interval with Level Scan's object geometry; it stops once the interval closes.
+- The actual delayed tick still requires exact Geometry Dash ring contact and a surviving post-orb trajectory. Geometric overlap alone cannot fire a click.
+- The normal Assisted Click queue/core is left intact; Orb Assist uses a fixed game-time queue and is not re-timed by the live planner.
+- Windows console is opt-in and has no automatic startup/scan chatter.
