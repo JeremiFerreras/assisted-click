@@ -8017,12 +8017,12 @@ public:
         }
 
         if (orbPlanFound) {
-            bool const normalImmediateSafe = dec == Decision::PassSafe && r0.end == SimEnd::Survived;
+            // A route accepted by the ordinary planner must not be stolen by the
+            // orb path. PassEscapable is also left alone: it relies on the player's
+            // next physical input, not an orb interception.
+            bool const normalImmediateSafe = dec == Decision::PassSafe || dec == Decision::PassEscapable;
             bool normalDelayedSafe = false;
             float normalClearance = r0.clear;
-            int normalRunLo = bestDelay;
-            int normalRunHi = bestDelay;
-
             if (!normalImmediateSafe && dec == Decision::Buffered && bestDelay > 0 &&
                 normalSearchComplete && !liveFallback && !rescue && spotNote == 0) {
                 auto const selected = normalTests.find(bestDelay);
@@ -8031,28 +8031,17 @@ public:
                     selected->second.second == ibcore::Verdict::Good) {
                     normalDelayedSafe = true;
                     normalClearance = selected->second.first.clear;
-                    auto normalSafeAt = [&](int d) {
-                        if (d == 0) return r0.end == SimEnd::Survived;
-                        auto const it = normalTests.find(d);
-                        return it != normalTests.end() &&
-                               it->second.first.end == SimEnd::Survived &&
-                               it->second.second == ibcore::Verdict::Good;
-                    };
-                    while (normalRunLo > 1 && normalSafeAt(normalRunLo - 1)) --normalRunLo;
-                    while (normalRunHi < maxDelay && normalSafeAt(normalRunHi + 1)) ++normalRunHi;
                 }
             }
 
-            int const normalRunWidth = normalDelayedSafe ? normalRunHi - normalRunLo + 1 : 0;
-            int const orbRunWidth = orbPlanSafeHi - orbPlanSafeLo + 1;
-            bool preferOrb = !normalImmediateSafe && !normalDelayedSafe;
-            if (!normalImmediateSafe && normalDelayedSafe) {
-                preferOrb = orbRunWidth > normalRunWidth ||
-                    (orbRunWidth == normalRunWidth && orbPlanClearance > normalClearance + 0.5f) ||
-                    (orbRunWidth >= normalRunWidth && orbPlanDelay < bestDelay &&
-                     orbPlanClearance + 0.5f >= normalClearance);
-            }
-            // Previously successful / failed spots are direct real-run evidence.
+            // The normal search deliberately samples a sparse tick set; its
+            // interval width is not known. Compare only confirmed results:
+            // Orb wins over a delayed normal route only with a clearly larger
+            // clearance, or an equally safe margin at an earlier tick.
+            bool preferOrb = orbassist::preferOrbPlan(
+                normalImmediateSafe, normalDelayedSafe, bestDelay, normalClearance,
+                orbPlanDelay, orbPlanClearance
+            );
             if (spotNote != 0) preferOrb = false;
             if (preferOrb && scheduleOrbPlan()) return false;
         }
@@ -8526,23 +8515,41 @@ public:
         if ((m_tick & 3) == 0) updatePreview(pl);
 
         if (!m_enabled) {
-            // Stage "Off" disables ordinary Assisted Click, but an Orb Assist
-            // press already accepted above must remain scheduled.
+            // Stage Off keeps Orb Assist independent, but must still require
+            // Geometry Dash's exact contact callback before delivering the click.
             if (m_orbHelpHold && m_queue.pending()) {
-                if (m_orbHelpRing && (!orbAvailableNow(m_orbHelpRing) || realUsedOrb(m_orbHelpRing))) {
-                    // Do not lose the user's press if its target is disabled or
-                    // consumed while waiting; bring the queued press forward.
-                    m_queue.shiftAll(m_gameTime - m_queue.nextAt(), m_gameTime);
-                }
-                if (auto due = m_queue.poll(m_gameTime, TIME_EPS)) {
+                if (m_orbHelpRing) {
+                    bool const active = orbAvailableNow(m_orbHelpRing) && !realUsedOrb(m_orbHelpRing);
+                    bool const exact = active && touchingOrbObj(player, m_orbHelpRing);
+                    bool const planned = m_liveState.planned >= 0.0 &&
+                                         m_gameTime + TIME_EPS >= m_liveState.planned;
+                    bool const expired = m_liveState.latest >= 0.0 &&
+                                         m_gameTime + TIME_EPS >= m_liveState.latest;
+                    if (exact && planned && !expired) {
+                        if (auto due = m_queue.poll(m_gameTime, TIME_EPS)) fireButton(pl, *due);
+                        else return;
+                        m_orbHelpRing = nullptr;
+                        if (!m_queue.pending()) m_orbHelpHold = false;
+                    } else if (!active || expired) {
+                        // Missed the verified contact window: do not eat the input.
+                        m_queue.shiftAll(m_gameTime - m_queue.nextAt(), m_gameTime);
+                        if (auto due = m_queue.poll(m_gameTime, TIME_EPS)) fireButton(pl, *due);
+                        m_orbHelpRing = nullptr;
+                        if (!m_queue.pending()) m_orbHelpHold = false;
+                        pushLog("Orb Assist cancelled: exact contact missed; click passed through", COL_ORANGE, true);
+                    } else {
+                        return;
+                    }
+                } else if (auto due = m_queue.poll(m_gameTime, TIME_EPS)) {
                     fireButton(pl, *due);
-                    m_orbHelpRing = nullptr;
                     if (!m_queue.pending()) m_orbHelpHold = false;
                 }
-                if (m_orbHelpHold) return; // keep the Orb Assist queue's rhythm intact
+                if (m_orbHelpHold) return;
             } else {
                 clearBuffer();
             }
+            m_live = false;
+            m_liveState = ibcore::LiveState{};
             reconcile(pl);
             return;
         }
