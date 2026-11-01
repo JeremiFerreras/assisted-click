@@ -1,4 +1,17 @@
-e# 1.2.0
+# v4.7.0
+
+4.7.0 — Orb Assist contact discovery and exact-tick delivery
+
+- Reused the Level Scan `PlayerSnap` as the source state for every Orb Assist simulation branch, preserving the real player's movement, collision, jump-buffer, gravity, and touched-orb state.
+- Split contact discovery from safety validation: the discovery pass uses the Level Scan object's bounded hitbox scan only to map a candidate interval; every candidate tick must still activate the same target through Geometry Dash's exact ring-contact callback and survive its post-orb route. AABB overlap alone can never authorize a delayed click.
+- Ended the no-input discovery simulation immediately after the contact interval closes. Unrelated triggers encountered later in the level no longer invalidate the contact map; candidate simulations still run through the full judged route and still fail closed on unsupported effects.
+- Kept one-tick/frame-perfect windows in the exhaustive tick search and preserved the direct game-time queue schedule (no generic live re-planner may move the chosen tick).
+- Kept Orb Assist independent of the normal Stage switch. The regular Assisted Click core and `src/BufferCore.hpp` are unchanged.
+- Made the Windows console opt-in (F7) and removed automatic load/scan progress output. When manually opened, it shows Orb Assist result lines only.
+
+Verification note: source-level checks and dependency-free C++ tests do not substitute for a Geode SDK build or a live Geometry Dash test. This version has not yet been verified in a live game.
+
+# 1.2.0
 
 1.2 — Deterministic, fail-closed Orb Assist
 
