@@ -116,6 +116,17 @@ class VideoProfileTests(unittest.TestCase):
         self.assertIn("m_simUsedRingExact = false;", SOURCE)
         self.assertIn("m_simHeld = false;", SOURCE)
         self.assertIn("if (push && c.orbHelper && !touchingOrb(p1))", SOURCE)
+        self.assertIn("state.canRingJump = p->m_stateRingJump2", SOURCE)
+        self.assertIn("state.holdingJumpReleaseDelayed = p->m_stateJumpBuffered", SOURCE)
+        self.assertIn("p->m_touchedRings.insert(r->m_uniqueID)", SOURCE)
+        self.assertIn("p->m_touchingRings->removeObject(r, true)", SOURCE)
+        self.assertNotIn("p->addToTouchedRings(r)", SOURCE)
+        self.assertIn("bool const flying = p->isFlying();", SOURCE)
+        self.assertIn("p->flipMod()", SOURCE)
+        self.assertIn("if (r->m_isReverse)", SOURCE)
+        self.assertIn("if (!simRingJump(player, ring)) return;", SOURCE)
+        self.assertIn("m_simUsedRingExact = true;", SOURCE)
+        self.assertIn("testExactTickDelayScheduling", (ROOT / "tests" / "orb_assist_tests.cpp").read_text(encoding="utf-8"))
 
     def test_orb_physics_covers_post_impulse_vehicle_rules(self):
         for required in (
