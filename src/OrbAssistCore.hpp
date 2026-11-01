@@ -43,6 +43,9 @@ struct PhysicsInput {
     bool mini = false;
     bool upsideDown = false;
     bool isFlying = false;
+    // Native PlayerObject::flipMod() value when supplied by the game. Zero
+    // keeps standalone tests/backwards-compatible callers on upsideDown.
+    double nativeFlipMod = 0.0;
 };
 
 struct PhysicsEffect {
@@ -88,7 +91,14 @@ inline PhysicsEffect modelPhysics(PhysicsInput const& in) {
     // Teleport / Custom orbs are not represented by this enum and fail closed.
 
     double factor = 1.0;
-    bool gravitySign = in.upsideDown;
+    // Prefer GD's own flipMod() result. The fallback exists only for the
+    // dependency-free test core and older call sites.
+    double gravitySign = 0.0;
+    if (std::isfinite(in.nativeFlipMod) && std::abs(in.nativeFlipMod) > 0.5) {
+        gravitySign = in.nativeFlipMod < 0.0 ? -1.0 : 1.0;
+    } else {
+        gravitySign = in.upsideDown ? -1.0 : 1.0;
+    }
 
     switch (in.orb) {
         case Orb::Yellow:
@@ -120,14 +130,14 @@ inline PhysicsEffect modelPhysics(PhysicsInput const& in) {
         case Orb::Green:
             if (in.vehicle == Vehicle::Ship) factor = 0.70;
             out.flipBeforeVelocity = true;
-            gravitySign = !gravitySign;
+            gravitySign = -gravitySign;
             break;
         case Orb::Black: {
             double const base = in.isFlying ? -14.0 : -15.0;
             double modeFactor = 1.0;
             if (in.vehicle == Vehicle::Spider && !in.isFlying) modeFactor = 1.10;
             if (in.vehicle == Vehicle::Ufo && in.isFlying) modeFactor = 0.80;
-            out.yVelocity = (in.upsideDown ? -1.0 : 1.0) * base * modeFactor;
+            out.yVelocity = gravitySign * base * modeFactor;
             out.releaseJump = in.vehicle == Vehicle::Ball || in.vehicle == Vehicle::Swing;
             out.velocityUncapped = true;
             out.standardJump = false;
@@ -140,7 +150,7 @@ inline PhysicsEffect modelPhysics(PhysicsInput const& in) {
     }
 
     double const miniScale = in.mini ? 0.80 : 1.0;
-    double const sign = gravitySign ? -1.0 : 1.0;
+    double const sign = gravitySign;
     // GD rounds setYVelocity first, then ringJump applies a mode-specific
     // multiplier for Ball / Spider / Swing. Keep that order: it is observable
     // at 240-TPS boundaries and differs from multiplying before rounding.
@@ -155,6 +165,40 @@ inline PhysicsEffect modelPhysics(PhysicsInput const& in) {
     out.standardJump = true;
     out.valid = true;
     return out;
+}
+
+// Native 2.2081 PlayerObject::ringJump eligibility, expressed as a small
+// value type so the exact gate can be tested without Geode. The field mapping
+// is supplied by main.cpp from PlayerObject's live/simulated members.
+struct ActivationState {
+    bool alive = true;
+    bool canRingJump = true;                 // m_canRingJump
+    bool dashing = false;                    // m_isDashing
+    bool holdingJumpReleaseDelayed = true;   // m_holdingJumpReleaseDelayed
+    bool alreadyActivated = false;           // activatedRingIDs contains uniqueID
+    bool touchedRing = false;                // m_touchedRing
+    bool touchedCustomRing = false;          // m_touchedCustomRing
+    bool touchedTeleportRing = false;        // m_touchedTeleportRing
+    bool isJumpingRing = true;
+    bool isCustomRing = false;
+    bool isTeleportRing = false;
+};
+
+inline bool canActivate(const ActivationState& state) {
+    if (!state.alive || !state.canRingJump || state.dashing ||
+        !state.holdingJumpReleaseDelayed || state.alreadyActivated) {
+        return false;
+    }
+
+    // This mirrors the native ringJump gate. Supported Orb Assist types are
+    // ordinary jumping rings, but keeping the complete condition prevents a
+    // future custom/teleport extension from silently changing GD's rules.
+    if ((state.touchedRing || !state.isJumpingRing) &&
+        (state.touchedCustomRing || !state.isCustomRing)) {
+        if (state.touchedTeleportRing) return false;
+        if (!state.isTeleportRing) return false;
+    }
+    return true;
 }
 
 struct TickProbe {
