@@ -1,6 +1,6 @@
 # Geode Predictive Input Buffer — Orb Delay
 
-Private development fork for **Geometry Dash 2.2081 / Geode 5.11.2**. The current work focuses on Orb Delay while preserving the existing Assisted Click scheduling core.
+Private development fork for **Geometry Dash 2.2081 / Geode 5.11.2** (Orb Delay v4.9.0). The current work focuses on Orb Delay while preserving the existing Assisted Click scheduling core.
 
 ## Orb Delay
 
