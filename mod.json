@@ -6,11 +6,11 @@
 		"android": "2.2081",
 		"ios": "2.2081"
 	},
-	"version": "v4.6.1",
+	"version": "v4.6.2",
 	"id": "geodepredictive.inputbuffer",
 	"name": "Geode Predictive Input Buffer",
 	"developer": "Custom fork",
-	"description": "Trajectory-prediction input buffer with calibrated orb-click assistance and a video-style Windows console.",
+	"description": "Trajectory-prediction input buffer with deterministic, fail-closed orb-click assistance and a video-style Windows console.",
 	"resources": {
 		"sprites": [
 			"resources/*.png"
@@ -66,7 +66,7 @@
 		"orb-helper": {
 			"type": "bool",
 			"name": "Assist Orb Clicks",
-			"description": "Delay early orb presses to a tick whose simulated post-orb path is safe. Uses learned orb impulses for the current vehicle; unlearned orb/vehicle combinations are not assisted.",
+			"description": "Delay early orb presses only when an exhaustive per-tick simulation confirms exact GD contact and a safe post-orb route. Uses Geometry Dash 2.2081 physics; no prior orb calibration is required. Unsupported or uncertain cases fall back to the normal Assisted Click path.",
 			"default": true,
 			"category": "gameplay"
 		}
