@@ -7531,6 +7531,7 @@ public:
             m_orbHelpRing = orbPlanTarget;
             m_routeHold = false;
             m_queue.start(true, m_gameTime, std::max(0.0, at(orbPlanDelay) - m_gameTime));
+            if (mode.wave) m_streamShift = static_cast<double>(orbPlanDelay) * dt;
 
             // The selected delay is fixed. The live step only gates delivery on
             // Geometry Dash confirming the exact target contact in the safe run.
@@ -7718,11 +7719,18 @@ public:
                 m_hasDeadline = budgetUs0 > 0;
                 if (m_hasDeadline) m_deadline = Clock::now() + std::chrono::microseconds(budgetUs0);
                 m_recordPath = false;
+                float streamPlanClearance = -std::numeric_limits<float>::infinity();
+                bool streamPlanConfirmed = false;
                 auto okAt = [&](int d) {
                     SimResult const r = runSim(sx, d);
                     bool bh = false;
                     ibcore::Verdict const v = verdictFor(sx, d, r, -1000000, bh);
-                    return v == ibcore::Verdict::Good || v == ibcore::Verdict::Partial;
+                    bool const acceptable = v == ibcore::Verdict::Good || v == ibcore::Verdict::Partial;
+                    if (acceptable) {
+                        streamPlanClearance = r.clear;
+                        streamPlanConfirmed = v == ibcore::Verdict::Good;
+                    }
+                    return acceptable;
                 };
                 // On time first (1.25.9): if this input is safe with no delay, the
                 // stream drops its shift right here - before, one delay stayed on
@@ -7736,6 +7744,16 @@ public:
                     return pass(Decision::PassSafe); // stream wound down to no shift
                 }
                 if (chosen > 0) {
+                    // Wave streams have an early fixed-shift path. Compare that
+                    // confirmed stream result with the Orb candidate here too,
+                    // before the stream's early return can bypass the selector.
+                    if (orbPlanFound) {
+                        bool const preferOrb = orbassist::preferOrbPlan(
+                            false, streamPlanConfirmed, chosen, streamPlanClearance,
+                            orbPlanDelay, orbPlanClearance
+                        );
+                        if (preferOrb && scheduleOrbPlan()) return false;
+                    }
                     m_streamShift = static_cast<double>(chosen) * dt;
                     double const gridStart = m_gameTime - static_cast<double>(tickPhase()) * dt;
                     m_queue.start(push, m_gameTime, std::max(0.0, gridStart + static_cast<double>(chosen) * dt - m_gameTime));
