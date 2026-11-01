@@ -6094,6 +6094,9 @@ public:
         m_orbAssistSimulation = true;
         m_orbAssistDiscoveryOnly = false;
         m_recordPath = false;
+        // Orb Delay has its own deterministic orb model; it must not inherit
+        // the optional legacy Assisted Click orb-prediction toggle.
+        m_orbPredict = true;
         m_hasDeadline = false;
         m_simChainStop = 0;
 
@@ -7641,11 +7644,14 @@ public:
                 int const oldScanPortalTraces = m_scanPortalTraces;
                 bool const oldAssistSimulation = m_orbAssistSimulation;
                 bool const oldRecordPath = m_recordPath;
+                bool const oldOrbPredict = m_orbPredict;
                 m_hasDeadline = true;
                 m_deadline = Clock::now() + std::chrono::microseconds(ORB_HELP_BUDGET_US);
                 m_recordPath = false;
                 m_scanSim = true; // reuse supported mode / size / speed / gravity portals
                 m_orbAssistSimulation = true;
+                // Orb Delay is independent of the legacy orb-prediction option.
+                m_orbPredict = true;
                 m_simChainStop = scaleTicks(ORB_CHAIN_SPARE_BASE, s);
 
                 std::string rejectReason;
@@ -7739,6 +7745,7 @@ public:
                 m_simSnap = oldSimSnap;
                 m_orbAssistSimulation = oldAssistSimulation;
                 m_recordPath = oldRecordPath;
+                m_orbPredict = oldOrbPredict;
                 m_hasDeadline = oldDeadlineOn;
                 m_deadline = oldDeadline;
 
