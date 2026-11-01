@@ -5771,7 +5771,7 @@ public:
                 return false;
             }
             orbassist::PhysicsEffect const effect = orbassist::modelPhysics({
-                vehicle, orb, p->m_yStart, mini, p->m_isUpsideDown, flying, p->flipMod()
+                vehicle, orb, p->m_yStart, mini, p->m_isUpsideDown, flying, static_cast<double>(p->flipMod())
             });
             if (!effect.valid) {
                 m_simOrbModelValid = false;
@@ -8259,7 +8259,7 @@ public:
                 m_liveState.good = 0;
                 Ctx fallbackCtx;
                 int fallbackTicks = 2;
-                if (makeCtx(pl, true, c, fallbackCtx)) fallbackTicks = std::max(2, fallbackCtx.windowTicks);
+                if (makeCtx(pl, true, c, fallbackCtx)) fallbackTicks = std::max(2, fallbackCtx.window);
                 m_liveState.deadline = now + static_cast<double>(fallbackTicks) * dt + TIME_EPS;
                 pushLog("Orb Assist cancelled: exact contact was not confirmed; handing the click back to Assisted Click",
                         COL_ORANGE, true);
