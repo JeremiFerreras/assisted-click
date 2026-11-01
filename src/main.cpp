@@ -2105,7 +2105,7 @@ struct LogConsole {
             if (HMENU m = GetSystemMenu(w, FALSE)) DeleteMenu(m, SC_CLOSE, MF_BYCOMMAND);
         }
         s_on = true;
-        write("[InputBuffer] v4.6.2 LOADED (Deterministic Orb Assist)", {255, 255, 255});
+        write("[InputBuffer] v4.7 loaded (Orb Assist / Level Scan)", {255, 255, 255});
         int const stage = stageFromSetting(Mod::get()->getSettingValue<std::string>("stage"));
         if (stage == 0) {
             write("[InputBuffer] Starting Mode: OFF (100% Raw Input)", {255, 255, 255});
@@ -2226,6 +2226,9 @@ class TrajectoryBufferSim {
     // Orb Assist gets a private deterministic physics path. The legacy
     // Assisted Click predictor keeps its existing learned-model behaviour.
     bool  m_orbAssistSimulation = false;
+    // Discovery-only pass: Level Scan geometry maps the candidate orb window,
+    // then the candidate pass still requires GD's exact ring callback.
+    bool  m_orbAssistDiscoveryOnly = false;
     bool  m_simOrbModelValid = true;
     bool  m_simOrbAssistIncomplete = false;
     bool  m_simUsedRingExact = false;
@@ -2501,7 +2504,8 @@ class TrajectoryBufferSim {
         Config const& c = cfg();
         m_active   = allowedHere(c, PlayLayer::get());
         m_enabled  = m_active;
-        m_orbAssistEnabled = c.orbHelper;
+        PlayLayer* current = PlayLayer::get();
+        m_orbAssistEnabled = c.orbHelper && (!c.practiceOnly || (current && current->m_isPracticeMode));
         m_logDebug = c.debug;
         m_logCsv   = c.csv;
     }
@@ -3405,9 +3409,9 @@ public:
         // preserves the useful part of the earlier partial scan.
         startScan(pl);
         if (scanning()) {
-            LogConsole::write("[InputBuffer] Auto scan started (small CPU slices while paused).", {255, 255, 255});
+            // Scan status is available in the Tools tab; keep the console quiet.
         } else if (!m_scanMsg.empty()) {
-            LogConsole::write(fmt::format("[InputBuffer] Auto scan skipped: {}", m_scanMsg), {255, 255, 255});
+            // Scan status is available in the Tools tab; keep the console quiet.
         }
     }
 
@@ -3506,7 +3510,7 @@ public:
         m_scanMsg = std::move(msg);
         m_scanState = ScanState::Done;
         m_autoScanComplete = pctAt(pl, m_scanX) >= 99.5f;
-        LogConsole::write(fmt::format("[InputBuffer] Auto scan finished: {}", m_scanMsg), {255, 255, 255});
+        // Scan status is available in the Tools tab; keep the console quiet.
         trace(fmt::format("scan: {} (gamemode portals passed in tests: {})", m_scanMsg, m_scanModeSwitches));
         // short: the full message is on the Tools tab
         // No in-game notification in the video profile; report only to the console.
@@ -3524,11 +3528,7 @@ public:
             finishScan(pl, fmt::format("stopped at {:.0f}% - stay paused while it scans", pctAt(pl, m_scanX)), &m_beam);
             return;
         }
-        int const scanPct = static_cast<int>(std::floor(std::clamp(pctAt(pl, m_scanX), 0.f, 100.f) / 10.f)) * 10;
-        if (scanPct >= m_consoleScanPct + 10 && scanPct < 100) {
-            m_consoleScanPct = scanPct;
-            LogConsole::write(fmt::format("[InputBuffer] Auto scan progress: {}%", scanPct), {255, 255, 255});
-        }
+        // No per-10% console spam. Progress remains visible in the Tools tab.
         auto const t0 = Clock::now();
         if (m_realScan) {
             realScanSlice(pl, t0);
@@ -4594,6 +4594,7 @@ public:
 private:
 
     void flushQueue(PlayLayer* pl) {
+        bool const wasOrbAssist = m_orbHelpHold;
         int guard = 0;
         while (m_queue.pending() && guard++ < 64) {
             auto due = m_queue.poll(1e18, TIME_EPS);
@@ -4602,6 +4603,10 @@ private:
         }
         m_queue.clear();
         m_live = false;
+        if (wasOrbAssist) {
+            m_orbHelpHold = false;
+            m_orbHelpRing = nullptr;
+        }
     }
 
     // Is the physics-step hook (which fires held inputs) running right now?
@@ -4749,8 +4754,8 @@ private:
         // Orb contact by hitbox (1.24.8): GD only reports orb contact while the
         // button is down, so a path without a press never "saw" the orb coming
         // and orb aim never started.
-        if (!m_orbAssistSimulation && isModelledOrb(type) && player == m_simPlayer1.data() &&
-            orbOverlap && !realUsedOrb(obj) && obj != m_simOrbObj) {
+        if ((!m_orbAssistSimulation || m_orbAssistDiscoveryOnly) && isModelledOrb(type) &&
+            player == m_simPlayer1.data() && orbOverlap && !realUsedOrb(obj) && obj != m_simOrbObj) {
             if (auto* ring = typeinfo_cast<RingObject*>(obj)) {
                 if (!m_simFirstRing) {
                     m_simFirstRing = ring;
@@ -5044,6 +5049,18 @@ private:
                 if (judged) out.clear = std::min(out.clear, m_tickClr);
             }
 
+            // The no-input discovery run only needs the complete contact
+            // interval. Continuing to the full player horizon used to encounter
+            // unrelated triggers AFTER the orb and mark an otherwise usable
+            // contact map incomplete. Candidate runs are not shortened: they
+            // still simulate the full judged post-orb path.
+            if (m_orbAssistSimulation && m_orbAssistDiscoveryOnly && m_simFirstRing &&
+                i > m_simFirstRingLast) {
+                out.ticks = i + 1;
+                out.end = SimEnd::Survived;
+                break;
+            }
+
             if (m_recordPath) m_path.push_back(ibcore::Point2{s1->getPositionX(), s1->getPositionY(), s1->getRotation()});
 
             if (m_simTrunc.valid && !m_scanNoclip) {
@@ -5275,6 +5292,7 @@ private:
         auto starts = [&](char const* p) { return text.rfind(p, 0) == 0; };
         std::string tag = "NOTE";
         if (starts("DEATH: ")) { tag = "DEATH"; text = text.substr(7); }
+        else if (starts("Orb Assist")) tag = "ORB";
         else if (starts("PRESS fired ") || starts("REL fired ")) {
             tag = "FIRED";
             text = (starts("PRESS") ? "press " : "release ") + text.substr(text.find("fired ") + 6);
@@ -5292,7 +5310,10 @@ private:
         trace(fmt::format("log {} {}", tag, text));
         m_logVersion++;
         float const t = levelMs() / 1000.f;
-        if (LogConsole::on()) LogConsole::write(fmt::format("[InputBuffer] {}", text), {255, 255, 255});
+        // Keep the optional console useful: only Orb Assist decisions go there.
+        // Routine buffer, scan and telemetry messages remain in the in-game log.
+        if (LogConsole::on() && tag == "ORB")
+            LogConsole::write(fmt::format("[OrbAssist] {}", text), {255, 255, 255});
         if (!m_history.empty() && m_history.back().text == text && m_history.back().tag == tag) {
             m_history.back().repeat++;
             m_history.back().t = t;
@@ -6287,10 +6308,18 @@ public:
         // Assist opts into a reduced-rate sample (60 Hz at 240 TPS) because a
         // moving target/hazard must not be mistaken for a stationary object.
         if (!MOVERS_ON && !m_orbAssistEnabled) return;
-        if (!m_enabled || !vec || !pl || player != pl->m_player1) return;
+        if ((!m_enabled && !m_orbAssistEnabled) || !vec || !pl || player != pl->m_player1) return;
+        double sampleBaseline = 0.5;
         if (!MOVERS_ON) {
             double const now = m_gameTime;
-            if (m_orbMoverSampleAt >= 0.0 && now - m_orbMoverSampleAt < 1.0) return;
+            // Sample once per nominal physics tick, not once per 60-fps frame.
+            // At 240 TPS the old 1.0-frame gate sampled only every four ticks,
+            // so a short frame-perfect approach often had no motion history.
+            // Match the velocity baseline to one tick: stationary orbs can be
+            // classified after two adjacent samples instead of waiting 3 ticks.
+            double const sampleEvery = std::max(0.05, static_cast<double>(getValidDt()) * 0.90);
+            sampleBaseline = sampleEvery;
+            if (m_orbMoverSampleAt >= 0.0 && now - m_orbMoverSampleAt + TIME_EPS < sampleEvery) return;
             m_orbMoverSampleAt = now;
         }
         if (MOVERS_ON && !m_orbAssistEnabled) {
@@ -6303,7 +6332,8 @@ public:
         for (int i = 0; i < n; i++) {
             GameObject* obj = (*vec)[i];
             if (!obj || !(isHazard(obj->m_objectType) || isOrb(obj->m_objectType))) continue;
-            m_movers[obj].sample(obj->m_positionX, obj->m_positionY, t, MOVER_MAX_GAP, MOVER_TELEPORT);
+            m_movers[obj].sample(obj->m_positionX, obj->m_positionY, t,
+                                 MOVER_MAX_GAP, MOVER_TELEPORT, sampleBaseline);
         }
         if (m_movers.size() > MOVER_MAX_TRACKED) {
             for (auto it = m_movers.begin(); it != m_movers.end();) {
@@ -7268,14 +7298,19 @@ public:
         Config const& c = cfg();
         m_active   = allowedHere(c, pl);
         m_enabled  = m_active;
-        m_orbAssistEnabled = c.orbHelper;
+        m_orbAssistEnabled = c.orbHelper && (!c.practiceOnly || pl->m_isPracticeMode);
         m_logDebug = c.debug;
         m_logCsv   = c.csv;
-        if (!m_enabled) {
+        bool const orbAssistAllowed = c.orbHelper && (!c.practiceOnly || pl->m_isPracticeMode);
+        // Orb Assist is an independent feature. The main stage switch controls
+        // Assisted Click only; Stage "Off" must not disable a requested orb delay.
+        if (!m_enabled && !orbAssistAllowed) {
             clearBuffer();
             m_gameHolding = push;
             return true;
         }
+        if (!m_enabled) clearBuffer();
+        m_orbAssistEnabled = orbAssistAllowed;
         // Dead (death animation, respawn): straight through, nothing to check.
         // (2.1: before the hook check - clicks while dead looked like a
         // missing physics hook.)
@@ -7302,6 +7337,10 @@ public:
             }
             return true;
         }
+
+        // The ordinary stage may be OFF while Orb Assist is enabled. Create its
+        // hidden PlayerObject here, not from onPlayerUpdate's normal-stage path.
+        if (orbAssistAllowed) ensureSimPlayers(pl);
 
         // Platformer inputs depend on held directions the sim does not model.
         if (p1->m_isPlatformer || (p2 && p2->m_isPlatformer)) {
@@ -7395,7 +7434,7 @@ public:
             }
             if (!placed) m_queue.push(push, m_gameTime, minGap);
             // e.g. the release of a press that already fired: it gets the live check too
-            if (!m_live && m_queue.pending()) {
+            if (!m_live && m_queue.pending() && !m_orbHelpHold) {
                 m_live = true;
                 m_liveState.needInit = true;
             }
@@ -7425,7 +7464,7 @@ public:
         //     scan found is decided from the scan - no prediction (cheap, and
         //     the scan already knows that spot). Inside its window: as made.
         //     Early (within your stage window): held until the window starts.
-        if (c.routeSnap && !m_route.empty() && windowTicks > 0) {
+        if (m_enabled && c.routeSnap && !m_route.empty() && windowTicks > 0) {
             float tx = 0.f;
             int const m = routeMatch(pl, push, mode, windowTicks, dt, tx);
             if (m == 1) {
@@ -7478,6 +7517,13 @@ public:
                 auto const oldDeadlineOn = m_hasDeadline;
                 auto const oldDeadline = m_deadline;
                 auto const oldScanSim = m_scanSim;
+                PlayerSnap const orbAssistStart = snapFrom(p1);
+                PlayerSnap const* oldSimSnap = m_simSnap;
+                // Use the same full PlayerObject snapshot as Level Scan. The
+                // ordinary syncSimPlayer copy intentionally omits collision,
+                // slope, jump-buffer and ring state that matters at tight orb
+                // contacts; Level Scan preserves those fields between branches.
+                m_simSnap = &orbAssistStart;
                 int const oldChainStop = m_simChainStop;
                 int const oldScanModeSwitches = m_scanModeSwitches;
                 int const oldScanPortalTraces = m_scanPortalTraces;
@@ -7495,7 +7541,19 @@ public:
                 RingObject* target = nullptr;
                 orbassist::TickPlan pick;
 
-                SimResult idle = runSim(ox, scanTicks + 1, FollowUp{}, 1);
+                bool const oldDiscoveryOnly = m_orbAssistDiscoveryOnly;
+                m_orbAssistDiscoveryOnly = true;
+                // Discover the approach/contact interval with no click applied.
+                // The previous h=1 call only simulated one physics tick, so it
+                // could never map an orb that was more than one tick away.
+                // Give the discovery pass the full look-ahead horizon and
+                // explicitly release the simulated button at tick zero.
+                Ctx discovery = ox;
+                discovery.push = false;
+                discovery.horizon = std::clamp(std::max(ox.horizon, scanTicks + 1),
+                                               MIN_HORIZON, MAX_SIM_STEPS);
+                SimResult idle = runSim(discovery, 0, FollowUp{}, scanTicks + 1);
+                m_orbAssistDiscoveryOnly = oldDiscoveryOnly;
                 int const contactLo = idle.firstRingTick;
                 int const contactHi = idle.firstRingLast;
                 bool const diedBeforeOrb = idle.end == SimEnd::Died && idle.deathStep >= 0 &&
@@ -7566,6 +7624,7 @@ public:
                 m_scanModeSwitches = oldScanModeSwitches;
                 m_scanPortalTraces = oldScanPortalTraces;
                 m_scanSim = oldScanSim;
+                m_simSnap = oldSimSnap;
                 m_orbAssistSimulation = oldAssistSimulation;
                 m_recordPath = oldRecordPath;
                 m_hasDeadline = oldDeadlineOn;
@@ -7581,9 +7640,12 @@ public:
                     m_orbHelpRing = target;
                     m_routeHold = false;
                     m_queue.start(true, m_gameTime, std::max(0.0, at(chosen) - m_gameTime));
-                    m_live = true;
-                    m_liveState.startClick(m_gameTime, dt, at(chosen),
-                                           at(pick.runHi + 1) + TIME_EPS, at(pick.runHi) + TIME_EPS);
+                    // Every candidate tick was exhaustively simulated from the
+                    // Level Scan PlayerSnap. Fire on that exact game-time tick;
+                    // do not run the generic live re-planner, which can move a
+                    // frame-perfect input away from the verified tick.
+                    m_live = false;
+                    m_liveState = ibcore::LiveState{};
                     m_liveArrive = m_gameTime;
                     m_livePlanTicks = chosen;
                     m_liveWaited = false;
@@ -7603,12 +7665,15 @@ public:
                                         chosen, pick.runLo, pick.runHi, pick.tested), COL_GREEN, true);
                     return false;
                 }
-                if (!rejectReason.empty()) {
-                    pushLog("Orb Assist skipped: " + rejectReason + "; regular Assisted Click remains active",
-                            COL_GREY, true);
-                }
+                // Rejection is intentionally silent: the click remains raw (or
+                // goes through the normal buffer when the main stage is on).
+                (void)rejectReason;
             }
         }
+
+        // When the main stage is OFF, do not fall through into the ordinary
+        // Assisted Click predictor after the independent Orb Assist check.
+        if (!m_enabled) return pass(Decision::PassModeOff);
 
         // 2b. Wave spam: keep ONE steady shift for the whole stream. Jitter came
         //     from every input being judged on its own - one delayed 3 ticks,
@@ -8384,7 +8449,23 @@ public:
         if ((m_tick & 3) == 0) updatePreview(pl);
 
         if (!m_enabled) {
-            clearBuffer();
+            // Stage "Off" disables ordinary Assisted Click, but an Orb Assist
+            // press already accepted above must remain scheduled.
+            if (m_orbHelpHold && m_queue.pending()) {
+                if (m_orbHelpRing && (!orbAvailableNow(m_orbHelpRing) || realUsedOrb(m_orbHelpRing))) {
+                    // Do not lose the user's press if its target is disabled or
+                    // consumed while waiting; bring the queued press forward.
+                    m_queue.shiftAll(m_gameTime - m_queue.nextAt(), m_gameTime);
+                }
+                if (auto due = m_queue.poll(m_gameTime, TIME_EPS)) {
+                    fireButton(pl, *due);
+                    m_orbHelpRing = nullptr;
+                    if (!m_queue.pending()) m_orbHelpHold = false;
+                }
+                if (m_orbHelpHold) return; // keep the Orb Assist queue's rhythm intact
+            } else {
+                clearBuffer();
+            }
             reconcile(pl);
             return;
         }
@@ -8426,8 +8507,18 @@ public:
             }
         } else if (m_queue.pending()) {
             // At most one queued input per physics step, right before the step runs.
+            if (m_orbHelpHold && m_orbHelpRing &&
+                (!orbAvailableNow(m_orbHelpRing) || realUsedOrb(m_orbHelpRing))) {
+                m_queue.shiftAll(m_gameTime - m_queue.nextAt(), m_gameTime);
+            }
             if (auto due = m_queue.poll(m_gameTime, TIME_EPS)) {
+                bool const wasOrbAssist = m_orbHelpHold;
                 fireButton(pl, *due);
+                if (wasOrbAssist) {
+                    m_orbHelpRing = nullptr;
+                    if (!m_queue.pending()) m_orbHelpHold = false;
+                    m_routeHold = false;
+                }
                 if (m_trackPending) {
                     // Align the prediction to the step the held click really landed on.
                     m_tracker.start(m_gameTime - static_cast<double>(m_pendingDelay) * getValidDt(), getValidDt(),
@@ -8984,7 +9075,8 @@ protected:
         if (!tabShown(lastTab)) lastTab = TAB_LOG;
         showTab(static_cast<Tab>(lastTab));
         popIn();
-        if (LogConsole::available() && Mod::get()->getSavedValue<bool>("log-console", false)) LogConsole::open();
+        // The external console is opt-in (F7); never open it as a side effect
+        // of showing the in-game window.
         return true;
     }
 
@@ -10622,13 +10714,8 @@ $on_mod(Loaded) {
         if (down && !repeat) s_sim.cyclePreset();
         return false; // don't swallow the key
     });
-    // This fork has no Input Buffer overlay. Open the external Windows console
-    // automatically; F7 can close/reopen it without changing the game input.
-#ifdef GEODE_IS_WINDOWS
-    queueInMainThread([] {
-        if (!LogConsole::open()) log::warn("[InputBuffer] Could not allocate the live console");
-    });
-#endif
+    // The Windows console is opt-in: F7 opens/closes it. Loading the mod must
+    // not create a second command window or flood it with scan diagnostics.
     listenForKeybindSettingPresses("console-key", [](Keybind const&, bool down, bool repeat, double) {
         if (down && !repeat && LogConsole::available()) {
             if (LogConsole::on()) LogConsole::close();
@@ -10924,4 +11011,6 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         }
         GJBaseGameLayer::playerTouchedRing(player, ring);
     }
+};
+
 };
