@@ -3046,7 +3046,8 @@ public:
 #define IB_SNAP_DECL(f) std::remove_cvref_t<decltype(std::declval<PlayerObject&>().f)> f{};
         IB_SNAP_FIELDS(IB_SNAP_DECL)
 #undef IB_SNAP_DECL
-        std::vector<int> touchedRings; // gd::unordered_set: copied by hand (like syncSimPlayer does)
+        std::vector<int> touchedRings; // per-step contact bookkeeping used by resetTouchedRings()
+        std::vector<int> activatedRingIds; // m_ringRelatedSet: ringJump's already-activated ID set
         int     mode = 0;              // modeCode() - the scan passes gamemode portals
         CCPoint pos{};
         float   scale = 1.f;
@@ -3058,6 +3059,7 @@ public:
         IB_SNAP_FIELDS(IB_SNAP_GET)
 #undef IB_SNAP_GET
         for (int id : p->m_touchedRings) s.touchedRings.push_back(id);
+        for (int id : p->m_ringRelatedSet) s.activatedRingIds.push_back(id);
         s.mode = modeCode(p);
         s.pos = p->getPosition();
         s.scale = p->getScale();
@@ -3073,6 +3075,8 @@ public:
 #undef IB_SNAP_SET
         p->m_touchedRings.clear();
         for (int id : s.touchedRings) p->m_touchedRings.insert(id);
+        p->m_ringRelatedSet.clear();
+        for (int id : s.activatedRingIds) p->m_ringRelatedSet.insert(id);
     }
     PlayerSnap const* m_simSnap = nullptr; // set: tests start from this state (level scan)
     float m_scanClr = 1e9f;                // level scan: closest a test came to a hazard (every tick)
@@ -5721,7 +5725,9 @@ public:
     // state instead of approximating eligibility from our click model.
     static bool orbAssistCanActivate(PlayerObject* p, RingObject* r) {
         if (!p || !r) return false;
-        auto const alreadyActivated = p->m_touchedRings.find(r->m_uniqueID) != p->m_touchedRings.end();
+        // m_touchedRings is only the per-step contact list. ringJump checks
+        // activatedRingIDs, exposed by the 2.2081 bindings as m_ringRelatedSet.
+        auto const alreadyActivated = p->m_ringRelatedSet.find(r->m_uniqueID) != p->m_ringRelatedSet.end();
         orbassist::ActivationState state;
         state.alive = !p->m_isDead;
         state.canRingJump = p->m_stateRingJump2; // binding alias: m_canRingJump
@@ -5815,11 +5821,11 @@ public:
             // m_isVelocityUncapped respectively. Keep this inside the Orb
             // Assist-only branch so legacy Assisted Click is untouched.
             p->m_touchedRing = true;
-            // ringJump inserts the unique ID into activatedRingIDs and then
-            // removes the object from m_touchingRings. addToTouchedRings() is
-            // not equivalent here: it re-adds the object to m_touchingRings.
-            // Mirror both native bookkeeping operations directly.
-            p->m_touchedRings.insert(r->m_uniqueID);
+            // ringJump inserts the unique ID into activatedRingIDs
+            // (m_ringRelatedSet), then removes the object from m_touchingRings.
+            // m_touchedRings is a transient per-step marker and must not be
+            // mistaken for the activated-ID set.
+            p->m_ringRelatedSet.insert(r->m_uniqueID);
             if (p->m_touchingRings) p->m_touchingRings->removeObject(r, true);
             p->m_stateRingJump = false; // m_isJumpUnused
             p->m_ringJumpRelated = true; // m_ringJumpingThisTick
