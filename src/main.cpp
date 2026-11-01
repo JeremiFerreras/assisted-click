@@ -6064,6 +6064,61 @@ public:
                std::fabs(track.accx) <= 0.05f && std::fabs(track.accy) <= 0.05f;
     }
 
+    // Probe the *upcoming* physics step with the current real PlayerSnap.
+    // touchingRings is only populated by collision processing after PlayerObject::update;
+    // checking it before update misses the first (often only) frame-perfect contact.
+    bool probeUpcomingOrbContact(PlayLayer* pl, RingObject* target) {
+        if (!pl || !pl->m_player1 || !target || !orbAvailableNow(target) || realUsedOrb(target))
+            return false;
+
+        Ctx probe;
+        Config const& c = cfg();
+        if (!makeCtx(pl, true, c, probe)) return false;
+
+        PlayerSnap const start = snapFrom(pl->m_player1);
+        PlayerSnap const* oldSnap = m_simSnap;
+        bool const oldScanSim = m_scanSim;
+        bool const oldOrbSimulation = m_orbAssistSimulation;
+        bool const oldDiscoveryOnly = m_orbAssistDiscoveryOnly;
+        bool const oldRecordPath = m_recordPath;
+        bool const oldDeadlineOn = m_hasDeadline;
+        auto const oldDeadline = m_deadline;
+        int const oldChainStop = m_simChainStop;
+        int const oldModeSwitches = m_scanModeSwitches;
+        int const oldPortalTraces = m_scanPortalTraces;
+        bool const oldOrbPredict = m_orbPredict;
+        bool const oldPadPredict = m_padPredict;
+
+        m_simSnap = &start;
+        m_scanSim = true;
+        m_orbAssistSimulation = true;
+        m_orbAssistDiscoveryOnly = false;
+        m_recordPath = false;
+        m_hasDeadline = false;
+        m_simChainStop = 0;
+
+        // Exactly one real physics tick: input down, native update, native
+        // collision broadphase, then the 2.2081 playerTouchedRing callback.
+        SimResult const next = runSim(probe, 0, FollowUp{}, 1);
+
+        m_simSnap = oldSnap;
+        m_scanSim = oldScanSim;
+        m_orbAssistSimulation = oldOrbSimulation;
+        m_orbAssistDiscoveryOnly = oldDiscoveryOnly;
+        m_recordPath = oldRecordPath;
+        m_hasDeadline = oldDeadlineOn;
+        m_deadline = oldDeadline;
+        m_simChainStop = oldChainStop;
+        m_scanModeSwitches = oldModeSwitches;
+        m_scanPortalTraces = oldPortalTraces;
+        m_orbPredict = oldOrbPredict;
+        m_padPredict = oldPadPredict;
+
+        return next.end != SimEnd::OutOfBudget && next.end != SimEnd::Truncated &&
+               next.orbAssistComplete && next.orbAssistModelValid &&
+               next.orbUsed && next.exactOrbContact && next.usedRing == target;
+    }
+
     // The modelled orb a (real) player is touching right now, if any.
     static RingObject* touchingOrb(PlayerObject* p) {
         if (!p || !p->m_touchingRings) return nullptr;
@@ -8206,6 +8261,16 @@ public:
         bool waveMode = false;
         SimEnd testedEnd = SimEnd::Survived;
 
+        // Check the collision that will happen after this PlayerObject::update.
+        // The previous-step m_touchingRings list is too late for a one-tick orb.
+        bool orbContactOnUpcomingStep = false;
+        if (wasFirst && m_orbHelpHold && m_liveState.planned >= 0.0 &&
+            now + TIME_EPS >= m_liveState.planned) {
+            RingObject* const target = m_orbHelpRing;
+            if (orbAvailableNow(target) && !realUsedOrb(target))
+                orbContactOnUpcomingStep = probeUpcomingOrbContact(pl, target);
+        }
+
         // "Is firing it now safe?" - one test from the real current state.
         //  * The click you made (head = first) gets everything: learned spots,
         //    near-miss waits, waiting for a spot that worked before.
@@ -8244,9 +8309,8 @@ public:
             // tick stored in LiveState.
             if (head && push && m_orbHelpHold) {
                 if (now + TIME_EPS < m_liveState.planned) return ibcore::LiveVerdict::Unsafe;
-                if (orbAvailableNow(m_orbHelpRing) && !realUsedOrb(m_orbHelpRing) &&
-                    touchingOrbObj(pl->m_player1, m_orbHelpRing)) return ibcore::LiveVerdict::Proven;
-                return ibcore::LiveVerdict::Unsafe;
+                return orbContactOnUpcomingStep ? ibcore::LiveVerdict::Proven
+                                                : ibcore::LiveVerdict::Unsafe;
             }
             // Held for a learned spot: fire exactly when you reach it (no
             // prediction - it may be blind there), else keep waiting.
@@ -8403,9 +8467,9 @@ public:
         // Assisted Click safety check from the current live state.
         if (wasFirst && m_orbHelpHold) {
             bool const activeTarget = orbAvailableNow(m_orbHelpRing) && !realUsedOrb(m_orbHelpRing);
-            bool const exactNow = activeTarget && touchingOrbObj(pl ? pl->m_player1 : nullptr, m_orbHelpRing);
+            bool const exactUpcoming = activeTarget && orbContactOnUpcomingStep;
             bool const expired = m_liveState.latest >= 0.0 && now + TIME_EPS >= m_liveState.latest;
-            if (!exactNow && (!activeTarget || expired)) {
+            if (!exactUpcoming && (!activeTarget || expired)) {
                 m_orbHelpHold = false;
                 m_orbHelpRing = nullptr;
                 m_liveState.latest = -1.0; // remove the generic forced-plan path for Orb Assist
@@ -8544,9 +8608,10 @@ public:
             if (m_orbHelpHold && m_queue.pending()) {
                 if (m_orbHelpRing) {
                     bool const active = orbAvailableNow(m_orbHelpRing) && !realUsedOrb(m_orbHelpRing);
-                    bool const exact = active && touchingOrbObj(player, m_orbHelpRing);
                     bool const planned = m_liveState.planned >= 0.0 &&
                                          m_gameTime + TIME_EPS >= m_liveState.planned;
+                    bool const exact = active && planned &&
+                                       probeUpcomingOrbContact(pl, m_orbHelpRing);
                     // A one-tick safe run has planned == latest. Accept exact
                     // contact at equality, but pass through immediately if that
                     // final safe tick arrives without contact.
