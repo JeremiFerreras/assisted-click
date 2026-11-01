@@ -6,11 +6,11 @@
 		"android": "2.2081",
 		"ios": "2.2081"
 	},
-	"version": "v4.8.0",
+	"version": "v4.9.0",
 	"id": "geodepredictive.inputbuffer",
 	"name": "Geode Predictive Input Buffer",
 	"developer": "Custom fork",
-	"description": "Orb Delay compares the normal Assisted Click route with exact per-tick simulations for supported stationary orbs. It schedules an orb press only when the modeled post-orb trajectory is safer, then requires exact live contact before delivering the input. Unsupported or missed contacts fail closed.",
+	"description": "Orb Delay compares the normal Assisted Click route with exact per-tick simulations for supported stationary orbs. It mirrors Geometry Dash 2.2081's activated-ring ID set separately from transient touched-ring bookkeeping, then requires exact live contact before delivering the input. Unsupported or missed contacts fail closed.",
 	"resources": {
 		"sprites": [
 			"resources/*.png"
