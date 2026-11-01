@@ -8523,8 +8523,10 @@ public:
                     bool const exact = active && touchingOrbObj(player, m_orbHelpRing);
                     bool const planned = m_liveState.planned >= 0.0 &&
                                          m_gameTime + TIME_EPS >= m_liveState.planned;
+                    // A one-tick safe run has planned == latest. Equality is
+                    // still the verified tick; only a later physics step is expired.
                     bool const expired = m_liveState.latest >= 0.0 &&
-                                         m_gameTime + TIME_EPS >= m_liveState.latest;
+                                         m_gameTime > m_liveState.latest + TIME_EPS;
                     if (exact && planned && !expired) {
                         if (auto due = m_queue.poll(m_gameTime, TIME_EPS)) fireButton(pl, *due);
                         else return;
