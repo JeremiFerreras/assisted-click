@@ -1,7 +1,7 @@
- """Static consistency checks for the video-style Geode fork.
+"""Static integration checks for the video-style Geode fork.
 
-Run with: python verify_video_profile.py
-These tests inspect project configuration only. They do not emulate Geometry Dash.
+Run with: python tests/verify_video_profile.py
+These checks inspect source/configuration only; they do not emulate GD.
 """
 from __future__ import annotations
 
@@ -12,13 +12,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / "src" / "main.cpp").read_text(encoding="utf-8")
+ORB_CORE = (ROOT / "src" / "OrbAssistCore.hpp").read_text(encoding="utf-8")
 MOD = json.loads((ROOT / "mod.json").read_text(encoding="utf-8"))
 
 
 class VideoProfileTests(unittest.TestCase):
     def test_geode_metadata_and_settings(self):
         self.assertEqual(MOD["id"], "geodepredictive.inputbuffer")
-        self.assertEqual(MOD["version"], "v4.6.1")
+        self.assertEqual(MOD["version"], "v4.6.2")
         self.assertEqual(MOD["settings"]["stage"]["default"], "Stage 1")
         self.assertEqual(
             MOD["settings"]["stage"]["one-of"],
@@ -27,6 +28,7 @@ class VideoProfileTests(unittest.TestCase):
         self.assertTrue(MOD["settings"]["auto-scan"]["default"])
         self.assertFalse(MOD["settings"]["route-snap"]["default"])
         self.assertTrue(MOD["settings"]["orb-helper"]["default"])
+        self.assertIn("no prior orb calibration", MOD["settings"]["orb-helper"]["description"])
 
     def test_expected_stage_windows_are_encoded(self):
         expected = {
@@ -48,7 +50,7 @@ class VideoProfileTests(unittest.TestCase):
     def test_console_matches_video_profile(self):
         for required in (
             "Geode Predictive Input Buffer - Live Console",
-            "[InputBuffer] v4.6.1 LOADED (Calibrated Orb Click Assist)",
+            "[InputBuffer] v4.6.2 LOADED (Deterministic Orb Assist)",
             "[InputBuffer] Starting Mode: STAGE 1 (2 All / 2 Wave)",
             "2/2 -> 4/4 -> 8/8 -> 16/8 -> OFF",
             "SAVED +{} TICKS",
@@ -80,24 +82,50 @@ class VideoProfileTests(unittest.TestCase):
         self.assertIn("Auto scan finished: {}", SOURCE)
         self.assertIn("m_autoScanComplete = pctAt(pl, m_scanX) >= 99.5f", SOURCE)
         self.assertIn("routeMerge()", SOURCE)
-        # A partial scan can restart from a later pause; no m_scanState == Done guard.
         auto_scan = SOURCE[SOURCE.index("void autoScanOnPause("):SOURCE.index("// The best version's inputs")]
         self.assertNotIn("m_scanState == ScanState::Done", auto_scan)
-        # The scan finisher must not create an in-game notification in this profile.
         finish = SOURCE[SOURCE.index("void finishScan("):SOURCE.index("// Called once per frame by the scan runner.")]
         self.assertNotIn("Notification::create", finish)
 
-    def test_orb_helper_checks_calibrated_full_safe_window(self):
-        self.assertIn("orb-helper", MOD["settings"])
-        self.assertIn("m_simFirstRingKey = orbKey(ring, player);", SOURCE)
-        self.assertIn("orbModelAvailable(idle.firstRingKey)", SOURCE)
-        self.assertIn("ibcore::pickOrbTick(contactLo, contactHi", SOURCE)
-        self.assertIn("candidate.exactOrbContact", SOURCE)
+    def test_orb_assist_is_deterministic_and_independent(self):
+        self.assertTrue((ROOT / "src" / "OrbAssistCore.hpp").exists())
+        self.assertIn("orbassist::modelPhysics", SOURCE)
+        self.assertIn("orbassist::chooseSafeTick", SOURCE)
+        self.assertNotIn("orbModelAvailable(", SOURCE)
+        self.assertIn("if (m_orbAssistSimulation) sim->m_yStart = real->m_yStart;", SOURCE)
+        self.assertIn("sim->m_isAccelerating = real->m_isAccelerating;", SOURCE)
+        self.assertIn("m_orbMoverSampleAt < 1.0", SOURCE)
+        self.assertIn("sim->m_ringJumpRelated = real->m_ringJumpRelated;", SOURCE)
+        self.assertIn("sim->m_padRingRelated = real->m_padRingRelated;", SOURCE)
+        self.assertIn("p->m_stateRingJump = false; // m_isJumpUnused", SOURCE)
+        self.assertIn("p->m_hasEverHitRing = true;", SOURCE)
+        self.assertIn("m_simMovers = m_orbAssistSimulation", SOURCE)
+        self.assertIn("if (m_orbAssistSimulation && isModelledOrb(type)) return;", SOURCE)
+        self.assertIn("if (!m_orbAssistSimulation && isModelledOrb(type)", SOURCE)
+        self.assertIn("touchingOrbObj(pl->m_player1, m_orbHelpRing)", SOURCE)
+        self.assertIn("candidate.orbAssistComplete && candidate.orbAssistModelValid", SOURCE)
+        self.assertIn("candidate.orbUsed && candidate.exactOrbContact", SOURCE)
         self.assertIn("candidate.usedRing == target", SOURCE)
-        self.assertIn("orbModelAvailable(candidate.usedRingKey)", SOURCE)
-        self.assertIn("contactHi - contactLo + 1 <= ORB_HELP_OVERLAP_TICKS", SOURCE)
-        self.assertIn("at(pick.runHi) + TIME_EPS", SOURCE)
-        self.assertIn("m_liveState.planned", SOURCE)
+        self.assertIn("orbMotionKnown(idle.firstRing)", SOURCE)
+        self.assertIn("ORB_HELP_BASE           = 48", SOURCE)
+        self.assertIn("ORB_HELP_OVERLAP_TICKS  = 64", SOURCE)
+        self.assertIn("ORB_HELP_MAX_TESTS      = 64", SOURCE)
+        self.assertIn("ORB_HELP_BUDGET_US      = 30000", SOURCE)
+        self.assertIn("m_liveState.latest = -1.0;", SOURCE)
+        self.assertIn("handing the click back to Assisted Click", SOURCE)
+        self.assertIn("m_simUsedRingExact = false;", SOURCE)
+        self.assertIn("m_simHeld = false;", SOURCE)
+        self.assertIn("if (push && c.orbHelper && !touchingOrb(p1))", SOURCE)
+
+    def test_orb_physics_covers_post_impulse_vehicle_rules(self):
+        for required in (
+            "factor = 0.37", "factor = 0.42", "factor = 0.77", "factor = 1.38",
+            "out.flipAfterVelocity = true", "out.flipBeforeVelocity = true",
+            "postSetVelocityMultiplier = 0.70", "postSetVelocityMultiplier = 0.60",
+            "out.velocityUncapped = true", "Wave uses the ordinary ringJump path",
+        ):
+            self.assertIn(required, ORB_CORE)
+        self.assertNotIn("if (in.vehicle == Vehicle::Wave)", ORB_CORE)
 
     def test_f6_cycles_five_modes_then_wraps(self):
         self.assertIn("int const next = (cur == STAGE_COUNT - 1) ? 0 : cur + 1;", SOURCE)
