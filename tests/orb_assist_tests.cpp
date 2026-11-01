@@ -237,6 +237,8 @@ void testExhaustiveTickPlanner() {
     });
     check(p.status == PlanStatus::Found && p.runLo == 12 && p.runHi == 14,
           "clearance breaks equal-window tie");
+    check(std::fabs(p.clearance - 9.0f) < 0.001f,
+          "selected safe run reports its weakest clearance");
 
     // Any unknown physics / out-of-budget result invalidates the whole search,
     // even if a previous tick looked safe: no partial plan may leak out.
