@@ -8523,16 +8523,19 @@ public:
                     bool const exact = active && touchingOrbObj(player, m_orbHelpRing);
                     bool const planned = m_liveState.planned >= 0.0 &&
                                          m_gameTime + TIME_EPS >= m_liveState.planned;
-                    // A one-tick safe run has planned == latest. Equality is
-                    // still the verified tick; only a later physics step is expired.
-                    bool const expired = m_liveState.latest >= 0.0 &&
-                                         m_gameTime > m_liveState.latest + TIME_EPS;
-                    if (exact && planned && !expired) {
+                    // A one-tick safe run has planned == latest. Accept exact
+                    // contact at equality, but pass through immediately if that
+                    // final safe tick arrives without contact.
+                    bool const withinSafeRun = m_liveState.latest < 0.0 ||
+                                               m_gameTime <= m_liveState.latest + TIME_EPS;
+                    bool const windowEnded = m_liveState.latest >= 0.0 &&
+                                             m_gameTime + TIME_EPS >= m_liveState.latest;
+                    if (exact && planned && withinSafeRun) {
                         if (auto due = m_queue.poll(m_gameTime, TIME_EPS)) fireButton(pl, *due);
                         else return;
                         m_orbHelpRing = nullptr;
                         if (!m_queue.pending()) m_orbHelpHold = false;
-                    } else if (!active || expired) {
+                    } else if (!active || windowEnded) {
                         // Missed the verified contact window: do not eat the input.
                         m_queue.shiftAll(m_gameTime - m_queue.nextAt(), m_gameTime);
                         if (auto due = m_queue.poll(m_gameTime, TIME_EPS)) fireButton(pl, *due);
