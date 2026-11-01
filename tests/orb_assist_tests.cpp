@@ -1,4 +1,5 @@
 #include "../src/OrbAssistCore.hpp"
+#include "../src/BufferCore.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -64,6 +65,12 @@ void testPhysicsProfiles() {
     near(e.yVelocity, 8.0, "blue uses pre-flip gravity sign");
     e = modelPhysics({Vehicle::Cube, Orb::Blue, 10.0, false, true, false});
     near(e.yVelocity, -8.0, "blue upside-down velocity");
+    // Live Orb Assist supplies PlayerObject::flipMod(); when present it must
+    // override the parallel cached orientation flag rather than re-derive it.
+    e = modelPhysics({Vehicle::Cube, Orb::Yellow, 10.0, false, false, false, -1.0});
+    near(e.yVelocity, -10.0, "native flipMod overrides cached upright flag");
+    e = modelPhysics({Vehicle::Cube, Orb::Green, 10.0, false, true, false, -1.0});
+    near(e.yVelocity, 10.0, "green orb inverts native flipMod before impulse");
     e = modelPhysics({Vehicle::Ship, Orb::Green, 10.0, false, false, true});
     near(e.yVelocity, -7.0, "ship green factor 0.7 after flip");
 
@@ -134,6 +141,70 @@ void testPhysicsProfiles() {
     }
 }
 
+void testExactTickDelayScheduling() {
+    TickPlan const plan = chooseSafeTick(0, 63, 64, 64, [](int tick) -> std::optional<TickProbe> {
+        return TickProbe{true, true, tick == 16, tick == 16 ? 5.0f : 0.0f};
+    });
+    check(plan.status == PlanStatus::Found && plan.best == 16,
+          "Orb Assist can select an exact 16-tick plan");
+
+    // Orb Assist converts the chosen tick to game time and hands the offset
+    // to the same queue. At 240 TPS, the event must not fire on tick 15 and
+    // must be due on tick 16 (4 frames at 60 FPS).
+    constexpr double dt = 1.0 / 240.0;
+    ibcore::InputQueue queue;
+    queue.start(true, 0.0, static_cast<double>(plan.best) * dt);
+    check(!queue.poll(15.0 * dt).has_value(), "16-tick delay does not fire at tick 15");
+    auto const due = queue.poll(16.0 * dt);
+    check(due.has_value() && *due, "16-tick delay fires exactly at tick 16");
+}
+
+void testNativeActivationGate() {
+    ActivationState s;
+    check(canActivate(s), "fresh ordinary orb matches GD ringJump eligibility");
+
+    s.alive = false;
+    check(!canActivate(s), "dead player cannot activate an orb");
+    s = ActivationState{};
+    s.canRingJump = false;
+    check(!canActivate(s), "GD canRingJump flag blocks activation");
+    s = ActivationState{};
+    s.dashing = true;
+    check(!canActivate(s), "dashing player cannot activate an ordinary orb");
+    s = ActivationState{};
+    s.holdingJumpReleaseDelayed = false;
+    check(!canActivate(s), "GD delayed-held-input flag is required");
+    s = ActivationState{};
+    s.alreadyActivated = true;
+    check(!canActivate(s), "an already activated unique ring ID is rejected");
+    s = ActivationState{};
+    s.touchedRing = true;
+    check(!canActivate(s), "GD touched-ring state blocks a second ordinary ring");
+    s = ActivationState{};
+    s.touchedRing = true;
+    s.touchedTeleportRing = true;
+    check(!canActivate(s), "touched teleport state cannot pass the native ring gate");
+
+    // Explicit custom/teleport cases guard the full native condition so a
+    // future extension cannot weaken the existing eligibility rules.
+    s = ActivationState{};
+    s.isJumpingRing = false;
+    s.isCustomRing = true;
+    check(canActivate(s), "first custom ring passes the matching native gate");
+    s.touchedRing = true;
+    check(canActivate(s), "custom ring retains the native exception after an ordinary ring");
+    s.touchedCustomRing = true;
+    check(!canActivate(s), "a previously touched custom ring blocks another custom ring");
+    s = ActivationState{};
+    s.isJumpingRing = false;
+    s.isTeleportRing = true;
+    s.touchedRing = true;
+    s.touchedCustomRing = true;
+    check(canActivate(s), "teleport orb is the exception to native touched-ring gate");
+    s.touchedTeleportRing = true;
+    check(!canActivate(s), "already touched teleport orb blocks a second teleport orb");
+}
+
 void testExhaustiveTickPlanner() {
     // At 240 physics ticks per second, each candidate is one exact tick.
     // Every single-tick safe window is found at every position in the
@@ -201,6 +272,8 @@ void testExhaustiveTickPlanner() {
 
 int main() {
     testPhysicsProfiles();
+    testExactTickDelayScheduling();
+    testNativeActivationGate();
     testExhaustiveTickPlanner();
     std::printf("Orb Assist isolated tests: %d checks, %d failures\n", checks, failures);
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
