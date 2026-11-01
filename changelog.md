@@ -1,3 +1,17 @@
+# 1.1.0
+
+1.1 — Calibrated orb-click assist
+
+- Added the `Assist Orb Clicks` gameplay setting, enabled by default.
+- The helper now discovers the target orb's full contact interval and probes each physics tick in that interval, rather than testing only the first contact tick.
+- A candidate is accepted only when the simulator actually activates the target orb and its post-orb route is safe (or the remaining death is independently judged escapable).
+- The helper uses saved real-game orb impulse samples keyed by orb type, vehicle, mini/normal size, and gravity direction. It does not guess a velocity for an unlearned vehicle/orb combination.
+- The Level Scan portal/size/speed/gravity handling is reused during the search, and the next orb can serve as the next user-controlled decision in an orb chain.
+- The live input waits until the chosen safe tick, checks the real orb hitbox, and never waits beyond the last fully tested safe tick. Console output reports the contact window, verified safe window, and last safe tick.
+- The orb helper now also considers Wave, Ship, Robot, UFO, Swing, Cube, Ball, and Spider modes, using the learned input-hold rhythm when the vehicle's trajectory depends on release timing.
+
+Verification note: the unit tests exercise the tick-window picker and configuration checks. They are not a substitute for testing every orb/vehicle pairing in the live Geometry Dash physics engine. A vehicle/orb pairing must first be learned from a real activation before the helper will delay it.
+
 # 1.0.0
 - Changelog — Geode Predictive Input Buffer
 
@@ -5,7 +19,7 @@
 Status: private/local testing build. This is not an official Geometry Dash feature or an announced public Geode release.
 
 Base: the supplied Input Buffer source package, whose existing code and manifest identify the upstream baseline as v4.6.0.
-Version-number note: “1.0” labels the first consolidated feature set of this adaptation. This documentation-only change does not change the code's existing version string in mod.json, CMakeLists.txt, or the startup console; those still identify the source baseline as v4.6.0.
+Version-number note: “1.0” labels the first consolidated feature set of this adaptation. The later 1.1 feature update advances the Geode manifest and startup console to v4.6.1; CMake's Template project version remains a build-project placeholder.
 
 Added — separate live Windows console
 - Added a Windows command-prompt console named Geode Predictive Input Buffer - Live Console as the main status and decision display.
