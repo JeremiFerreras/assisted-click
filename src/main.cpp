@@ -1179,13 +1179,14 @@ constexpr int    SHIP_JUDGE_BASE         = 24;
 // whole zig-zag: a +18t mini-wave press, then its release 18t late, death.
 constexpr float  HOLD_DELAY_FRAC         = 0.75f;
 constexpr int    HOLD_DELAY_MIN_BASE     = 6;
-// Orb helper: look ahead for an approaching orb, then test every physics tick
-// in GD's exact contact interval. The interval is capped at 64 ticks so the
-// search can inspect it exhaustively without returning a partial winner.
+// Orb helper: discover the first approaching orb, then test candidate ticks
+// in chronological order. The planner stops at the first fully safe result;
+// the live check revalidates the exact upcoming contact and post-orb path.
 constexpr int    ORB_HELP_BASE           = 48; // allow early presses up to 12 base frames ahead
-constexpr int    ORB_HELP_OVERLAP_TICKS  = 64; // exhaustive range; wider windows fail closed
-constexpr int    ORB_HELP_MAX_TESTS      = 64; // one full simulation per candidate tick
-constexpr int    ORB_HELP_BUDGET_US      = 30000; // dedicated cap; exhaustion cancels Orb Assist
+constexpr int    ORB_HELP_OVERLAP_TICKS  = 64; // max candidate ticks searched in one prediction
+constexpr int    ORB_HELP_MAX_TESTS      = 64; // hard cap; normally only the first few ticks are tested
+constexpr int    ORB_HELP_BUDGET_US      = 8000; // initial search cap; exhaustion falls back to normal input
+constexpr int    ORB_HELP_LIVE_BUDGET_US = 6000; // current-state route validation at exact contact
 // Level scan (2.1): see scanSlice().
 constexpr int    SCAN_STEP_BASE          = 2;     // a version may switch every 2 ticks (240 TPS)
 constexpr float  SCAN_STEP_WAVE          = 1.f;   // wave: every tick - mini wave gaps are tight
@@ -6048,20 +6049,18 @@ public:
         return r && r->isVisible() && !r->m_isGroupDisabled && !r->m_isDisabled;
     }
 
-    // A target must have enough real samples to be classified as static or
-    // moving. Unknown / stale motion is not silently treated as stationary.
-    bool orbMotionKnown(RingObject* r) const {
+    // The live gate can validate a contact on the very next physics step, so
+    // lack of movement samples is not a reason to reject an otherwise usable
+    // orb. Reject only when fresh samples positively show that the orb moves:
+    // the current native collision probe does not project its future transform.
+    bool orbMotionConfirmedMoving(RingObject* r) const {
+        if (!r) return true;
         auto it = m_movers.find(r);
-        if (!r || it == m_movers.end()) return false;
+        if (it == m_movers.end()) return false;
         ibcore::MoverTrack const& track = it->second;
         if (track.vt < 0.0 || m_gameTime - track.vt > MOVER_FRESH) return false;
-        // This build's exact touchingRings callback only sees the live object
-        // transform; it does not apply a predicted mover offset to GD's native
-        // collision system. Therefore even a well-tracked moving orb is not a
-        // valid Orb Assist target yet. Moving hazards remain tracked separately.
-        if (track.moving(m_gameTime, MOVER_FRESH, MOVER_MIN_SPEED)) return false;
-        return std::fabs(track.vx) < MOVER_MIN_SPEED && std::fabs(track.vy) < MOVER_MIN_SPEED &&
-               std::fabs(track.accx) <= 0.05f && std::fabs(track.accy) <= 0.05f;
+        return std::fabs(track.vx) >= MOVER_MIN_SPEED || std::fabs(track.vy) >= MOVER_MIN_SPEED ||
+               std::fabs(track.accx) > 0.05f || std::fabs(track.accy) > 0.05f;
     }
 
     // Probe the *upcoming* physics step with the current real PlayerSnap.
@@ -6120,6 +6119,77 @@ public:
         return next.end != SimEnd::OutOfBudget && next.end != SimEnd::Truncated &&
                next.orbAssistComplete && next.orbAssistModelValid &&
                next.orbUsed && next.exactOrbContact && next.usedRing == target;
+    }
+
+    // Called only after the one-step native probe confirms that this exact orb
+    // will be touched on the upcoming real physics tick. Re-simulate the whole
+    // judged post-orb route from the CURRENT player snapshot. This is the live
+    // equivalent of the click-time candidate test, so a small timing/physics
+    // drift cannot turn an old safe prediction into a blind activation.
+    bool probeUpcomingOrbSafe(PlayLayer* pl, RingObject* target) {
+        if (!probeUpcomingOrbContact(pl, target)) return false;
+
+        Ctx route;
+        Config const& c = cfg();
+        if (!makeCtx(pl, true, c, route)) return false;
+
+        PlayerSnap const start = snapFrom(pl->m_player1);
+        PlayerSnap const* oldSnap = m_simSnap;
+        bool const oldScanSim = m_scanSim;
+        bool const oldOrbSimulation = m_orbAssistSimulation;
+        bool const oldDiscoveryOnly = m_orbAssistDiscoveryOnly;
+        bool const oldRecordPath = m_recordPath;
+        bool const oldDeadlineOn = m_hasDeadline;
+        auto const oldDeadline = m_deadline;
+        int const oldChainStop = m_simChainStop;
+        int const oldModeSwitches = m_scanModeSwitches;
+        int const oldPortalTraces = m_scanPortalTraces;
+        bool const oldOrbPredict = m_orbPredict;
+        bool const oldPadPredict = m_padPredict;
+
+        m_simSnap = &start;
+        m_scanSim = true;
+        m_orbAssistSimulation = true;
+        m_orbAssistDiscoveryOnly = false;
+        m_recordPath = false;
+        m_orbPredict = true;
+        m_hasDeadline = true;
+        m_deadline = Clock::now() + std::chrono::microseconds(ORB_HELP_LIVE_BUDGET_US);
+        m_simChainStop = scaleTicks(ORB_CHAIN_SPARE_BASE, route.s);
+
+        FollowUp release;
+        if (!route.tapModel) {
+            WinIdx const w = primaryWin(route.mode, true);
+            int const held = std::max(scaleTicks(1, route.s), static_cast<int>(std::lround(
+                rhythm(m_holdLen[w], DEFAULT_TAP_FRAMES) / route.dt)));
+            release.at[0] = held;
+            release.held[0] = false;
+        }
+
+        SimResult const candidate = runSim(route, 0, release);
+        bool const budgetHit = budgetExpired();
+        bool safe = false;
+        if (!budgetHit && candidate.end == SimEnd::Survived &&
+            candidate.orbAssistComplete && candidate.orbAssistModelValid &&
+            candidate.orbUsed && candidate.exactOrbContact && candidate.usedRing == target) {
+            bool escapeBudget = false;
+            safe = verdictFor(route, 0, candidate, -1000000, escapeBudget, 1) == ibcore::Verdict::Good &&
+                   !escapeBudget && !budgetExpired();
+        }
+
+        m_simSnap = oldSnap;
+        m_scanSim = oldScanSim;
+        m_orbAssistSimulation = oldOrbSimulation;
+        m_orbAssistDiscoveryOnly = oldDiscoveryOnly;
+        m_recordPath = oldRecordPath;
+        m_hasDeadline = oldDeadlineOn;
+        m_deadline = oldDeadline;
+        m_simChainStop = oldChainStop;
+        m_scanModeSwitches = oldModeSwitches;
+        m_scanPortalTraces = oldPortalTraces;
+        m_orbPredict = oldOrbPredict;
+        m_padPredict = oldPadPredict;
+        return safe;
     }
 
     // The modelled orb a (real) player is touching right now, if any.
@@ -7597,12 +7667,13 @@ public:
             m_queue.start(true, m_gameTime, std::max(0.0, at(orbPlanDelay) - m_gameTime));
             if (mode.wave) m_streamShift = static_cast<double>(orbPlanDelay) * dt;
 
-            // The selected delay is fixed. The live step only gates delivery on
-            // Geometry Dash confirming the exact target contact in the safe run.
+            // Wait for the predicted contact interval, but keep checking each
+            // tick inside it. The live gate re-tests exact contact AND the
+            // post-orb route from the current state before delivering the input.
             m_live = true;
             m_liveState.startClick(m_gameTime, dt, at(orbPlanDelay),
                                    at(orbPlanContactHi + 1) + TIME_EPS,
-                                   at(orbPlanSafeHi) + TIME_EPS);
+                                   at(orbPlanContactHi) + TIME_EPS);
             m_liveArrive = m_gameTime;
             m_livePlanTicks = orbPlanDelay;
             m_liveWaited = false;
@@ -7676,8 +7747,10 @@ public:
                 int const contactHi = idle.firstRingLast;
                 bool const diedBeforeOrb = idle.end == SimEnd::Died && idle.deathStep >= 0 &&
                                            (contactLo < 0 || idle.deathStep <= contactLo);
-                bool const contactComplete = contactHi >= contactLo && contactHi < scanTicks &&
-                                             contactHi - contactLo + 1 <= ORB_HELP_OVERLAP_TICKS;
+                // We only need a bounded first contact interval. The planner
+                // tests at most 64 ticks and exits at the first safe candidate;
+                // a long overlap is not an automatic rejection.
+                bool const contactComplete = contactHi >= contactLo && contactHi < scanTicks;
 
                 if (idle.end == SimEnd::OutOfBudget || budgetExpired()) {
                     rejectReason = "search budget expired before contact was mapped";
@@ -7685,8 +7758,8 @@ public:
                     rejectReason = "dynamic trigger/effect in the approach; prediction is incomplete";
                 } else if (!idle.firstRing || contactLo < 1 || contactLo > lead) {
                     rejectReason = "no supported orb in the assist window";
-                } else if (!orbMotionKnown(idle.firstRing)) {
-                    rejectReason = "orb is moving or its motion is not confirmed static; moving-orb contact is unsupported";
+                } else if (orbMotionConfirmedMoving(idle.firstRing)) {
+                    rejectReason = "orb motion is confirmed; its next transform is not modeled by the native contact probe";
                 } else if (diedBeforeOrb) {
                     rejectReason = "player dies before reaching the orb";
                 } else if (!contactComplete) {
@@ -7722,8 +7795,8 @@ public:
                         return result;
                     };
 
-                    pick = orbassist::chooseSafeTick(contactLo, contactHi, ORB_HELP_OVERLAP_TICKS,
-                                                     ORB_HELP_MAX_TESTS, probe);
+                    pick = orbassist::chooseEarliestSafeTick(contactLo, contactHi, ORB_HELP_OVERLAP_TICKS,
+                                                            ORB_HELP_MAX_TESTS, probe);
                     if (pick.status == orbassist::PlanStatus::Found && pick.best >= contactLo &&
                         pick.best <= contactHi && pick.runHi >= pick.runLo) {
                         chosen = pick.best;
@@ -8268,14 +8341,15 @@ public:
         bool waveMode = false;
         SimEnd testedEnd = SimEnd::Survived;
 
-        // Check the collision that will happen after this PlayerObject::update.
-        // The previous-step m_touchingRings list is too late for a one-tick orb.
-        bool orbContactOnUpcomingStep = false;
+        // Check the exact upcoming contact and the entire post-orb route from
+        // the current state. Once the predicted contact interval starts this
+        // is re-evaluated on each tick, not trusted from the click-time snapshot.
+        bool orbSafeOnUpcomingStep = false;
         if (wasFirst && m_orbHelpHold && m_liveState.planned >= 0.0 &&
             now + TIME_EPS >= m_liveState.planned) {
             RingObject* const target = m_orbHelpRing;
             if (orbAvailableNow(target) && !realUsedOrb(target))
-                orbContactOnUpcomingStep = probeUpcomingOrbContact(pl, target);
+                orbSafeOnUpcomingStep = probeUpcomingOrbSafe(pl, target);
         }
 
         // "Is firing it now safe?" - one test from the real current state.
@@ -8310,14 +8384,13 @@ public:
                 if ((px - m_spotTargetX) * m_spotTargetDir >= -spotTol().x) return ibcore::LiveVerdict::Proven;
                 return ibcore::LiveVerdict::Unsafe;
             }
-            // Orb helper: never fire on an earlier contact tick than the one
-            // whose post-orb trajectory was tested. From that tick onward the
-            // exact live hitbox can release it; latest is the verified last-safe
-            // tick stored in LiveState.
+            // Orb Assist never trusts the original route blindly: once the
+            // planned approach begins, a click is released only after the exact
+            // upcoming target contact and current post-orb path both pass.
             if (head && push && m_orbHelpHold) {
                 if (now + TIME_EPS < m_liveState.planned) return ibcore::LiveVerdict::Unsafe;
-                return orbContactOnUpcomingStep ? ibcore::LiveVerdict::Proven
-                                                : ibcore::LiveVerdict::Unsafe;
+                return orbSafeOnUpcomingStep ? ibcore::LiveVerdict::Proven
+                                             : ibcore::LiveVerdict::Unsafe;
             }
             // Held for a learned spot: fire exactly when you reach it (no
             // prediction - it may be blind there), else keep waiting.
@@ -8474,7 +8547,7 @@ public:
         // Assisted Click safety check from the current live state.
         if (wasFirst && m_orbHelpHold) {
             bool const activeTarget = orbAvailableNow(m_orbHelpRing) && !realUsedOrb(m_orbHelpRing);
-            bool const exactUpcoming = activeTarget && orbContactOnUpcomingStep;
+            bool const exactUpcoming = activeTarget && orbSafeOnUpcomingStep;
             bool const expired = m_liveState.latest >= 0.0 && now + TIME_EPS >= m_liveState.latest;
             if (!exactUpcoming && (!activeTarget || expired)) {
                 m_orbHelpHold = false;
@@ -8618,10 +8691,10 @@ public:
                     bool const planned = m_liveState.planned >= 0.0 &&
                                          m_gameTime + TIME_EPS >= m_liveState.planned;
                     bool const exact = active && planned &&
-                                       probeUpcomingOrbContact(pl, m_orbHelpRing);
-                    // A one-tick safe run has planned == latest. Accept exact
-                    // contact at equality, but pass through immediately if that
-                    // final safe tick arrives without contact.
+                                       probeUpcomingOrbSafe(pl, m_orbHelpRing);
+                    // The predicted contact interval is a live search window.
+                    // Every tick is revalidated against the exact target and
+                    // the current post-orb trajectory before the input is sent.
                     bool const withinSafeRun = m_liveState.latest < 0.0 ||
                                                m_gameTime <= m_liveState.latest + TIME_EPS;
                     bool const windowEnded = m_liveState.latest >= 0.0 &&
