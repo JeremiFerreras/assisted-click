@@ -244,71 +244,56 @@ inline bool preferOrbPlan(bool normalImmediateSafe, bool normalDelayedSafe,
            normalDelay > 0 && orbDelay < normalDelay;
 }
 
-// Every tick in the contact interval is simulated. A partial result is never
-// accepted: timeouts or incomplete physics invalidate the whole candidate set.
+// Test candidate ticks in chronological order and stop at the FIRST fully
+// verified safe tick. Orb Assist only needs the earliest safe activation; it
+// does not need to map the width of every safe run or calculate a midpoint.
+// This removes the old full-window sweep after a valid answer was already found.
+//
+// maxWindowTicks / maxTests bound worst-case work. If the search is capped
+// before reaching hi, return WindowTooWide rather than falsely claiming that
+// no safe tick exists. A timeout or incomplete simulation invalidates the
+// candidate; partial winners are never returned.
 template <class Probe>
-TickPlan chooseSafeTick(int lo, int hi, int maxWindowTicks, int maxTests, Probe&& probe) {
+TickPlan chooseEarliestSafeTick(int lo, int hi, int maxWindowTicks, int maxTests, Probe&& probe) {
     TickPlan plan;
     if (hi < lo || maxWindowTicks < 1 || maxTests < 1) {
         plan.status = PlanStatus::InvalidRange;
         return plan;
     }
-    int const count = hi - lo + 1;
-    if (count > maxWindowTicks || count > maxTests) {
-        plan.status = PlanStatus::WindowTooWide;
-        return plan;
-    }
 
-    struct Entry { bool safe = false; float clearance = 0.0f; };
-    std::vector<Entry> entries(static_cast<std::size_t>(count));
+    long long const total = static_cast<long long>(hi) - static_cast<long long>(lo) + 1LL;
+    int const limit = static_cast<int>(std::min<long long>(
+        total, std::min(maxWindowTicks, maxTests)
+    ));
 
-    for (int d = lo; d <= hi; ++d) {
-        std::optional<TickProbe> result = probe(d);
+    for (int i = 0; i < limit; ++i) {
+        int const tick = lo + i;
+        std::optional<TickProbe> result = probe(tick);
         if (!result) {
             plan.status = PlanStatus::BudgetExpired;
-            plan.best = plan.runLo = plan.runHi = -1;
             return plan;
         }
+
         ++plan.tested;
         if (!result->complete) {
             plan.status = PlanStatus::IncompleteSimulation;
-            plan.best = plan.runLo = plan.runHi = -1;
             return plan;
         }
-        bool const safe = result->exactTargetContact && result->survived;
-        entries[static_cast<std::size_t>(d - lo)] = Entry{safe, result->clearance};
-        if (safe) ++plan.safeTicks;
-    }
 
-    int bestLo = -1, bestHi = -1, bestLen = 0;
-    float bestMargin = -std::numeric_limits<float>::infinity();
-    for (int i = 0; i < count;) {
-        if (!entries[static_cast<std::size_t>(i)].safe) { ++i; continue; }
-        int const start = i;
-        float margin = std::numeric_limits<float>::infinity();
-        while (i < count && entries[static_cast<std::size_t>(i)].safe) {
-            margin = std::min(margin, entries[static_cast<std::size_t>(i)].clearance);
-            ++i;
-        }
-        int const end = i - 1;
-        int const length = end - start + 1;
-        if (length > bestLen || (length == bestLen && margin > bestMargin)) {
-            bestLen = length;
-            bestLo = lo + start;
-            bestHi = lo + end;
-            bestMargin = margin;
+        if (result->exactTargetContact && result->survived) {
+            plan.status = PlanStatus::Found;
+            plan.best = tick;
+            plan.runLo = tick;
+            plan.runHi = tick;
+            plan.safeTicks = 1;
+            plan.clearance = result->clearance;
+            return plan;
         }
     }
 
-    if (bestLen == 0) {
-        plan.status = PlanStatus::NoSafeTick;
-        return plan;
-    }
-    plan.status = PlanStatus::Found;
-    plan.runLo = bestLo;
-    plan.runHi = bestHi;
-    plan.best = bestLo + (bestHi - bestLo) / 2;
-    plan.clearance = bestMargin;
+    plan.status = (static_cast<long long>(limit) < total)
+        ? PlanStatus::WindowTooWide
+        : PlanStatus::NoSafeTick;
     return plan;
 }
 
