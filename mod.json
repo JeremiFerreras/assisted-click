@@ -6,11 +6,11 @@
 		"android": "2.2081",
 		"ios": "2.2081"
 	},
-	"version": "v4.9.0",
+	"version": "v4.10.0",
 	"id": "geodepredictive.inputbuffer",
 	"name": "Geode Predictive Input Buffer",
 	"developer": "Custom fork",
-	"description": "Orb Delay compares the normal Assisted Click route with exact per-tick simulations for supported stationary orbs. It mirrors Geometry Dash 2.2081's activated-ring ID set separately from transient touched-ring bookkeeping, then requires exact live contact before delivering the input. Unsupported or missed contacts fail closed.",
+	"description": "Orb Assist compares the normal Assisted Click route with the earliest safe orb-contact tick. It stops candidate search at the first complete safe path, then revalidates exact native contact and the post-orb trajectory from the current player state before firing. Unknown motion is checked live; confirmed moving orbs and incomplete simulations fail closed.",
 	"resources": {
 		"sprites": [
 			"resources/*.png"
@@ -66,7 +66,7 @@
 		"orb-helper": {
 			"type": "bool",
 			"name": "Assist Orb Clicks",
-			"description": "Compare normal Assisted Click with an exact Orb Delay simulation near a supported stationary orb. Delay only when the post-orb route is safer, then confirm exact live contact before firing. Unsupported/moving orbs and incomplete simulations are rejected.",
+			"description": "Compare normal Assisted Click with the earliest safe Orb Assist tick. Revalidate exact upcoming contact and the post-orb route from the current player state before firing. Confirmed moving orbs and incomplete simulations are rejected.",
 			"default": true,
 			"category": "gameplay"
 		}
