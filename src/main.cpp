@@ -7690,8 +7690,8 @@ public:
             n.orbHelp = true;
             n.orbSafeLo = orbPlanSafeLo;
             note(c, mode, dt, n);
-            pushLog(fmt::format("Orb Assist: {} ticks planned (safe run {}..{}, {} exact tests)",
-                                orbPlanDelay, orbPlanSafeLo, orbPlanSafeHi, orbPlanTested), COL_GREEN, true);
+            pushLog(fmt::format("Orb Assist: first safe tick +{} ({} candidate tests); live route will be rechecked",
+                                orbPlanDelay, orbPlanTested), COL_GREEN, true);
             return true;
         };
 
