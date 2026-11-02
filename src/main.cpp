@@ -5074,7 +5074,7 @@ private:
                 break;
             }
 
-            if ((i & 3) == 3 && budgetExpired()) { // every 4 steps: heavy levels can't overrun far
+            if (((i & 3) == 3 || m_orbAssistSimulation) && budgetExpired()) { // Orb Assist checks each tick; other modes keep the 4-step cadence
                 out.end = SimEnd::OutOfBudget;
                 break;
             }
