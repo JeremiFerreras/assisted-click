@@ -7,7 +7,7 @@ Private development fork for **Geometry Dash 2.2081 / Geode 5.11.2** (Orb Assist
 When the player presses early near an orb, the mod evaluates two routes:
 
 1. **Normal Assisted Click:** whether the click is safe immediately or its regular tick-delay search finds a safe input.
-2. **Orb Assist:** uses a full \`PlayerSnap\` to discover the first approaching orb and its contact interval. Candidate ticks are simulated in chronological order. The planner stops at the **first complete safe result**; it no longer simulates every remaining tick merely to calculate a widest-run midpoint.
+2. **Orb Assist:** uses a full `PlayerSnap` to discover the first approaching orb and its contact interval. Candidate ticks are simulated in chronological order. The planner stops at the **first complete safe result**; it no longer simulates every remaining tick merely to calculate a widest-run midpoint.
 
 The normal route keeps priority if it is safe immediately. When both routes require delay, Orb Assist only replaces a confirmed normal plan if it has more measured collision clearance, or comparable clearance and an earlier tick. It does not infer safe-window width from sparse normal-search samples.
 
@@ -25,7 +25,7 @@ The initial discovery/candidate search has an **8 ms CPU budget**; current-state
 
 ## Physics coverage and limits
 
-The deterministic model follows Geometry Dash 2.2081 \`PlayerObject::ringJump()\` ordering, including \`flipMod()\`, mini scaling, pre-/post-impulse gravity flips, and the post-\`setYVelocity\` Ball/Spider/Swing multipliers.
+The deterministic model follows Geometry Dash 2.2081 `PlayerObject::ringJump()` ordering, including `flipMod()`, mini scaling, pre-/post-impulse gravity flips, and the post-`setYVelocity` Ball/Spider/Swing multipliers.
 
 Supported standard orb types: Yellow, Pink, Red, Black/Drop, Blue/Gravity and Green. The modeled vehicle set is Cube, Ship, Ball, UFO, Wave, Robot, Spider and Swing.
 
@@ -49,9 +49,9 @@ The repository GitHub Actions workflow builds the Windows mod using the pinned G
 
 For local builds, use the Geode CLI:
 
-\`\`\`sh
+```sh
 geode build
-\`\`\`
+```
 
 ## Validation status
 
